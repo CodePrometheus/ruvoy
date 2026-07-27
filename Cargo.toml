@@ -1,0 +1,17 @@
+[package]
+name = "ruvoy-poc"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+magnus = { version = "=0.8.2", features = ["embed"] }
+
+[workspace]
+members = [
+    "crates/ruvoy-envoy-baseline",
+    "crates/ruvoy-envoy-fiber",
+    "crates/ruvoy-envoy-sync",
+]
+resolver = "3"

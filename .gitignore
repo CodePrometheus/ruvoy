@@ -1,0 +1,37 @@
+# Build and dependency outputs.
+/target/
+/build/
+/vendor/bundle/
+/.tools/
+
+# Local POC notes and raw evidence. Publish curated, sanitized documentation
+# separately instead of committing machine-specific logs and request bodies.
+/.agents/
+
+# Local editor and operating-system metadata.
+/.idea/
+/.vscode/
+/.bundle/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Runtime scratch output.
+*.log
+*.pid
+
+# Local configuration and credentials. Keep an explicitly sanitized template
+# available when the project needs one.
+.env
+.env.*
+!.env.example
+.envrc
+/.cargo/credentials
+/.cargo/credentials.toml
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore

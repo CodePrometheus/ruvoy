@@ -1,0 +1,14 @@
+[package]
+name = "ruvoy-envoy-baseline"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "ruvoy_baseline"
+crate-type = ["cdylib"]
+
+[dependencies.envoy-proxy-dynamic-modules-rust-sdk]
+git = "https://github.com/envoyproxy/envoy"
+rev = "8eea3285d6bdb89f8ea34632cfe7ce1608a8f374"

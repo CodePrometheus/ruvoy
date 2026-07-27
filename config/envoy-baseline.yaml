@@ -1,0 +1,32 @@
+static_resources:
+  listeners:
+    - name: ruvoy_baseline
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 18080
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ruvoy_baseline
+                codec_type: AUTO
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local_service
+                      domains:
+                        - "*"
+                http_filters:
+                  - name: envoy.extensions.filters.http.dynamic_modules
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: ruvoy_baseline
+                        do_not_close: true
+                      filter_name: baseline
+                      terminal_filter: true
+                      filter_config:
+                        "@type": type.googleapis.com/google.protobuf.StringValue
+                        value: baseline

@@ -1,0 +1,62 @@
+static_resources:
+  listeners:
+    - name: ruvoy_sync_rack
+      per_connection_buffer_limit_bytes: 4194304
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 18081
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ruvoy_sync_rack
+                codec_type: AUTO
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local_service
+                      domains:
+                        - "*"
+                http_filters:
+                  - name: envoy.extensions.filters.http.dynamic_modules
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: ruvoy_sync
+                        do_not_close: true
+                      filter_name: sync_rack
+                      terminal_filter: true
+                      filter_config:
+                        "@type": type.googleapis.com/google.protobuf.StringValue
+                        value: sync_rack
+    - name: ruvoy_control
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 18082
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ruvoy_control
+                codec_type: AUTO
+                route_config:
+                  name: control_route
+                  virtual_hosts:
+                    - name: control_service
+                      domains:
+                        - "*"
+                      routes:
+                        - match:
+                            prefix: "/"
+                          direct_response:
+                            status: 200
+                            body:
+                              inline_string: control-ok
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
