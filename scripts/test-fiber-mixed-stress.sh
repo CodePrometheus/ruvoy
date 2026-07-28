@@ -7,6 +7,7 @@ run_id="$(date -u '+%Y%m%dT%H%M%SZ')"
 result_root="${RUVOY_RESULTS_DIR:-"$repo_root/.agents/results"}"
 result_dir="$result_root/poc6-fiber-mixed-stress-$run_id"
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/ruvoy-mixed.XXXXXX")"
+envoy_config="$temporary_dir/envoy.yaml"
 envoy_log="$result_dir/envoy.log"
 resource_file="$result_dir/resources.tsv"
 heap_file="$result_dir/heap.tsv"
@@ -397,7 +398,7 @@ run_recovery() {
   probe_control "$prefix"
 }
 
-for tool in cargo curl dd jq lsof pgrep ps rg seq uvx; do
+for tool in cargo curl dd jq lsof pgrep ps rg sed seq uvx; do
   command -v "$tool" >/dev/null || fail "$tool is required"
 done
 [[ -x "$oha" ]] || fail "missing project-local oha"
@@ -441,6 +442,11 @@ printf 'label\telapsed_seconds\n' >"$control_file"
 printf 'startup\n' >"$phase_file"
 dd if=/dev/zero of="$temporary_dir/body-262144.bin" bs=262144 count=1 2>/dev/null
 dd if=/dev/zero of="$temporary_dir/body-1048576.bin" bs=1048576 count=1 2>/dev/null
+sed \
+  "s|value: bench/config.ru|value: $repo_root/test/fixtures/rack/config.ru|" \
+  "$repo_root/config/envoy-fiber-rack.yaml" >"$envoy_config"
+grep -Fq "value: $repo_root/test/fixtures/rack/config.ru" "$envoy_config" ||
+  fail "failed to configure the Rack fixture"
 
 {
   printf 'run_id=%s\nmode=%s\ncycles=%s\nhost=%s\n' "$run_id" "$mode" "$cycles" "$(uname -srm)"
@@ -470,7 +476,7 @@ RUVOY_MAX_INFLIGHT_REQUESTS="$max_inflight_requests" \
   BUNDLE_FROZEN=true \
   ENVOY_DYNAMIC_MODULES_SEARCH_PATH="$repo_root/build/modules" \
   uvx --from envoy-server==1.39.0 envoy \
-  --config-path "$repo_root/config/envoy-fiber-rack.yaml" \
+  --config-path "$envoy_config" \
   --concurrency "$envoy_concurrency" \
   --disable-hot-restart \
   --log-level warning \
