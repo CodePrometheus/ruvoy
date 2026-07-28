@@ -1,7 +1,9 @@
 use crate::runtime::{BodyBudget, BodyLease, FiberRackConfig};
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
-use ruvoy_poc::{BridgeError, Request, RequestDiagnostics, Response, fiber::FiberRuntimeClient};
+use ruvoy_poc::{
+    BridgeError, Request, RequestDiagnostics, RequestMetadata, Response, fiber::FiberRuntimeClient,
+};
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -20,6 +22,7 @@ type ResultSlot = Arc<Mutex<Option<TimedResult>>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BodyCopyError {
     Allocation,
+    InvalidRequest(&'static str),
     MissingRequest,
     Overloaded,
     TooLarge,
@@ -78,11 +81,12 @@ impl FiberRackFilter {
         let method = envoy_filter
             .get_request_header_value(":method")
             .map(|value| String::from_utf8_lossy(value.as_slice()).into_owned())
-            .unwrap_or_else(|| "GET".to_owned());
+            .ok_or(BodyCopyError::InvalidRequest("missing :method"))?;
         let path = envoy_filter
             .get_request_header_value(":path")
             .map(|value| String::from_utf8_lossy(value.as_slice()).into_owned())
-            .unwrap_or_else(|| "/".to_owned());
+            .ok_or(BodyCopyError::InvalidRequest("missing :path"))?;
+        let metadata = request_metadata(envoy_filter)?;
         let force_gc = path.split('?').next() == Some("/gc");
         let body_capacity = declared_body_capacity(
             envoy_filter
@@ -107,6 +111,7 @@ impl FiberRackFilter {
                 path,
                 body,
                 headers,
+                metadata,
                 force_gc,
                 diagnostics: diagnostics_enabled
                     .then(|| RequestDiagnostics::new(received_at, body_capacity)),
@@ -234,6 +239,12 @@ impl FiberRackFilter {
                 b"request body allocation failed",
                 "ruvoy_fiber_body_allocation_failed",
             ),
+            BodyCopyError::InvalidRequest(message) => self.send_bridge_error(
+                envoy_filter,
+                400,
+                message.as_bytes(),
+                "ruvoy_fiber_invalid_request",
+            ),
             BodyCopyError::Overloaded => self.send_bridge_error(
                 envoy_filter,
                 503,
@@ -264,7 +275,7 @@ impl FiberRackFilter {
             response
                 .headers
                 .iter()
-                .filter(|(name, _)| !name.starts_with(':'))
+                .filter(|(name, _)| !name.starts_with(':') && !name.starts_with("rack."))
                 .map(|(name, value)| (name.as_str(), value.as_bytes())),
         );
         if let Some(value) = scheduler_return_value.as_deref() {
@@ -380,6 +391,102 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
     }
 }
 
+fn request_metadata<EHF: EnvoyHttpFilter>(
+    envoy_filter: &EHF,
+) -> Result<RequestMetadata, BodyCopyError> {
+    let scheme = attribute_string(
+        envoy_filter,
+        envoy_dynamic_module_type_attribute_id::RequestScheme,
+    )
+    .ok_or(BodyCopyError::InvalidRequest("missing request scheme"))?;
+    let authority = attribute_string(
+        envoy_filter,
+        envoy_dynamic_module_type_attribute_id::RequestHost,
+    )
+    .or_else(|| {
+        envoy_filter
+            .get_request_header_value(":authority")
+            .map(|value| String::from_utf8_lossy(value.as_slice()).into_owned())
+    })
+    .ok_or(BodyCopyError::InvalidRequest("missing request authority"))?;
+    let protocol = attribute_string(
+        envoy_filter,
+        envoy_dynamic_module_type_attribute_id::RequestProtocol,
+    )
+    .ok_or(BodyCopyError::InvalidRequest("missing request protocol"))?;
+
+    let destination_address = attribute_string(
+        envoy_filter,
+        envoy_dynamic_module_type_attribute_id::DestinationAddress,
+    );
+    let server_name = authority_host(&authority)
+        .or_else(|| destination_address.as_deref().and_then(authority_host))
+        .ok_or(BodyCopyError::InvalidRequest("invalid request authority"))?
+        .to_owned();
+    let server_port = envoy_filter
+        .get_attribute_int(envoy_dynamic_module_type_attribute_id::DestinationPort)
+        .and_then(|port| u16::try_from(port).ok())
+        .or_else(|| authority_port(&authority))
+        .or_else(|| default_port(&scheme))
+        .ok_or(BodyCopyError::InvalidRequest("missing destination port"))?;
+    let remote_addr = attribute_string(
+        envoy_filter,
+        envoy_dynamic_module_type_attribute_id::SourceAddress,
+    )
+    .and_then(|address| authority_host(&address).map(str::to_owned));
+
+    Ok(RequestMetadata {
+        authority,
+        scheme,
+        server_name,
+        server_port,
+        protocol,
+        remote_addr,
+    })
+}
+
+fn attribute_string<EHF: EnvoyHttpFilter>(
+    envoy_filter: &EHF,
+    attribute: envoy_dynamic_module_type_attribute_id,
+) -> Option<String> {
+    envoy_filter
+        .get_attribute_string(attribute)
+        .map(|value| String::from_utf8_lossy(value.as_slice()).into_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn authority_host(authority: &str) -> Option<&str> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let closing = rest.find(']')?;
+        return Some(&authority[..closing + 2]);
+    }
+
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => {
+            (!host.is_empty()).then_some(host)
+        }
+        _ => (!authority.is_empty()).then_some(authority),
+    }
+}
+
+fn authority_port(authority: &str) -> Option<u16> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let closing = rest.find(']')?;
+        return rest[closing + 1..].strip_prefix(':')?.parse().ok();
+    }
+
+    let (host, port) = authority.rsplit_once(':')?;
+    (!host.contains(':')).then(|| port.parse().ok()).flatten()
+}
+
+fn default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    }
+}
+
 fn declared_body_capacity(value: Option<&[u8]>) -> Result<usize, BodyCopyError> {
     let Some(value) = value else {
         return Ok(0);
@@ -452,5 +559,15 @@ mod tests {
             Err(BodyCopyError::TooLarge)
         );
         assert_eq!(body.len(), MAX_REQUEST_BODY_BYTES - 1);
+    }
+
+    #[test]
+    fn authority_is_split_without_corrupting_ipv6_hosts() {
+        assert_eq!(authority_host("example.com:8443"), Some("example.com"));
+        assert_eq!(authority_port("example.com:8443"), Some(8443));
+        assert_eq!(authority_host("[::1]:18083"), Some("[::1]"));
+        assert_eq!(authority_port("[::1]:18083"), Some(18083));
+        assert_eq!(authority_host("example.com"), Some("example.com"));
+        assert_eq!(authority_port("example.com"), None);
     }
 }

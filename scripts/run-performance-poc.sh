@@ -13,10 +13,13 @@ ruby_version="$(tr -d '[:space:]' <"$repo_root/.ruby-version")"
 ruby_bin="${RUVOY_RUBY:-"$HOME/.rbenv/versions/$ruby_version/bin/ruby"}"
 bundle_bin="$HOME/.rbenv/versions/$ruby_version/bin/bundle"
 bundle_path="$repo_root/vendor/bundle"
-bench_duration="2s"
-warmup_duration="1s"
+bench_duration="${RUVOY_BENCH_DURATION:-2s}"
+warmup_duration="${RUVOY_BENCH_WARMUP_DURATION:-1s}"
 control_repetitions=5
 oha_timeout_seconds="${RUVOY_BENCH_OHA_TIMEOUT_SECONDS:-60}"
+envoy_concurrency="${RUVOY_BENCH_ENVOY_CONCURRENCY:-1}"
+puma_workers="${RUVOY_BENCH_PUMA_WORKERS:-0}"
+puma_threads="${RUVOY_BENCH_PUMA_THREADS:-100}"
 architecture_selection="${RUVOY_BENCH_ARCHITECTURES:-baseline sync fiber puma}"
 IFS=' ' read -r -a architectures <<<"$architecture_selection"
 scenario_selection="${RUVOY_BENCH_SCENARIOS:-all}"
@@ -37,10 +40,10 @@ case "$mode" in
     ;;
 esac
 case "$body_matrix" in
-  true | false)
+  true | false | request | response)
     ;;
   *)
-    echo "RUVOY_BENCH_BODY_MATRIX must be true or false" >&2
+    echo "RUVOY_BENCH_BODY_MATRIX must be false, true, request, or response" >&2
     exit 1
     ;;
 esac
@@ -48,6 +51,25 @@ esac
   echo "RUVOY_BENCH_OHA_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 1
 }
+[[ "$envoy_concurrency" =~ ^[0-9]+$ ]] && [[ "$envoy_concurrency" -gt 0 ]] || {
+  echo "RUVOY_BENCH_ENVOY_CONCURRENCY must be a positive integer" >&2
+  exit 1
+}
+[[ "$puma_workers" =~ ^[0-9]+$ ]] || {
+  echo "RUVOY_BENCH_PUMA_WORKERS must be a non-negative integer" >&2
+  exit 1
+}
+[[ "$puma_threads" =~ ^[0-9]+$ ]] && [[ "$puma_threads" -gt 0 ]] || {
+  echo "RUVOY_BENCH_PUMA_THREADS must be a positive integer" >&2
+  exit 1
+}
+for duration_name in bench_duration warmup_duration; do
+  duration="${!duration_name}"
+  [[ "$duration" =~ ^[1-9][0-9]*(ms|s|m)$ ]] || {
+    echo "$duration_name must use a positive ms, s, or m duration" >&2
+    exit 1
+  }
+done
 
 [[ "${#architectures[@]}" -gt 0 ]] || {
   echo "RUVOY_BENCH_ARCHITECTURES must select at least one architecture" >&2
@@ -73,6 +95,7 @@ printf 'architecture\tstate\trun\toha_json\n' >"$control_manifest"
 current_envoy_pid=""
 current_envoy_runtime_pid=""
 current_puma_pid=""
+current_puma_pid_csv=""
 current_architecture=""
 current_envoy_log=""
 current_listener_port=""
@@ -173,6 +196,7 @@ cleanup_current() {
   current_envoy_pid=""
   current_envoy_runtime_pid=""
   current_puma_pid=""
+  current_puma_pid_csv=""
   current_listener_port=""
   server_pid_csv=""
 }
@@ -297,8 +321,8 @@ start_architecture() {
         "$ruby_bin" "$bundle_bin" _4.0.10_ exec puma \
         --no-config \
         --environment production \
-        --threads 0:100 \
-        --workers 0 \
+        --threads "0:$puma_threads" \
+        --workers "$puma_workers" \
         --bind tcp://127.0.0.1:18110 \
         "$repo_root/bench/config.ru" \
         >"$architecture_dir/puma.log" 2>&1 &
@@ -307,6 +331,29 @@ start_architecture() {
         'http://127.0.0.1:18110/benchmark?wait_ms=0&response_bytes=0' \
         "$current_puma_pid" ||
         fail "Puma did not become ready"
+      current_puma_pid_csv="$current_puma_pid"
+      if [[ "$puma_workers" -gt 0 ]]; then
+        local puma_worker_pid_list=""
+        local puma_worker_count=0
+        for _ in $(seq 1 200); do
+          puma_worker_pid_list="$(pgrep -P "$current_puma_pid" || true)"
+          puma_worker_count="$(
+            printf '%s\n' "$puma_worker_pid_list" |
+              awk 'NF { count += 1 } END { print count + 0 }'
+          )"
+          if [[ "$puma_worker_count" -ge "$puma_workers" ]]; then
+            break
+          fi
+          sleep 0.05
+        done
+        [[ "$puma_worker_count" -ge "$puma_workers" ]] ||
+          fail "Puma started $puma_worker_count of $puma_workers workers"
+        local puma_worker_pid
+        while IFS= read -r puma_worker_pid; do
+          [[ -n "$puma_worker_pid" ]] || continue
+          current_puma_pid_csv+=",$puma_worker_pid"
+        done <<<"$puma_worker_pid_list"
+      fi
       ;;
     *)
       fail "unknown architecture: $architecture"
@@ -319,7 +366,7 @@ start_architecture() {
     ENVOY_DYNAMIC_MODULES_SEARCH_PATH="$repo_root/build/modules" \
     uvx --from "$envoy_package" envoy \
     --config-path "$config" \
-    --concurrency 1 \
+    --concurrency "$envoy_concurrency" \
     --disable-hot-restart \
     --log-level warning \
     >"$current_envoy_log" 2>&1 &
@@ -341,7 +388,7 @@ start_architecture() {
     fail "$architecture could not resolve the Envoy runtime PID"
 
   if [[ -n "$current_puma_pid" ]]; then
-    server_pid_csv="$current_envoy_runtime_pid,$current_puma_pid"
+    server_pid_csv="$current_envoy_runtime_pid,$current_puma_pid_csv"
   else
     server_pid_csv="$current_envoy_runtime_pid"
   fi
@@ -399,7 +446,7 @@ run_oha() {
   local url="http://127.0.0.1:$listener_port/benchmark?wait_ms=$wait_ms&response_bytes=$response_bytes&expected_request_bytes=$request_bytes"
   local args=(--no-tui --output-format json --wait-ongoing-requests-after-deadline)
 
-  if [[ "$body_matrix" == "true" ]]; then
+  if [[ "$body_matrix" != "false" ]]; then
     local request_count=$((concurrency * 10))
     if [[ "$request_count" -lt 100 ]]; then
       request_count=100
@@ -541,13 +588,18 @@ run_control_probe() {
 }
 
 scenario_rows() {
-  if [[ "$body_matrix" == "true" ]]; then
-    local request_bytes
+  if [[ "$body_matrix" != "false" ]]; then
+    local body_bytes
     local concurrency
-    for request_bytes in 1024 65536 262144 1048576 2097152; do
+    for body_bytes in 1024 65536 262144 1048576 2097152; do
       for concurrency in 1 10 100; do
-        printf 'request_%s_h1_c%s|1.1|%s|0|%s|0|5\n' \
-          "$request_bytes" "$concurrency" "$concurrency" "$request_bytes"
+        if [[ "$body_matrix" == "true" || "$body_matrix" == "request" ]]; then
+          printf 'request_%s_h1_c%s|1.1|%s|0|%s|0|5\n' \
+            "$body_bytes" "$concurrency" "$concurrency" "$body_bytes"
+        else
+          printf 'response_%s_h1_c%s|1.1|%s|0|0|%s|5\n' \
+            "$body_bytes" "$concurrency" "$concurrency" "$body_bytes"
+        fi
       done
     done
     return
@@ -608,8 +660,9 @@ done
     "$envoy_package" "8eea3285d6bdb89f8ea34632cfe7ce1608a8f374"
   printf 'ruby=%s\noha=%s\n' "$("$ruby_bin" --version)" "$("$oha" --version)"
   printf 'rustc=%s\nrack=3.2.6\npuma=7.2.0\n' "$(rustc --version)"
-  printf 'bench_duration=%s\nwarmup_duration=%s\noha_timeout_seconds=%s\n' \
-    "$bench_duration" "$warmup_duration" "$oha_timeout_seconds"
+  printf 'envoy_concurrency=%s\nbench_duration=%s\nwarmup_duration=%s\noha_timeout_seconds=%s\n' \
+    "$envoy_concurrency" "$bench_duration" "$warmup_duration" "$oha_timeout_seconds"
+  printf 'puma_workers=%s\npuma_threads=%s\n' "$puma_workers" "$puma_threads"
   RUVOY_BUILD_PROFILE=release "$repo_root/scripts/build-modules.sh"
   RUVOY_BUILD_PROFILE=release "$repo_root/scripts/build-sync-module.sh"
   RUVOY_BUILD_PROFILE=release "$repo_root/scripts/build-fiber-module.sh"

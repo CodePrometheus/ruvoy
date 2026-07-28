@@ -9,77 +9,6 @@ use std::sync::{
 
 const DEFAULT_MAX_INFLIGHT_BODY_BYTES: usize = 256 * 1024 * 1024;
 
-const FIBER_RACK_APP_SOURCE: &str = r#"
-Class.new do
-  def call(env)
-    path = env.fetch("PATH_INFO")
-    query = env.fetch("QUERY_STRING", "")
-    duration = query.split("=", 2).last.to_f
-    raise "intentional fiber envoy boom" if path == "/raise"
-
-    case path
-    when "/async-sleep", "/slow-shutdown"
-      sleep duration
-    when "/blocking"
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + duration
-      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-      end
-    end
-
-    @calls = (@calls || 0) + 1
-    GC.start if path == "/gc" || path == "/gc-stats" || env["ruvoy.force_gc"]
-
-    input = env.fetch("rack.input")
-    input.rewind
-    request_body = input.read
-
-    benchmark_response_bytes = nil
-    if path == "/benchmark"
-      parameters = query.split("&").to_h { |entry| entry.split("=", 2) }
-      wait_ms = Integer(parameters.fetch("wait_ms", "0"), 10)
-      benchmark_response_bytes = Integer(parameters.fetch("response_bytes", "0"), 10)
-      expected_request_bytes = Integer(parameters.fetch("expected_request_bytes", request_body.bytesize.to_s), 10)
-      raise "invalid benchmark wait_ms" unless (0..1000).cover?(wait_ms)
-      raise "invalid benchmark response_bytes" unless (0..2 * 1024 * 1024).cover?(benchmark_response_bytes)
-      raise "invalid expected request bytes" unless (0..2 * 1024 * 1024).cover?(expected_request_bytes)
-      raise "unexpected request body size" unless request_body.bytesize == expected_request_bytes
-      sleep(wait_ms / 1000.0) if wait_ms.positive?
-    end
-
-    response_body =
-      case path
-      when "/benchmark"
-        "B".b * benchmark_response_bytes
-      when "/echo"
-        request_body
-      when "/large-response"
-        "F".b * (1024 * 1024)
-      else
-        [env.fetch("REQUEST_METHOD"), path, request_body].join(" ")
-      end
-
-    headers = {
-      "content-type" => "application/octet-stream",
-      "content-length" => response_body.bytesize.to_s,
-      "x-request-bytes" => request_body.bytesize.to_s,
-      "x-async-version" => Async::VERSION,
-      "x-ruby-call-count" => @calls.to_s,
-      "x-ruby-thread-object-id" => Thread.current.object_id.to_s,
-      "x-ruby-fiber-object-id" => Fiber.current.object_id.to_s
-    }
-    if env["HTTP_X_RUVOY_TEST"]
-      headers["x-rack-request-header"] = env["HTTP_X_RUVOY_TEST"]
-    end
-    if path == "/gc-stats"
-      headers["x-ruby-heap-live-slots"] = GC.stat(:heap_live_slots).to_s
-      headers["x-ruby-heap-available-slots"] = GC.stat(:heap_available_slots).to_s
-    end
-
-    [200, headers, [response_body]]
-  end
-end.new
-"#;
-
 pub(crate) struct FiberRackConfig {
     client: FiberRuntimeClient,
     body_budget: Arc<BodyBudget>,
@@ -88,14 +17,21 @@ pub(crate) struct FiberRackConfig {
 }
 
 impl FiberRackConfig {
-    pub(crate) fn start() -> Result<Self, BridgeError> {
+    pub(crate) fn start(filter_config: &[u8]) -> Result<Self, BridgeError> {
+        let rackup = std::str::from_utf8(filter_config)
+            .map_err(|_| BridgeError::Startup("rackup path must contain valid UTF-8".to_owned()))?;
+        if rackup.is_empty() {
+            return Err(BridgeError::Startup(
+                "rackup path must not be empty".to_owned(),
+            ));
+        }
         let max_inflight_requests =
             positive_env_usize("RUVOY_MAX_INFLIGHT_REQUESTS", DEFAULT_MAX_INFLIGHT_REQUESTS)?;
         let max_inflight_body_bytes = positive_env_usize(
             "RUVOY_MAX_INFLIGHT_BODY_BYTES",
             DEFAULT_MAX_INFLIGHT_BODY_BYTES,
         )?;
-        let runtime = FiberRuntime::start_with_limit(FIBER_RACK_APP_SOURCE, max_inflight_requests)?;
+        let runtime = FiberRuntime::start_rackup_with_limit(rackup, max_inflight_requests)?;
         let client = runtime.client();
         let runtime_thread_id = runtime.info().rust_thread_id.clone();
 

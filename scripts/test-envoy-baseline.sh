@@ -49,9 +49,9 @@ assert_response() {
     fail "$path returned an unexpected body"
 }
 
-command -v cargo >/dev/null || fail "cargo is required"
-command -v curl >/dev/null || fail "curl is required"
-command -v uvx >/dev/null || fail "uvx is required"
+for tool in cargo curl dd uvx; do
+  command -v "$tool" >/dev/null || fail "$tool is required"
+done
 
 if command -v lsof >/dev/null && lsof -nP -iTCP:18080 -sTCP:LISTEN >/dev/null 2>&1; then
   fail "TCP port 18080 is already in use"
@@ -94,6 +94,26 @@ done
 assert_response /direct direct rust-baseline
 assert_response /scheduler scheduler rust-scheduler
 
+two_mib_file="$temporary_dir/two-mib.bin"
+two_mib_prefix="$temporary_dir/two-mib"
+dd if=/dev/zero of="$two_mib_file" bs=2097152 count=1 2>/dev/null
+two_mib_status="$(
+  curl --silent --show-error \
+    --request POST \
+    --header 'Expect:' \
+    --data-binary "@$two_mib_file" \
+    --dump-header "$two_mib_prefix.headers" \
+    --output "$two_mib_prefix.body" \
+    --write-out '%{http_code}' \
+    'http://127.0.0.1:18080/benchmark?wait_ms=0&response_bytes=0&expected_request_bytes=2097152'
+)"
+[[ "$two_mib_status" == "200" ]] ||
+  fail "2 MiB POST /benchmark returned HTTP $two_mib_status"
+[[ ! -s "$two_mib_prefix.body" ]] ||
+  fail "2 MiB POST /benchmark returned an unexpected body"
+[[ "$(tr -d '\r' <"$two_mib_prefix.headers" | awk 'tolower($1) == "x-request-bytes:" { print $2 }')" == "2097152" ]] ||
+  fail "2 MiB POST /benchmark was not read completely"
+
 for _ in $(seq 1 50); do
   assert_response /scheduler scheduler rust-scheduler
 done
@@ -113,6 +133,7 @@ fi
 
 {
   echo "direct_response=PASS"
+  echo "two_mib_request=PASS"
   echo "foreign_thread_scheduler_responses=51"
   echo "sigint_cleanup=PASS"
   echo

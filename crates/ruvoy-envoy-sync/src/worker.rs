@@ -66,6 +66,7 @@ impl SyncRackFilter {
             path,
             body: Vec::new(),
             headers,
+            metadata: Default::default(),
             force_gc,
             diagnostics: None,
         }

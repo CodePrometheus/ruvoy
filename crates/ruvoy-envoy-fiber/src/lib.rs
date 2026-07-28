@@ -12,13 +12,13 @@ fn init() -> bool {
 fn new_http_filter_config_fn<EC: EnvoyHttpFilterConfig, EHF: EnvoyHttpFilter>(
     _envoy_filter_config: &mut EC,
     name: &str,
-    _config: &[u8],
+    config: &[u8],
 ) -> Option<Box<dyn HttpFilterConfig<EHF>>> {
     if name != "fiber_rack" {
         return None;
     }
 
-    match runtime::FiberRackConfig::start() {
+    match runtime::FiberRackConfig::start(config) {
         Ok(config) => Some(Box::new(config)),
         Err(error) => {
             eprintln!("[ruvoy] failed to start Fiber runtime: {error}");

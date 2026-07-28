@@ -5,7 +5,9 @@
 
 pub mod fiber;
 
-use magnus::{RArray, RClass, RHash, Ruby, Value, prelude::*, value::BoxValue};
+use magnus::{
+    RArray, RClass, RHash, RString, Ruby, Value, prelude::*, r_hash::ForEach, value::BoxValue,
+};
 use std::{
     error::Error as StdError,
     fmt,
@@ -22,6 +24,20 @@ use std::{
 
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+const RACK_BODY_READER_SOURCE: &str = r#"
+lambda do |body|
+  raise TypeError, "streaming Rack response bodies are not supported" unless body.respond_to?(:each)
+
+  output = +"".b
+  begin
+    body.each { |chunk| output << chunk }
+  ensure
+    body.close if body.respond_to?(:close)
+  end
+  output
+end
+"#;
+
 pub const DEFAULT_APP_SOURCE: &str = r#"
 Class.new do
   def call(env)
@@ -31,7 +47,6 @@ Class.new do
     GC.start if env["ruvoy.force_gc"]
 
     input = env.fetch("rack.input")
-    input.rewind
 
     body = [
       env.fetch("REQUEST_METHOD"),
@@ -41,8 +56,7 @@ Class.new do
 
     headers = {
       "content-type" => "text/plain",
-      "x-ruby-call-count" => @calls.to_s,
-      "x-ruby-thread-object-id" => Thread.current.object_id.to_s
+      "x-ruby-call-count" => @calls.to_s
     }
     if env["HTTP_X_RUVOY_TEST"]
       headers["x-request-header"] = env["HTTP_X_RUVOY_TEST"]
@@ -63,8 +77,32 @@ pub struct Request {
     pub path: String,
     pub body: Vec<u8>,
     pub headers: Vec<(String, Vec<u8>)>,
+    pub metadata: RequestMetadata,
     pub force_gc: bool,
     pub diagnostics: Option<RequestDiagnostics>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestMetadata {
+    pub authority: String,
+    pub scheme: String,
+    pub server_name: String,
+    pub server_port: u16,
+    pub protocol: String,
+    pub remote_addr: Option<String>,
+}
+
+impl Default for RequestMetadata {
+    fn default() -> Self {
+        Self {
+            authority: "localhost".to_owned(),
+            scheme: "http".to_owned(),
+            server_name: "localhost".to_owned(),
+            server_port: 80,
+            protocol: "HTTP/1.1".to_owned(),
+            remote_addr: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +139,7 @@ impl Request {
             path: path.into(),
             body: body.into(),
             headers: Vec::new(),
+            metadata: RequestMetadata::default(),
             force_gc: false,
             diagnostics: None,
         }
@@ -113,6 +152,11 @@ impl Request {
 
     pub fn with_forced_gc(mut self) -> Self {
         self.force_gc = true;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: RequestMetadata) -> Self {
+        self.metadata = metadata;
         self
     }
 }
@@ -361,6 +405,22 @@ fn runtime_main(
             return Err(error);
         }
     };
+    let rack_errors = match ruby.eval::<Value>("STDERR") {
+        Ok(value) => BoxValue::new(value),
+        Err(error) => {
+            let error = ruby_error("loading rack.errors", error);
+            let _ = ready_tx.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+    let body_reader = match ruby.eval::<Value>(RACK_BODY_READER_SOURCE) {
+        Ok(value) => BoxValue::new(value),
+        Err(error) => {
+            let error = ruby_error("loading Rack body reader", error);
+            let _ = ready_tx.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
 
     let app = match ruby.eval::<Value>(&app_source) {
         Ok(value) => BoxValue::new(value),
@@ -378,6 +438,7 @@ fn runtime_main(
             return Err(error);
         }
     };
+    let ruby_thread_object_id = info.ruby_thread_object_id;
     ready_tx
         .send(Ok(info))
         .map_err(|_| BridgeError::Startup("starter dropped readiness channel".to_owned()))?;
@@ -394,7 +455,15 @@ fn runtime_main(
                     request,
                     completion,
                 }) => {
-                    completion(call_app(ruby, *app, string_io_class, request));
+                    completion(call_app(
+                        ruby,
+                        *app,
+                        string_io_class,
+                        *rack_errors,
+                        *body_reader,
+                        ruby_thread_object_id,
+                        request,
+                    ));
                 }
                 Ok(Command::ForceGc { reply }) => {
                     ruby.gc_start();
@@ -441,6 +510,9 @@ fn call_app(
     ruby: &Ruby,
     app: Value,
     string_io_class: RClass,
+    rack_errors: Value,
+    body_reader: Value,
+    ruby_thread_object_id: u64,
     request: Request,
 ) -> Result<Response, BridgeError> {
     let runtime_started_at = Instant::now();
@@ -449,6 +521,7 @@ fn call_app(
         path,
         body,
         headers,
+        metadata,
         force_gc,
         diagnostics,
     } = request;
@@ -467,14 +540,28 @@ fn call_app(
         .map_err(|error| ruby_error("setting PATH_INFO", error))?;
     env.aset("QUERY_STRING", query_string)
         .map_err(|error| ruby_error("setting QUERY_STRING", error))?;
-    env.aset("SERVER_NAME", "localhost")
+    env.aset("SERVER_NAME", metadata.server_name)
         .map_err(|error| ruby_error("setting SERVER_NAME", error))?;
-    env.aset("SERVER_PORT", "80")
+    env.aset("SERVER_PORT", metadata.server_port.to_string())
         .map_err(|error| ruby_error("setting SERVER_PORT", error))?;
-    env.aset("SERVER_PROTOCOL", "HTTP/1.1")
+    env.aset("SERVER_PROTOCOL", metadata.protocol)
         .map_err(|error| ruby_error("setting SERVER_PROTOCOL", error))?;
-    env.aset("rack.url_scheme", "http")
+    env.aset("HTTP_HOST", metadata.authority)
+        .map_err(|error| ruby_error("setting HTTP_HOST", error))?;
+    if let Some(remote_addr) = metadata.remote_addr {
+        env.aset("REMOTE_ADDR", remote_addr)
+            .map_err(|error| ruby_error("setting REMOTE_ADDR", error))?;
+    }
+    env.aset("rack.url_scheme", metadata.scheme)
         .map_err(|error| ruby_error("setting rack.url_scheme", error))?;
+    env.aset("rack.errors", rack_errors)
+        .map_err(|error| ruby_error("setting rack.errors", error))?;
+    env.aset("rack.multithread", false)
+        .map_err(|error| ruby_error("setting rack.multithread", error))?;
+    env.aset("rack.multiprocess", false)
+        .map_err(|error| ruby_error("setting rack.multiprocess", error))?;
+    env.aset("rack.run_once", false)
+        .map_err(|error| ruby_error("setting rack.run_once", error))?;
 
     for (name, value) in headers {
         if let Some(key) = rack_env_header_name(&name) {
@@ -487,6 +574,9 @@ fn call_app(
     let rack_input = string_io_class
         .funcall::<_, _, Value>("new", (ruby.str_from_slice(&body),))
         .map_err(|error| ruby_error("creating rack.input StringIO", error))?;
+    rack_input
+        .funcall::<_, _, Value>("binmode", ())
+        .map_err(|error| ruby_error("setting rack.input binary mode", error))?;
     env.aset("rack.input", rack_input)
         .map_err(|error| ruby_error("setting rack.input", error))?;
     env.aset("ruvoy.force_gc", force_gc)
@@ -506,33 +596,23 @@ fn call_app(
     }
 
     let response_copy_started_at = Instant::now();
+    let response_body = rack_response
+        .entry::<Value>(2)
+        .map_err(|error| ruby_error("reading response body", error))?;
+    let response_body = body_reader
+        .funcall::<_, _, RString>("call", (response_body,))
+        .map_err(|error| ruby_error("consuming response body", error))?;
+    // SAFETY: no Ruby calls occur while the borrowed bytes are copied.
+    let body = unsafe { response_body.as_slice() }.to_vec();
     let status = rack_response
         .entry::<i64>(0)
         .map_err(|error| ruby_error("converting response status", error))
         .and_then(to_u16_status)?;
-    let mut headers = rack_response
-        .entry::<RHash>(1)
-        .map_err(|error| ruby_error("converting response headers", error))?
-        .to_vec::<String, String>()
-        .map_err(|error| ruby_error("copying response headers", error))?;
-    let body = rack_response
-        .entry::<RArray>(2)
-        .map_err(|error| ruby_error("converting response body", error))?
-        .to_vec::<String>()
-        .map_err(|error| ruby_error("copying response body", error))?
-        .concat()
-        .into_bytes();
-    let ruby_thread_object_id = headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case("x-ruby-thread-object-id"))
-        .ok_or_else(|| {
-            BridgeError::InvalidResponse("missing x-ruby-thread-object-id header".to_owned())
-        })?
-        .1
-        .parse::<u64>()
-        .map_err(|error| {
-            BridgeError::InvalidResponse(format!("invalid x-ruby-thread-object-id header: {error}"))
-        })?;
+    let mut headers = copy_response_headers(
+        rack_response
+            .entry::<RHash>(1)
+            .map_err(|error| ruby_error("converting response headers", error))?,
+    )?;
     let response_copy_time = response_copy_started_at.elapsed();
 
     if let Some(diagnostics) = diagnostics {
@@ -590,6 +670,25 @@ fn call_app(
         body,
         ruby_thread_object_id,
     })
+}
+
+fn copy_response_headers(headers: RHash) -> Result<Vec<(String, String)>, BridgeError> {
+    let mut result = Vec::with_capacity(headers.len());
+    headers
+        .foreach(|name: String, value: Value| {
+            if let Some(values) = RArray::from_value(value) {
+                for value in values.to_vec::<String>()? {
+                    result.push((name.clone(), value));
+                }
+            } else {
+                let value = String::try_convert(value)?;
+                result.push((name, value));
+            }
+            Ok(ForEach::Continue)
+        })
+        .map_err(|error| ruby_error("copying response headers", error))?;
+
+    Ok(result)
 }
 
 fn rack_env_header_name(name: &str) -> Option<String> {

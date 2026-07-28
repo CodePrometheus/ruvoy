@@ -10,6 +10,7 @@ envoy_concurrency="${RUVOY_ENVOY_CONCURRENCY:-1}"
 result_file="$result_dir/poc3-envoy-fiber-rack-$build_profile-$run_id.log"
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/ruvoy-fiber.XXXXXX")"
 envoy_log="$temporary_dir/envoy.log"
+envoy_config="$temporary_dir/envoy.yaml"
 envoy_pid=""
 fiber_port=18083
 control_port=18084
@@ -88,6 +89,12 @@ command -v cargo >/dev/null || fail "cargo is required"
 command -v curl >/dev/null || fail "curl is required"
 command -v uvx >/dev/null || fail "uvx is required"
 
+sed \
+  "s|value: bench/config.ru|value: $repo_root/test/fixtures/rack/config.ru|" \
+  "$repo_root/config/envoy-fiber-rack.yaml" >"$envoy_config"
+grep -Fq "value: $repo_root/test/fixtures/rack/config.ru" "$envoy_config" ||
+  fail "failed to configure the Rack fixture"
+
 for port in "$fiber_port" "$control_port"; do
   if command -v lsof >/dev/null && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
     fail "TCP port $port is already in use"
@@ -115,7 +122,7 @@ BUNDLE_GEMFILE="$repo_root/Gemfile" \
   BUNDLE_FROZEN=true \
   ENVOY_DYNAMIC_MODULES_SEARCH_PATH="$repo_root/build/modules" \
   uvx --from envoy-server==1.39.0 envoy \
-  --config-path "$repo_root/config/envoy-fiber-rack.yaml" \
+  --config-path "$envoy_config" \
   --concurrency "$envoy_concurrency" \
   --disable-hot-restart \
   --log-level info \

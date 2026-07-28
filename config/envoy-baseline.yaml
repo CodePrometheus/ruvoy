@@ -1,6 +1,7 @@
 static_resources:
   listeners:
     - name: ruvoy_baseline
+      per_connection_buffer_limit_bytes: 4194304
       address:
         socket_address:
           address: 127.0.0.1

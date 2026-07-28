@@ -1,12 +1,14 @@
 use super::{
-    BridgeError, Completion, DEFAULT_RESPONSE_TIMEOUT, Request, Response, RuntimeInfo, call_app,
-    drain_wake_bytes, map_recv_timeout, panic_message, ruby_error, runtime_info, wake_runtime,
+    BridgeError, Completion, DEFAULT_RESPONSE_TIMEOUT, RACK_BODY_READER_SOURCE, Request, Response,
+    RuntimeInfo, call_app, drain_wake_bytes, map_recv_timeout, panic_message, ruby_error,
+    runtime_info, wake_runtime,
 };
-use magnus::{RArray, RClass, Ruby, Value, method, prelude::*, value::BoxValue};
+use magnus::{RArray, RClass, RModule, Ruby, Value, kwargs, method, prelude::*, value::BoxValue};
 use std::{
     cell::RefCell,
     os::{fd::AsRawFd, unix::net::UnixStream},
     panic::{self, AssertUnwindSafe},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -18,7 +20,7 @@ use std::{
 pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 1024;
 
 const FIBER_RUNNER_SOURCE: &str = r#"
-lambda do |bridge, app|
+lambda do |bridge, app, rack_errors, body_reader|
   io = IO.for_fd(bridge.fd, autoclose: false)
 
   begin
@@ -29,7 +31,7 @@ lambda do |bridge, app|
         envelopes, shutting_down = bridge.drain
         envelopes.each do |envelope|
           parent.async(envelope) do |_task, current_envelope|
-            bridge.execute(current_envelope, app)
+            bridge.execute(current_envelope, app, rack_errors, body_reader)
           end
         end
       end
@@ -40,6 +42,11 @@ lambda do |bridge, app|
   end
 end
 "#;
+
+enum FiberApp {
+    Source(String),
+    Rackup(PathBuf),
+}
 
 enum FiberCommand {
     Call {
@@ -64,6 +71,7 @@ struct FiberBridge {
     command_rx: RefCell<Receiver<FiberCommand>>,
     wake_reader: RefCell<UnixStream>,
     shutdown_reply: RefCell<Option<SyncSender<()>>>,
+    ruby_thread_object_id: u64,
 }
 
 impl FiberBridge {
@@ -110,16 +118,26 @@ impl FiberBridge {
 
     fn execute(
         ruby: &Ruby,
-        _bridge: &Self,
+        bridge: &Self,
         envelope: &FiberEnvelope,
         app: Value,
+        rack_errors: Value,
+        body_reader: Value,
     ) -> Result<(), magnus::Error> {
         let call =
             envelope.0.borrow_mut().take().ok_or_else(|| {
                 magnus::Error::new(ruby.exception_runtime_error(), "request reused")
             })?;
         let string_io_class = ruby.class_object().const_get::<_, RClass>("StringIO")?;
-        let result = call_app(ruby, app, string_io_class, call.request);
+        let result = call_app(
+            ruby,
+            app,
+            string_io_class,
+            rack_errors,
+            body_reader,
+            bridge.ruby_thread_object_id,
+            call.request,
+        );
         (call.completion)(result);
         Ok(())
     }
@@ -199,6 +217,36 @@ impl FiberRuntime {
         app_source: impl Into<String>,
         max_inflight_requests: usize,
     ) -> Result<Self, BridgeError> {
+        Self::start_app(FiberApp::Source(app_source.into()), max_inflight_requests)
+    }
+
+    /// Starts a Fiber runtime with the application built from a rackup file.
+    pub fn start_rackup(path: impl AsRef<Path>) -> Result<Self, BridgeError> {
+        Self::start_rackup_with_limit(path, DEFAULT_MAX_INFLIGHT_REQUESTS)
+    }
+
+    /// Starts a rackup application with a bounded number of in-flight requests.
+    pub fn start_rackup_with_limit(
+        path: impl AsRef<Path>,
+        max_inflight_requests: usize,
+    ) -> Result<Self, BridgeError> {
+        let path = path.as_ref();
+        let rackup = path.canonicalize().map_err(|error| {
+            BridgeError::Startup(format!(
+                "failed to resolve rackup {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !rackup.is_file() {
+            return Err(BridgeError::Startup(format!(
+                "rackup is not a file: {}",
+                rackup.display()
+            )));
+        }
+        Self::start_app(FiberApp::Rackup(rackup), max_inflight_requests)
+    }
+
+    fn start_app(app: FiberApp, max_inflight_requests: usize) -> Result<Self, BridgeError> {
         if max_inflight_requests == 0 {
             return Err(BridgeError::Startup(
                 "max in-flight requests must be positive".to_owned(),
@@ -216,12 +264,11 @@ impl FiberRuntime {
 
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let panic_ready_tx = ready_tx.clone();
-        let app_source = app_source.into();
         let join = thread::Builder::new()
             .name("ruvoy-ruby-fiber-runtime".to_owned())
             .spawn(move || {
                 match panic::catch_unwind(AssertUnwindSafe(|| {
-                    fiber_runtime_main(app_source, command_rx, wake_reader, ready_tx)
+                    fiber_runtime_main(app, command_rx, wake_reader, ready_tx)
                 })) {
                     Ok(result) => result,
                     Err(payload) => {
@@ -346,7 +393,7 @@ impl Drop for FiberRuntime {
 }
 
 fn fiber_runtime_main(
-    app_source: String,
+    app: FiberApp,
     command_rx: Receiver<FiberCommand>,
     wake_reader: UnixStream,
     ready_tx: SyncSender<Result<RuntimeInfo, BridgeError>>,
@@ -371,7 +418,7 @@ fn fiber_runtime_main(
     bridge_class
         .define_method("fd", method!(FiberBridge::fd, 0))
         .and_then(|_| bridge_class.define_method("drain", method!(FiberBridge::drain, 0)))
-        .and_then(|_| bridge_class.define_method("execute", method!(FiberBridge::execute, 2)))
+        .and_then(|_| bridge_class.define_method("execute", method!(FiberBridge::execute, 4)))
         .and_then(|_| {
             bridge_class.define_method("ack_shutdown", method!(FiberBridge::ack_shutdown, 0))
         })
@@ -380,10 +427,25 @@ fn fiber_runtime_main(
         .define_class("FiberEnvelope", ruby.class_object())
         .map_err(|error| ruby_error("defining FiberEnvelope", error))?;
 
-    let app = match ruby.eval::<Value>(&app_source) {
+    let app = match load_fiber_app(ruby, app) {
         Ok(value) => BoxValue::new(value),
         Err(error) => {
-            let error = ruby_error("evaluating fiber app source", error);
+            let _ = ready_tx.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+    let rack_errors = match ruby.eval::<Value>("STDERR") {
+        Ok(value) => BoxValue::new(value),
+        Err(error) => {
+            let error = ruby_error("loading rack.errors", error);
+            let _ = ready_tx.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+    let body_reader = match ruby.eval::<Value>(RACK_BODY_READER_SOURCE) {
+        Ok(value) => BoxValue::new(value),
+        Err(error) => {
+            let error = ruby_error("loading Rack body reader", error);
             let _ = ready_tx.send(Err(error.clone()));
             return Err(error);
         }
@@ -396,11 +458,6 @@ fn fiber_runtime_main(
             return Err(error);
         }
     };
-    let bridge = ruby.obj_wrap(FiberBridge {
-        command_rx: RefCell::new(command_rx),
-        wake_reader: RefCell::new(wake_reader),
-        shutdown_reply: RefCell::new(None),
-    });
 
     let info = match runtime_info(ruby) {
         Ok(info) => info,
@@ -409,15 +466,52 @@ fn fiber_runtime_main(
             return Err(error);
         }
     };
+    let bridge = ruby.obj_wrap(FiberBridge {
+        command_rx: RefCell::new(command_rx),
+        wake_reader: RefCell::new(wake_reader),
+        shutdown_reply: RefCell::new(None),
+        ruby_thread_object_id: info.ruby_thread_object_id,
+    });
     ready_tx
         .send(Ok(info))
         .map_err(|_| BridgeError::Startup("starter dropped fiber readiness channel".to_owned()))?;
 
     runner
-        .funcall::<_, _, Value>("call", (bridge, *app))
+        .funcall::<_, _, Value>("call", (bridge, *app, *rack_errors, *body_reader))
         .map_err(|error| ruby_error("running Async reactor", error))?;
 
     Ok(())
+}
+
+fn load_fiber_app(ruby: &Ruby, app: FiberApp) -> Result<Value, BridgeError> {
+    match app {
+        FiberApp::Source(source) => ruby
+            .eval(&source)
+            .map_err(|error| ruby_error("evaluating fiber app source", error)),
+        FiberApp::Rackup(path) => {
+            ruby.require("rack")
+                .map_err(|error| ruby_error("loading Rack", error))?;
+            let path = path.to_str().ok_or_else(|| {
+                BridgeError::Startup(format!(
+                    "rackup path must contain valid UTF-8: {}",
+                    path.display()
+                ))
+            })?;
+            let rack = ruby
+                .class_object()
+                .const_get::<_, RModule>("Rack")
+                .map_err(|error| ruby_error("loading Rack module", error))?;
+            let builder = rack
+                .const_get::<_, RClass>("Builder")
+                .map_err(|error| ruby_error("loading Rack::Builder", error))?;
+            builder
+                .funcall(
+                    "parse_file",
+                    (path, kwargs!(ruby, "isolation" => ruby.to_symbol("fiber"))),
+                )
+                .map_err(|error| ruby_error("loading rackup", error))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -30,7 +30,7 @@ static_resources:
                       terminal_filter: true
                       filter_config:
                         "@type": type.googleapis.com/google.protobuf.StringValue
-                        value: fiber_rack
+                        value: bench/config.ru
     - name: ruvoy_fiber_control
       address:
         socket_address:
