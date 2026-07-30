@@ -10,7 +10,8 @@ name = "ruvoy_fiber"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ruvoy-poc = { path = "../.." }
+libc = "0.2"
+ruvoy = { path = "../.." }
 
 [dependencies.envoy-proxy-dynamic-modules-rust-sdk]
 git = "https://github.com/envoyproxy/envoy"

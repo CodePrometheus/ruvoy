@@ -1,4 +1,4 @@
-use ruvoy_poc::{Request, RubyRuntime};
+use ruvoy::{Request, RubyRuntime};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = RubyRuntime::start_default()?;

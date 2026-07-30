@@ -12,6 +12,10 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ruvoy_sync_rack
+                # A stuck Ruby call never writes to the stream, so without an
+                # explicit bound the request would hang for Envoy's 5m default.
+                stream_idle_timeout: 15s
+                request_timeout: 30s
                 codec_type: AUTO
                 route_config:
                   name: local_route

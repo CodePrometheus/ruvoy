@@ -13,6 +13,10 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ruvoy_fiber_rack
                 codec_type: AUTO
+                # A stuck Ruby Fiber never writes to the stream, so without an
+                # explicit bound the request would hang for Envoy's 5m default.
+                stream_idle_timeout: 15s
+                request_timeout: 30s
                 route_config:
                   name: local_route
                   virtual_hosts:

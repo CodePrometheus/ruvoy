@@ -121,6 +121,7 @@ BUNDLE_GEMFILE="$repo_root/Gemfile" \
   BUNDLE_PATH="$repo_root/vendor/bundle" \
   BUNDLE_FROZEN=true \
   ENVOY_DYNAMIC_MODULES_SEARCH_PATH="$repo_root/build/modules" \
+  RUVOY_DIAGNOSTICS=1 \
   uvx --from envoy-server==1.39.0 envoy \
   --config-path "$envoy_config" \
   --concurrency "$envoy_concurrency" \

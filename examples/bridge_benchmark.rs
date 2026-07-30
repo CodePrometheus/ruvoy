@@ -1,4 +1,4 @@
-use ruvoy_poc::{Request, Response, RubyRuntime};
+use ruvoy::{Request, Response, RubyRuntime};
 use std::hint::black_box;
 use std::time::Instant;
 

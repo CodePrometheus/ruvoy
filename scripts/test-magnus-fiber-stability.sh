@@ -56,7 +56,7 @@ fi
   printf 'waves=%s\nrequests_per_wave=%s\nconcurrency=%s\n' \
     "$waves" "$requests_per_wave" "$concurrency"
   printf 'body_bytes=%s\nhost_threads=%s\n' "$body_bytes" "$host_threads"
-  cargo tree -p ruvoy-poc | rg 'magnus|rb-sys'
+  cargo tree -p ruvoy | rg 'magnus|rb-sys'
   cargo build --release --example fiber_stability_probe
 } >"$preflight_log" 2>&1 || fail "probe release build failed"
 

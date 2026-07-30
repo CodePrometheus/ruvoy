@@ -247,4 +247,8 @@ wait_for_url "http://127.0.0.1:$puma_port/closed" "$puma_pid" ||
 assert_server ruvoy "http://127.0.0.1:$fiber_port" "$fiber_port"
 assert_server puma "http://127.0.0.1:$puma_port" "$puma_port"
 
+# Fibers interleave app.call, so the Fiber runtime must not claim exclusivity.
+grep -Fxq 'rack.multithread=true' "$temporary_dir/ruvoy-env.body" ||
+  fail "Ruvoy did not report rack.multithread for the Fiber runtime"
+
 echo "PASS: Ruvoy and Puma served the same Rack::Lint application"

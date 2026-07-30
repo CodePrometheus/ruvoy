@@ -1,4 +1,4 @@
-//! Standalone proof of concept for a CRuby-owned request bridge.
+//! CRuby-owned request runtime for Ruvoy.
 //!
 //! Producer threads exchange owned Rust data with one long-lived runtime
 //! thread. Only that runtime thread initializes and calls CRuby.
@@ -9,6 +9,7 @@ use magnus::{
     RArray, RClass, RHash, RString, Ruby, Value, prelude::*, r_hash::ForEach, value::BoxValue,
 };
 use std::{
+    collections::VecDeque,
     error::Error as StdError,
     fmt,
     io::{self, Read, Write},
@@ -24,6 +25,9 @@ use std::{
 
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+// The synchronous runtime stays buffered: it exists as a diagnostic control for
+// the Fiber runtime, and giving it a second response path would make the two
+// harder to compare.
 const RACK_BODY_READER_SOURCE: &str = r#"
 lambda do |body|
   raise TypeError, "streaming Rack response bodies are not supported" unless body.respond_to?(:each)
@@ -35,6 +39,31 @@ lambda do |body|
     body.close if body.respond_to?(:close)
   end
   output
+end
+"#;
+
+// Pushing each chunk into the sink keeps the whole response out of memory and
+// lets the first bytes reach the client while the application is still
+// producing. Waiting for capacity happens in Ruby because only Ruby can yield
+// the Fiber; blocking in Rust would stall every other request on the runtime
+// thread. A cancelled sink stops the enumeration instead of walking a body
+// nobody will read.
+pub(crate) const RACK_STREAMING_BODY_READER_SOURCE: &str = r#"
+lambda do |body, sink|
+  raise TypeError, "streaming Rack response bodies are not supported" unless body.respond_to?(:each)
+
+  begin
+    body.each do |chunk|
+      until sink.writable?
+        break if sink.cancelled?
+        sleep 0.001
+      end
+      break unless sink.write(chunk)
+    end
+  ensure
+    body.close if body.respond_to?(:close)
+  end
+  nil
 end
 "#;
 
@@ -178,6 +207,169 @@ impl Response {
     }
 }
 
+/// The response head, delivered before the body has been produced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResponseHead {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub ruby_thread_object_id: u64,
+}
+
+/// What the Envoy worker still has to send downstream.
+#[derive(Debug)]
+pub enum StreamItem {
+    Head(ResponseHead),
+    Chunk(Vec<u8>),
+    End,
+    Failed(BridgeError),
+}
+
+/// The hand-off between the Ruby owner thread and one Envoy worker stream.
+///
+/// The queue is bounded by buffered bytes rather than chunk count, because a
+/// Rack body is free to yield either many small strings or a few large ones,
+/// and only the byte total bounds memory.
+pub struct ResponseStream {
+    inner: Mutex<ResponseStreamInner>,
+    max_buffered_bytes: usize,
+}
+
+#[derive(Default)]
+struct ResponseStreamInner {
+    items: VecDeque<StreamItem>,
+    buffered_bytes: usize,
+    cancelled: bool,
+    /// Set while the downstream write buffer is over its high watermark.
+    paused: bool,
+}
+
+impl ResponseStream {
+    pub fn new(max_buffered_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(ResponseStreamInner::default()),
+            max_buffered_bytes: max_buffered_bytes.max(1),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ResponseStreamInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Marks the stream dead. Called when the Envoy filter goes away, so the
+    /// Ruby side can stop enumerating a body nobody will read.
+    pub fn cancel(&self) {
+        let mut inner = self.lock();
+        inner.cancelled = true;
+        inner.items.clear();
+        inner.buffered_bytes = 0;
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.lock().cancelled
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.lock().paused = paused;
+    }
+
+    /// True while the producer must wait: either the buffer is full or the
+    /// downstream asked us to stop writing.
+    pub fn is_saturated(&self) -> bool {
+        let inner = self.lock();
+        inner.paused || inner.buffered_bytes >= self.max_buffered_bytes
+    }
+
+    fn push(&self, item: StreamItem) -> bool {
+        let mut inner = self.lock();
+        if inner.cancelled {
+            return false;
+        }
+        if let StreamItem::Chunk(chunk) = &item {
+            inner.buffered_bytes += chunk.len();
+        }
+        inner.items.push_back(item);
+        true
+    }
+
+    pub fn push_head(&self, head: ResponseHead) -> bool {
+        self.push(StreamItem::Head(head))
+    }
+
+    pub fn push_chunk(&self, chunk: Vec<u8>) -> bool {
+        self.push(StreamItem::Chunk(chunk))
+    }
+
+    pub fn push_end(&self) -> bool {
+        self.push(StreamItem::End)
+    }
+
+    pub fn push_failure(&self, error: BridgeError) -> bool {
+        self.push(StreamItem::Failed(error))
+    }
+
+    /// Takes the next item unless the downstream is paused, in which case the
+    /// worker leaves it queued so the producer keeps feeling the backpressure.
+    pub fn take_next(&self) -> Option<StreamItem> {
+        let mut inner = self.lock();
+        if inner.paused {
+            return None;
+        }
+        let item = inner.items.pop_front()?;
+        if let StreamItem::Chunk(chunk) = &item {
+            inner.buffered_bytes = inner.buffered_bytes.saturating_sub(chunk.len());
+        }
+        Some(item)
+    }
+}
+
+/// Wakes the Envoy worker that owns the downstream stream.
+///
+/// The Ruby thread must never touch Envoy state directly, so producing a chunk
+/// only signals the worker; the worker then drains the queue on its own thread.
+pub type StreamWaker = Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// One streaming response: the shared queue plus the way to wake its worker.
+#[derive(Clone)]
+pub struct StreamHandle {
+    pub stream: Arc<ResponseStream>,
+    pub waker: StreamWaker,
+}
+
+impl StreamHandle {
+    pub fn new(stream: Arc<ResponseStream>, waker: StreamWaker) -> Self {
+        Self { stream, waker }
+    }
+
+    pub fn wake(&self) {
+        (self.waker)();
+    }
+}
+
+/// The Fiber runtime re-enters `app.call` while an earlier call is suspended on
+/// scheduler-aware I/O, so `rack.multithread` must not promise exclusive access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RackConcurrency {
+    Serial,
+    Interleaved,
+}
+
+impl RackConcurrency {
+    fn multithread(self) -> bool {
+        matches!(self, Self::Interleaved)
+    }
+}
+
+pub(crate) struct RackCallContext {
+    pub(crate) app: Value,
+    pub(crate) string_io_class: RClass,
+    pub(crate) rack_errors: Value,
+    pub(crate) body_reader: Value,
+    pub(crate) ruby_thread_object_id: u64,
+    pub(crate) concurrency: RackConcurrency,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeInfo {
     pub ruby_description: String,
@@ -217,10 +409,7 @@ impl fmt::Display for BridgeError {
 impl StdError for BridgeError {}
 
 enum Command {
-    Call {
-        request: Request,
-        completion: Completion,
-    },
+    Call(Box<BufferedCall>),
     ForceGc {
         reply: SyncSender<Result<(), BridgeError>>,
     },
@@ -229,7 +418,12 @@ enum Command {
     },
 }
 
-type Completion = Box<dyn FnOnce(Result<Response, BridgeError>) + Send + 'static>;
+pub(crate) type Completion = Box<dyn FnOnce(Result<Response, BridgeError>) + Send + 'static>;
+
+struct BufferedCall {
+    request: Request,
+    completion: Completion,
+}
 
 #[derive(Clone)]
 pub struct RuntimeClient {
@@ -251,10 +445,10 @@ impl RuntimeClient {
     where
         F: FnOnce(Result<Response, BridgeError>) + Send + 'static,
     {
-        self.send_and_wake(Command::Call {
+        self.send_and_wake(Command::Call(Box::new(BufferedCall {
             request,
             completion: Box::new(completion),
-        })
+        })))
     }
 
     pub fn force_gc(&self) -> Result<(), BridgeError> {
@@ -438,7 +632,14 @@ fn runtime_main(
             return Err(error);
         }
     };
-    let ruby_thread_object_id = info.ruby_thread_object_id;
+    let context = RackCallContext {
+        app: *app,
+        string_io_class,
+        rack_errors: *rack_errors,
+        body_reader: *body_reader,
+        ruby_thread_object_id: info.ruby_thread_object_id,
+        concurrency: RackConcurrency::Serial,
+    };
     ready_tx
         .send(Ok(info))
         .map_err(|_| BridgeError::Startup("starter dropped readiness channel".to_owned()))?;
@@ -451,19 +652,8 @@ fn runtime_main(
         let mut should_shutdown = false;
         loop {
             match command_rx.try_recv() {
-                Ok(Command::Call {
-                    request,
-                    completion,
-                }) => {
-                    completion(call_app(
-                        ruby,
-                        *app,
-                        string_io_class,
-                        *rack_errors,
-                        *body_reader,
-                        ruby_thread_object_id,
-                        request,
-                    ));
+                Ok(Command::Call(call)) => {
+                    (call.completion)(call_app(ruby, &context, call.request));
                 }
                 Ok(Command::ForceGc { reply }) => {
                     ruby.gc_start();
@@ -506,16 +696,26 @@ fn runtime_info(ruby: &Ruby) -> Result<RuntimeInfo, BridgeError> {
     })
 }
 
-fn call_app(
+struct RackEnvBuild {
+    env: RHash,
+    diagnostics: Option<RequestDiagnostics>,
+    runtime_queue_time: Option<Duration>,
+    rack_input_time: Duration,
+}
+
+fn build_rack_env(
     ruby: &Ruby,
-    app: Value,
-    string_io_class: RClass,
-    rack_errors: Value,
-    body_reader: Value,
-    ruby_thread_object_id: u64,
+    context: &RackCallContext,
     request: Request,
-) -> Result<Response, BridgeError> {
+) -> Result<RackEnvBuild, BridgeError> {
+    let &RackCallContext {
+        string_io_class,
+        rack_errors,
+        concurrency,
+        ..
+    } = context;
     let runtime_started_at = Instant::now();
+
     let Request {
         method,
         path,
@@ -556,7 +756,7 @@ fn call_app(
         .map_err(|error| ruby_error("setting rack.url_scheme", error))?;
     env.aset("rack.errors", rack_errors)
         .map_err(|error| ruby_error("setting rack.errors", error))?;
-    env.aset("rack.multithread", false)
+    env.aset("rack.multithread", concurrency.multithread())
         .map_err(|error| ruby_error("setting rack.multithread", error))?;
     env.aset("rack.multiprocess", false)
         .map_err(|error| ruby_error("setting rack.multiprocess", error))?;
@@ -581,88 +781,141 @@ fn call_app(
         .map_err(|error| ruby_error("setting rack.input", error))?;
     env.aset("ruvoy.force_gc", force_gc)
         .map_err(|error| ruby_error("setting ruvoy.force_gc", error))?;
-    let rack_input_time = rack_input_started_at.elapsed();
 
-    let rack_call_started_at = Instant::now();
-    let rack_response = app
-        .funcall::<_, _, RArray>("call", (env,))
-        .map_err(|error| ruby_error("calling app.call(env)", error))?;
-    let rack_call_time = rack_call_started_at.elapsed();
+    Ok(RackEnvBuild {
+        env,
+        diagnostics,
+        runtime_queue_time,
+        rack_input_time: rack_input_started_at.elapsed(),
+    })
+}
+
+fn stage_timing_headers(
+    build: &RackEnvBuild,
+    rack_call_time: Duration,
+    response_copy_time: Duration,
+) -> Vec<(String, String)> {
+    let Some(diagnostics) = build.diagnostics.as_ref() else {
+        return Vec::new();
+    };
+    let ingress_time = diagnostics
+        .submitted_at
+        .map(|submitted_at| submitted_at.duration_since(diagnostics.received_at))
+        .unwrap_or_default();
+
+    vec![
+        ("x-ruvoy-stage-timing".to_owned(), "1".to_owned()),
+        (
+            "x-ruvoy-stage-ingress-ns".to_owned(),
+            ingress_time.as_nanos().to_string(),
+        ),
+        (
+            "x-ruvoy-stage-body-copy-ns".to_owned(),
+            diagnostics.body_copy_time.as_nanos().to_string(),
+        ),
+        (
+            "x-ruvoy-stage-body-callbacks".to_owned(),
+            diagnostics.body_callbacks.to_string(),
+        ),
+        (
+            "x-ruvoy-stage-body-reallocations".to_owned(),
+            diagnostics.body_reallocations.to_string(),
+        ),
+        (
+            "x-ruvoy-stage-declared-capacity".to_owned(),
+            diagnostics.declared_capacity.to_string(),
+        ),
+        (
+            "x-ruvoy-stage-runtime-queue-ns".to_owned(),
+            build
+                .runtime_queue_time
+                .unwrap_or_default()
+                .as_nanos()
+                .to_string(),
+        ),
+        (
+            "x-ruvoy-stage-rack-input-ns".to_owned(),
+            build.rack_input_time.as_nanos().to_string(),
+        ),
+        (
+            "x-ruvoy-stage-rack-call-ns".to_owned(),
+            rack_call_time.as_nanos().to_string(),
+        ),
+        (
+            "x-ruvoy-stage-response-copy-ns".to_owned(),
+            response_copy_time.as_nanos().to_string(),
+        ),
+    ]
+}
+
+struct RackResponseParts {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Value,
+}
+
+fn rack_response_parts(rack_response: &RArray) -> Result<RackResponseParts, BridgeError> {
     if rack_response.len() != 3 {
         return Err(BridgeError::InvalidResponse(format!(
             "expected 3 entries, got {}",
             rack_response.len()
         )));
     }
-
-    let response_copy_started_at = Instant::now();
-    let response_body = rack_response
+    let status = rack_response
+        .entry::<i64>(0)
+        .map_err(|error| ruby_error("converting response status", error))
+        .and_then(to_u16_status)?;
+    let headers = copy_response_headers(
+        rack_response
+            .entry::<RHash>(1)
+            .map_err(|error| ruby_error("converting response headers", error))?,
+    )?;
+    let body = rack_response
         .entry::<Value>(2)
         .map_err(|error| ruby_error("reading response body", error))?;
+
+    Ok(RackResponseParts {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn call_app(
+    ruby: &Ruby,
+    context: &RackCallContext,
+    request: Request,
+) -> Result<Response, BridgeError> {
+    let &RackCallContext {
+        app,
+        body_reader,
+        ruby_thread_object_id,
+        ..
+    } = context;
+    let build = build_rack_env(ruby, context, request)?;
+
+    let rack_call_started_at = Instant::now();
+    let rack_response = app
+        .funcall::<_, _, RArray>("call", (build.env,))
+        .map_err(|error| ruby_error("calling app.call(env)", error))?;
+    let rack_call_time = rack_call_started_at.elapsed();
+
+    let response_copy_started_at = Instant::now();
+    let RackResponseParts {
+        status,
+        mut headers,
+        body: response_body,
+    } = rack_response_parts(&rack_response)?;
     let response_body = body_reader
         .funcall::<_, _, RString>("call", (response_body,))
         .map_err(|error| ruby_error("consuming response body", error))?;
     // SAFETY: no Ruby calls occur while the borrowed bytes are copied.
     let body = unsafe { response_body.as_slice() }.to_vec();
-    let status = rack_response
-        .entry::<i64>(0)
-        .map_err(|error| ruby_error("converting response status", error))
-        .and_then(to_u16_status)?;
-    let mut headers = copy_response_headers(
-        rack_response
-            .entry::<RHash>(1)
-            .map_err(|error| ruby_error("converting response headers", error))?,
-    )?;
-    let response_copy_time = response_copy_started_at.elapsed();
-
-    if let Some(diagnostics) = diagnostics {
-        let ingress_time = diagnostics
-            .submitted_at
-            .map(|submitted_at| submitted_at.duration_since(diagnostics.received_at))
-            .unwrap_or_default();
-        headers.extend([
-            ("x-ruvoy-stage-timing".to_owned(), "1".to_owned()),
-            (
-                "x-ruvoy-stage-ingress-ns".to_owned(),
-                ingress_time.as_nanos().to_string(),
-            ),
-            (
-                "x-ruvoy-stage-body-copy-ns".to_owned(),
-                diagnostics.body_copy_time.as_nanos().to_string(),
-            ),
-            (
-                "x-ruvoy-stage-body-callbacks".to_owned(),
-                diagnostics.body_callbacks.to_string(),
-            ),
-            (
-                "x-ruvoy-stage-body-reallocations".to_owned(),
-                diagnostics.body_reallocations.to_string(),
-            ),
-            (
-                "x-ruvoy-stage-declared-capacity".to_owned(),
-                diagnostics.declared_capacity.to_string(),
-            ),
-            (
-                "x-ruvoy-stage-runtime-queue-ns".to_owned(),
-                runtime_queue_time
-                    .unwrap_or_default()
-                    .as_nanos()
-                    .to_string(),
-            ),
-            (
-                "x-ruvoy-stage-rack-input-ns".to_owned(),
-                rack_input_time.as_nanos().to_string(),
-            ),
-            (
-                "x-ruvoy-stage-rack-call-ns".to_owned(),
-                rack_call_time.as_nanos().to_string(),
-            ),
-            (
-                "x-ruvoy-stage-response-copy-ns".to_owned(),
-                response_copy_time.as_nanos().to_string(),
-            ),
-        ]);
-    }
+    headers.extend(stage_timing_headers(
+        &build,
+        rack_call_time,
+        response_copy_started_at.elapsed(),
+    ));
 
     Ok(Response {
         status,
@@ -670,6 +923,55 @@ fn call_app(
         body,
         ruby_thread_object_id,
     })
+}
+
+/// Runs the application and streams its body into `handle` chunk by chunk.
+///
+/// The head is published before the body is enumerated, so Envoy can start
+/// writing to the client while Ruby is still producing.
+pub(crate) fn call_app_streaming(
+    ruby: &Ruby,
+    context: &RackCallContext,
+    request: Request,
+    handle: &StreamHandle,
+    sink: Value,
+) -> Result<(), BridgeError> {
+    let &RackCallContext {
+        app,
+        body_reader,
+        ruby_thread_object_id,
+        ..
+    } = context;
+    let build = build_rack_env(ruby, context, request)?;
+
+    let rack_call_started_at = Instant::now();
+    let rack_response = app
+        .funcall::<_, _, RArray>("call", (build.env,))
+        .map_err(|error| ruby_error("calling app.call(env)", error))?;
+    let rack_call_time = rack_call_started_at.elapsed();
+
+    let RackResponseParts {
+        status,
+        mut headers,
+        body: response_body,
+    } = rack_response_parts(&rack_response)?;
+    headers.extend(stage_timing_headers(&build, rack_call_time, Duration::ZERO));
+    if !handle.stream.push_head(ResponseHead {
+        status,
+        headers,
+        ruby_thread_object_id,
+    }) {
+        return Ok(());
+    }
+    handle.wake();
+
+    body_reader
+        .funcall::<_, _, Value>("call", (response_body, sink))
+        .map_err(|error| ruby_error("streaming response body", error))?;
+
+    handle.stream.push_end();
+    handle.wake();
+    Ok(())
 }
 
 fn copy_response_headers(headers: RHash) -> Result<Vec<(String, String)>, BridgeError> {

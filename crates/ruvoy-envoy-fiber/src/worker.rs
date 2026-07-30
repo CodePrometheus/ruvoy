@@ -1,23 +1,18 @@
 use crate::runtime::{BodyBudget, BodyLease, FiberRackConfig};
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
-use ruvoy_poc::{
-    BridgeError, Request, RequestDiagnostics, RequestMetadata, Response, fiber::FiberRuntimeClient,
+use ruvoy::{
+    Request, RequestDiagnostics, RequestMetadata, ResponseHead, ResponseStream, StreamHandle,
+    StreamItem, StreamWaker, fiber::FiberRuntimeClient,
 };
-use std::{
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
 const RESPONSE_EVENT_ID: u64 = 1;
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-struct TimedResult {
-    completed_at: Instant,
-    result: Result<Response, BridgeError>,
-}
-
-type ResultSlot = Arc<Mutex<Option<TimedResult>>>;
+/// Caps what one response may hold in memory between the Ruby producer and the
+/// downstream write buffer. Beyond this the producer is asked to wait.
+const MAX_BUFFERED_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BodyCopyError {
@@ -34,10 +29,11 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FiberRackConfig {
             client: self.client(),
             body_budget: self.body_budget(),
             body_lease: None,
+            diagnostics_enabled: self.diagnostics_enabled(),
             runtime_thread_id: self.runtime_thread_id().to_owned(),
             worker_thread_id: format!("{:?}", std::thread::current().id()),
             request: None,
-            result: Arc::new(Mutex::new(None)),
+            stream: None,
             state: FilterState::Collecting,
         })
     }
@@ -47,6 +43,8 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FiberRackConfig {
 enum FilterState {
     Collecting,
     Waiting,
+    /// Headers are on the wire; only body chunks may follow.
+    Streaming,
     Responded,
 }
 
@@ -54,11 +52,21 @@ struct FiberRackFilter {
     client: FiberRuntimeClient,
     body_budget: Arc<BodyBudget>,
     body_lease: Option<BodyLease>,
+    diagnostics_enabled: bool,
     runtime_thread_id: String,
     worker_thread_id: String,
     request: Option<Request>,
-    result: ResultSlot,
+    stream: Option<Arc<ResponseStream>>,
     state: FilterState,
+}
+
+impl Drop for FiberRackFilter {
+    fn drop(&mut self) {
+        // The downstream is gone, so tell Ruby to stop enumerating the body.
+        if let Some(stream) = self.stream.take() {
+            stream.cancel();
+        }
+    }
 }
 
 impl FiberRackFilter {
@@ -87,7 +95,6 @@ impl FiberRackFilter {
             .map(|value| String::from_utf8_lossy(value.as_slice()).into_owned())
             .ok_or(BodyCopyError::InvalidRequest("missing :path"))?;
         let metadata = request_metadata(envoy_filter)?;
-        let force_gc = path.split('?').next() == Some("/gc");
         let body_capacity = declared_body_capacity(
             envoy_filter
                 .get_request_header_value("content-length")
@@ -101,9 +108,10 @@ impl FiberRackFilter {
             .map_err(|_| BodyCopyError::Overloaded)?;
         body.try_reserve_exact(body_capacity)
             .map_err(|_| BodyCopyError::Allocation)?;
-        let diagnostics_enabled = envoy_filter
-            .get_request_header_value("x-ruvoy-stage-timing")
-            .is_some_and(|value| value.as_slice() == b"1");
+        let stage_timing_requested = self.diagnostics_enabled
+            && envoy_filter
+                .get_request_header_value("x-ruvoy-stage-timing")
+                .is_some_and(|value| value.as_slice() == b"1");
 
         Ok((
             Request {
@@ -112,8 +120,8 @@ impl FiberRackFilter {
                 body,
                 headers,
                 metadata,
-                force_gc,
-                diagnostics: diagnostics_enabled
+                force_gc: false,
+                diagnostics: stage_timing_requested
                     .then(|| RequestDiagnostics::new(received_at, body_capacity)),
             },
             body_lease,
@@ -176,22 +184,27 @@ impl FiberRackFilter {
         }
 
         let scheduler = envoy_filter.new_scheduler();
-        let result_slot = Arc::clone(&self.result);
         let body_lease = self.body_lease.take();
-        match self.client.submit(request, move |result| {
-            let result = TimedResult {
-                completed_at: Instant::now(),
-                result,
-            };
-            match result_slot.lock() {
-                Ok(mut slot) => *slot = Some(result),
-                Err(poisoned) => *poisoned.into_inner() = Some(result),
-            }
+        let stream = Arc::new(ResponseStream::new(MAX_BUFFERED_RESPONSE_BYTES));
+        // The waker only signals; the worker thread does every Envoy call when
+        // the scheduled event arrives.
+        let waker: StreamWaker = Arc::new(move || {
             scheduler.commit(RESPONSE_EVENT_ID);
-            drop(body_lease);
-        }) {
-            Ok(()) => self.state = FilterState::Waiting,
+        });
+        self.stream = Some(Arc::clone(&stream));
+
+        match self
+            .client
+            .submit(request, StreamHandle::new(stream, waker))
+        {
+            Ok(()) => {
+                self.state = FilterState::Waiting;
+                // The request body is no longer needed once Ruby owns the call.
+                drop(body_lease);
+            }
             Err(error) => {
+                self.stream = None;
+                drop(body_lease);
                 let body = error.to_string();
                 self.send_bridge_error(
                     envoy_filter,
@@ -260,43 +273,87 @@ impl FiberRackFilter {
         }
     }
 
-    fn send_rack_response<EHF: EnvoyHttpFilter>(
+    fn send_response_head<EHF: EnvoyHttpFilter>(
         &mut self,
         envoy_filter: &mut EHF,
-        response: Response,
-        scheduler_return: Option<Duration>,
+        head: ResponseHead,
     ) {
-        let scheduler_return_value =
-            scheduler_return.map(|duration| duration.as_nanos().to_string());
-        let mut headers = Vec::with_capacity(
-            response.headers.len() + 2 + usize::from(scheduler_return_value.is_some()),
-        );
+        let status = head.status.to_string();
+        let mut headers = Vec::with_capacity(head.headers.len() + 3);
+        headers.push((":status", status.as_bytes()));
         headers.extend(
-            response
-                .headers
+            head.headers
                 .iter()
                 .filter(|(name, _)| !name.starts_with(':') && !name.starts_with("rack."))
                 .map(|(name, value)| (name.as_str(), value.as_bytes())),
         );
-        if let Some(value) = scheduler_return_value.as_deref() {
-            headers.push(("x-ruvoy-stage-scheduler-return-ns", value.as_bytes()));
+        if self.diagnostics_enabled {
+            headers.push((
+                "x-ruvoy-runtime-rust-thread-id",
+                self.runtime_thread_id.as_bytes(),
+            ));
+            headers.push((
+                "x-ruvoy-worker-rust-thread-id",
+                self.worker_thread_id.as_bytes(),
+            ));
         }
-        headers.push((
-            "x-ruvoy-runtime-rust-thread-id",
-            self.runtime_thread_id.as_bytes(),
-        ));
-        headers.push((
-            "x-ruvoy-worker-rust-thread-id",
-            self.worker_thread_id.as_bytes(),
-        ));
 
-        self.state = FilterState::Responded;
-        envoy_filter.send_response(
-            u32::from(response.status),
-            &headers,
-            Some(&response.body),
-            Some("ruvoy_fiber_rack_response"),
-        );
+        self.state = FilterState::Streaming;
+        envoy_filter.send_response_headers(&headers, false);
+    }
+
+    /// Moves whatever the Ruby side has produced so far to the downstream.
+    ///
+    /// Called on the worker thread for every scheduled event, so a slow client
+    /// simply leaves items queued and the producer sees the backpressure.
+    fn drain_stream<EHF: EnvoyHttpFilter>(&mut self, envoy_filter: &mut EHF) {
+        let Some(stream) = self.stream.clone() else {
+            return;
+        };
+
+        while let Some(item) = stream.take_next() {
+            match item {
+                StreamItem::Head(head) => {
+                    if self.state == FilterState::Waiting {
+                        self.send_response_head(envoy_filter, head);
+                    }
+                }
+                StreamItem::Chunk(chunk) => {
+                    if self.state != FilterState::Streaming {
+                        continue;
+                    }
+                    envoy_filter.send_response_data(&chunk, false);
+                }
+                StreamItem::End => {
+                    if self.state == FilterState::Streaming {
+                        envoy_filter.send_response_data(&[], true);
+                    }
+                    self.state = FilterState::Responded;
+                    self.stream = None;
+                    return;
+                }
+                StreamItem::Failed(error) => {
+                    let body = error.to_string();
+                    if self.state == FilterState::Waiting {
+                        // Nothing is on the wire yet, so a clean local reply is
+                        // still possible.
+                        self.send_bridge_error(
+                            envoy_filter,
+                            500,
+                            body.as_bytes(),
+                            "ruvoy_fiber_ruby_error",
+                        );
+                    } else {
+                        // Headers are already out; the only honest signal left
+                        // is to end the stream short rather than fake success.
+                        envoy_filter.send_response_data(&[], true);
+                        self.state = FilterState::Responded;
+                    }
+                    self.stream = None;
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -353,41 +410,34 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
     }
 
     fn on_scheduled(&mut self, envoy_filter: &mut EHF, event_id: u64) {
-        if event_id != RESPONSE_EVENT_ID || self.state != FilterState::Waiting {
+        if event_id != RESPONSE_EVENT_ID {
             return;
         }
-
-        let result = match self.result.lock() {
-            Ok(mut slot) => slot.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        match result {
-            Some(TimedResult {
-                completed_at,
-                result: Ok(response),
-            }) => {
-                let scheduler_return = (response.header("x-ruvoy-stage-timing") == Some("1"))
-                    .then(|| completed_at.elapsed());
-                self.send_rack_response(envoy_filter, response, scheduler_return);
-            }
-            Some(TimedResult {
-                result: Err(error), ..
-            }) => {
-                let body = error.to_string();
-                self.send_bridge_error(
-                    envoy_filter,
-                    500,
-                    body.as_bytes(),
-                    "ruvoy_fiber_ruby_error",
-                );
-            }
-            None => self.send_bridge_error(
-                envoy_filter,
-                500,
-                b"scheduler event arrived without a result",
-                "ruvoy_fiber_missing_result",
-            ),
+        if self.state != FilterState::Waiting && self.state != FilterState::Streaming {
+            return;
         }
+        self.drain_stream(envoy_filter);
+    }
+
+    fn on_downstream_above_write_buffer_high_watermark(&mut self, _envoy_filter: &mut EHF) {
+        // Stop pulling from the queue so the Ruby producer blocks instead of
+        // letting a slow client turn into unbounded memory.
+        if let Some(stream) = self.stream.as_ref() {
+            stream.set_paused(true);
+        }
+    }
+
+    fn on_downstream_below_write_buffer_low_watermark(&mut self, envoy_filter: &mut EHF) {
+        if self.stream.is_none() {
+            return;
+        }
+        if let Some(stream) = self.stream.as_ref() {
+            stream.set_paused(false);
+        }
+        // Writing from inside a watermark callback re-enters Envoy while it is
+        // still adjusting the buffer it is reporting on. Resume on the next
+        // dispatcher turn instead, where sending is a normal operation.
+        envoy_filter.new_scheduler().commit(RESPONSE_EVENT_ID);
     }
 }
 

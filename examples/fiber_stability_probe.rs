@@ -1,5 +1,5 @@
 use magnus::Ruby;
-use ruvoy_poc::{
+use ruvoy::{
     BridgeError, Request, Response,
     fiber::{DEFAULT_MAX_INFLIGHT_REQUESTS, FiberRuntime, FiberRuntimeClient},
 };
@@ -162,7 +162,7 @@ fn submit_request(
     body: &[u8],
 ) -> Result<(), BridgeError> {
     let result_tx = result_tx.clone();
-    client.submit(probe_request(id, body), move |result| {
+    client.submit_collected(probe_request(id, body), move |result| {
         let _ = result_tx.send((id, result));
     })
 }
@@ -330,7 +330,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    runtime.shutdown()?;
+    unsafe {
+        runtime.shutdown()?;
+    }
     println!(
         "total_requests={} total_elapsed_seconds={:.6}",
         waves * requests_per_wave,

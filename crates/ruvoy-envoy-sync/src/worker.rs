@@ -1,7 +1,7 @@
 use crate::runtime::SyncRackConfig;
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
-use ruvoy_poc::{BridgeError, Request, Response, RuntimeClient};
+use ruvoy::{BridgeError, Request, Response, RuntimeClient};
 use std::sync::{Arc, Mutex};
 
 const RESPONSE_EVENT_ID: u64 = 1;
@@ -13,6 +13,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for SyncRackConfig {
     fn new_http_filter(&self, _envoy_filter: &mut EHF) -> Box<dyn HttpFilter<EHF>> {
         Box::new(SyncRackFilter {
             client: self.client(),
+            diagnostics_enabled: self.diagnostics_enabled(),
             runtime_thread_id: self.runtime_thread_id().to_owned(),
             worker_thread_id: format!("{:?}", std::thread::current().id()),
             request: None,
@@ -31,6 +32,7 @@ enum FilterState {
 
 struct SyncRackFilter {
     client: RuntimeClient,
+    diagnostics_enabled: bool,
     runtime_thread_id: String,
     worker_thread_id: String,
     request: Option<Request>,
@@ -59,7 +61,6 @@ impl SyncRackFilter {
             .get_request_header_value(":path")
             .map(|value| String::from_utf8_lossy(value.as_slice()).into_owned())
             .unwrap_or_else(|| "/".to_owned());
-        let force_gc = path.split('?').next() == Some("/gc");
 
         Request {
             method,
@@ -67,7 +68,7 @@ impl SyncRackFilter {
             body: Vec::new(),
             headers,
             metadata: Default::default(),
-            force_gc,
+            force_gc: false,
             diagnostics: None,
         }
     }
@@ -149,7 +150,8 @@ impl SyncRackFilter {
         envoy_filter: &mut EHF,
         response: Response,
     ) {
-        let mut headers = Vec::with_capacity(response.headers.len() + 2);
+        let mut headers =
+            Vec::with_capacity(response.headers.len() + 2 * usize::from(self.diagnostics_enabled));
         headers.extend(
             response
                 .headers
@@ -157,14 +159,16 @@ impl SyncRackFilter {
                 .filter(|(name, _)| !name.starts_with(':'))
                 .map(|(name, value)| (name.as_str(), value.as_bytes())),
         );
-        headers.push((
-            "x-ruvoy-runtime-rust-thread-id",
-            self.runtime_thread_id.as_bytes(),
-        ));
-        headers.push((
-            "x-ruvoy-worker-rust-thread-id",
-            self.worker_thread_id.as_bytes(),
-        ));
+        if self.diagnostics_enabled {
+            headers.push((
+                "x-ruvoy-runtime-rust-thread-id",
+                self.runtime_thread_id.as_bytes(),
+            ));
+            headers.push((
+                "x-ruvoy-worker-rust-thread-id",
+                self.worker_thread_id.as_bytes(),
+            ));
+        }
 
         self.state = FilterState::Responded;
         envoy_filter.send_response(

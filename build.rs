@@ -1,23 +1,14 @@
 fn main() {
+    // Examples link against libruby too. The dynamic modules get their RUNPATH
+    // from their own build scripts; without this the example binaries would
+    // still depend on the caller exporting LD_LIBRARY_PATH.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-
-    if target_os == "macos" {
-        println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
-        return;
-    }
     if target_os != "linux" {
         return;
     }
-
-    // Envoy dlopens the module, and dlopen does not consult the LD_LIBRARY_PATH
-    // of whoever built it. Without an explicit RUNPATH the loader cannot find
-    // libruby and Envoy refuses to start.
     println!("cargo:rerun-if-env-changed=RUBY");
-    match ruby_libdir() {
-        Some(libdir) => println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,{libdir}"),
-        None => println!(
-            "cargo:warning=could not resolve the Ruby libdir; the module will need LD_LIBRARY_PATH"
-        ),
+    if let Some(libdir) = ruby_libdir() {
+        println!("cargo:rustc-link-arg-examples=-Wl,-rpath,{libdir}");
     }
 }
 

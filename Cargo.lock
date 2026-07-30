@@ -363,6 +363,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
+name = "ruvoy"
+version = "0.1.0"
+dependencies = [
+ "magnus",
+]
+
+[[package]]
 name = "ruvoy-envoy-baseline"
 version = "0.1.0"
 dependencies = [
@@ -374,7 +381,8 @@ name = "ruvoy-envoy-fiber"
 version = "0.1.0"
 dependencies = [
  "envoy-proxy-dynamic-modules-rust-sdk",
- "ruvoy-poc",
+ "libc",
+ "ruvoy",
 ]
 
 [[package]]
@@ -382,14 +390,7 @@ name = "ruvoy-envoy-sync"
 version = "0.1.0"
 dependencies = [
  "envoy-proxy-dynamic-modules-rust-sdk",
- "ruvoy-poc",
-]
-
-[[package]]
-name = "ruvoy-poc"
-version = "0.1.0"
-dependencies = [
- "magnus",
+ "ruvoy",
 ]
 
 [[package]]

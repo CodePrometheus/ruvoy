@@ -102,6 +102,7 @@ mkdir -p "$result_dir"
 } >"$result_file" 2>&1 || fail "release module build or preflight failed"
 
 ENVOY_DYNAMIC_MODULES_SEARCH_PATH="$repo_root/build/modules" \
+  RUVOY_DIAGNOSTICS=1 \
   uvx --from envoy-server==1.39.0 envoy \
   --config-path "$repo_root/config/envoy-sync-rack.yaml" \
   --concurrency 1 \

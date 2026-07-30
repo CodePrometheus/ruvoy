@@ -20,7 +20,7 @@ esac
 
 mkdir -p "$result_dir"
 
-run_args=(run --package ruvoy-poc --example fiber_runtime_poc)
+run_args=(run --package ruvoy --example fiber_runtime)
 if [[ "$profile" == "release" ]]; then
   run_args+=(--release)
 fi

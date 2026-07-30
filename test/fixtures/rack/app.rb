@@ -31,6 +31,35 @@ class TrackedRackBody
   end
 end
 
+# Yields chunks with a gap between them so a streaming server can be observed
+# delivering the first bytes before the body is finished. A buffering server
+# cannot produce the same timing.
+class PacedRackBody
+  class << self
+    attr_accessor :yielded_count
+  end
+  self.yielded_count = 0
+
+  def initialize(chunks:, chunk_bytes:, gap_seconds:)
+    @chunks = chunks
+    @chunk_bytes = chunk_bytes
+    @gap_seconds = gap_seconds
+  end
+
+  def each
+    @chunks.times do |index|
+      sleep @gap_seconds if index.positive? && @gap_seconds.positive?
+      self.class.yielded_count += 1
+      # A single-digit marker keeps every chunk exactly chunk_bytes long.
+      yield((index % 10).to_s.b + ("C".b * (@chunk_bytes - 1)))
+    end
+  end
+
+  def close
+    TrackedRackBody.closed_count += 1
+  end
+end
+
 class RackCompatibilityApp
   MAX_BODY_BYTES = 2 * 1024 * 1024
   MAX_WAIT_MS = 1_000
@@ -48,6 +77,8 @@ class RackCompatibilityApp
     request_body = read_request_body(env)
     return rack_env_response(env) if path == "/rack-env"
     return enumerable_response if path == "/enumerable"
+    return paced_response(query) if path == "/paced"
+    return text_response(PacedRackBody.yielded_count.to_s) if path == "/paced-yielded"
     return text_response(TrackedRackBody.closed_count.to_s) if path == "/closed"
 
     response_body = route_body(env, path, query, request_body)
@@ -68,7 +99,8 @@ class RackCompatibilityApp
   end
 
   def read_request_body(env)
-    env.fetch("rack.input").read
+    # rack.input is optional since Rack 3.1, so a server may legitimately omit it.
+    env["rack.input"]&.read || ""
   end
 
   def route_body(env, path, query, request_body)
@@ -136,6 +168,26 @@ class RackCompatibilityApp
       rack.run_once
     ].map { |key| "#{key}=#{env[key].inspect}" }.join("\n")
     text_response(body)
+  end
+
+  def paced_response(query)
+    parameters = query.split("&").to_h { |entry| entry.split("=", 2) }
+    chunks = Integer(parameters.fetch("chunks", "4"), 10)
+    chunk_bytes = Integer(parameters.fetch("chunk_bytes", "16"), 10)
+    gap_ms = Integer(parameters.fetch("gap_ms", "200"), 10)
+    raise "invalid paced chunks" unless (1..1_000).cover?(chunks)
+    raise "invalid paced chunk_bytes" unless (1..1_048_576).cover?(chunk_bytes)
+    raise "invalid paced gap_ms" unless (0..5_000).cover?(gap_ms)
+
+    [
+      200,
+      {
+        "content-type" => "application/octet-stream",
+        "x-paced-chunks" => chunks.to_s,
+        "x-paced-chunk-bytes" => chunk_bytes.to_s
+      },
+      PacedRackBody.new(chunks: chunks, chunk_bytes: chunk_bytes, gap_seconds: gap_ms / 1000.0)
+    ]
   end
 
   def enumerable_response

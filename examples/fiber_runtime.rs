@@ -1,4 +1,4 @@
-use ruvoy_poc::{
+use ruvoy::{
     Request, Response,
     fiber::{FiberRuntime, FiberRuntimeClient},
 };
@@ -65,7 +65,7 @@ fn run_batch(client: &FiberRuntimeClient, count: usize, path: &str) -> (Duration
         let path = path.to_owned();
         producers.push(thread::spawn(move || {
             client
-                .submit(
+                .submit_collected(
                     Request::new("GET", path, format!("request-{index}").into_bytes()),
                     move |result| {
                         response_tx
@@ -181,9 +181,11 @@ fn main() {
             .all(|response| response.status == 200)
     );
 
-    runtime
-        .shutdown()
-        .expect("Fiber runtime should shut down cleanly");
+    unsafe {
+        runtime
+            .shutdown()
+            .expect("Fiber runtime should shut down cleanly");
+    }
 
     println!("result=PASS");
     println!("async_version=2.39.0");
