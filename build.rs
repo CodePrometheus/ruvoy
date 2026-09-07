@@ -1,3 +1,5 @@
+//! Links the module against the Ruby the crate is built for.
+
 fn main() {
     // Examples link against libruby too. The dynamic modules get their RUNPATH
     // from their own build scripts; without this the example binaries would

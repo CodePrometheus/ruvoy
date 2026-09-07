@@ -8,7 +8,7 @@ class RackCompatibilityMiddleware
   def call(env)
     status, headers, body = @app.call(env)
     headers["x-rack-middleware"] = "active"
-    [status, headers, body]
+    [ status, headers, body ]
   end
 end
 
@@ -83,7 +83,7 @@ class RackCompatibilityApp
 
     response_body = route_body(env, path, query, request_body)
     headers = response_headers(env, request_body, response_body)
-    [200, headers, [response_body]]
+    [ 200, headers, [ response_body ] ]
   end
 
   private
@@ -112,7 +112,7 @@ class RackCompatibilityApp
     when "/large-response"
       "F".b * (1024 * 1024)
     else
-      [env.fetch("REQUEST_METHOD"), path, request_body].join(" ")
+      [ env.fetch("REQUEST_METHOD"), path, request_body ].join(" ")
     end
   end
 
@@ -196,7 +196,7 @@ class RackCompatibilityApp
       {
         "content-type" => "text/plain",
         "content-length" => "9",
-        "set-cookie" => ["first=1", "second=2"]
+        "set-cookie" => [ "first=1", "second=2" ]
       },
       TrackedRackBody.new("rack", "-body")
     ]
@@ -209,7 +209,7 @@ class RackCompatibilityApp
         "content-type" => "text/plain",
         "content-length" => body.bytesize.to_s
       },
-      [body]
+      [ body ]
     ]
   end
 end

@@ -45,7 +45,7 @@ def bar_chart(title, subtitle, series, unit)
   plot_height = HEIGHT - MARGIN_TOP - MARGIN_BOTTOM
   maximum = axis_maximum(series.map { |entry| entry.fetch(:value) })
   slot = plot_width.to_f / series.length
-  bar_width = [slot * 0.6, 90].min
+  bar_width = [ slot * 0.6, 90 ].min
 
   svg = []
   svg << %(<svg xmlns="http://www.w3.org/2000/svg" width="#{WIDTH}" height="#{HEIGHT}" ) +
@@ -98,16 +98,16 @@ rounds = provenance.fetch("rounds", "?")
 duration = provenance.fetch("bench_duration", "?")
 
 written = []
-summary.fetch("measurements").group_by { |row| [row.fetch("scenario"), row.fetch("tls_mode")] }
+summary.fetch("measurements").group_by { |row| [ row.fetch("scenario"), row.fetch("tls_mode") ] }
   .each do |(scenario, tls_mode), rows|
     ordered = rows.sort_by { |row| row.fetch("architecture") }
     subtitle = "commit #{commit} · #{host} · #{rounds} rounds x #{duration} · #{tls_mode}"
 
     throughput = ordered.map do |row|
-      {label: row.fetch("architecture"), value: row.fetch("rps_median")}
+      { label: row.fetch("architecture"), value: row.fetch("rps_median") }
     end
     latency = ordered.map do |row|
-      {label: row.fetch("architecture"), value: row.fetch("p99_median_seconds") * 1_000}
+      { label: row.fetch("architecture"), value: row.fetch("p99_median_seconds") * 1_000 }
     end
 
     throughput_path = File.join(charts_dir, "#{scenario}_#{tls_mode}_throughput.svg")

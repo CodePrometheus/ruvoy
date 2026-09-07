@@ -42,7 +42,7 @@ def validate_measurement!(document, relative_path)
   raise "#{relative_path}: success rate is not 100%" unless Float(summary.fetch("successRate")) == 1.0
   raise "#{relative_path}: requestsPerSec is not positive" unless Float(summary.fetch("requestsPerSec")) > 0
   raise "#{relative_path}: transport errors are present" unless errors.empty?
-  raise "#{relative_path}: non-200 status is present" unless statuses.keys == ["200"]
+  raise "#{relative_path}: non-200 status is present" unless statuses.keys == [ "200" ]
 
   requests = Integer(statuses.fetch("200"))
   raise "#{relative_path}: no successful requests" unless requests.positive?
@@ -75,7 +75,7 @@ manifest = CSV.read(
   col_sep: "\t"
 )
 groups = manifest.group_by do |row|
-  [row.fetch("architecture"), row.fetch("scenario"), row.fetch("tls_mode")]
+  [ row.fetch("architecture"), row.fetch("scenario"), row.fetch("tls_mode") ]
 end
 
 summary_rows = groups.map do |(architecture, scenario, tls_mode), rows|
@@ -120,7 +120,7 @@ summary_rows = groups.map do |(architecture, scenario, tls_mode), rows|
     "rss_mib_max" => rss.max,
     "errors" => 0
   }
-end.sort_by { |row| [row.fetch("tls_mode"), row.fetch("scenario"), row.fetch("architecture")] }
+end.sort_by { |row| [ row.fetch("tls_mode"), row.fetch("scenario"), row.fetch("architecture") ] }
 
 control_manifest = CSV.read(
   File.join(result_dir, "control-manifest.tsv"),
@@ -128,7 +128,7 @@ control_manifest = CSV.read(
   col_sep: "\t"
 )
 control_rows = control_manifest
-  .group_by { |row| [row.fetch("architecture"), row.fetch("state")] }
+  .group_by { |row| [ row.fetch("architecture"), row.fetch("state") ] }
   .map do |(architecture, state), rows|
     documents = rows.map { |row| load_json(result_dir, row.fetch("oha_json")) }
     documents.zip(rows).each { |document, row| validate_measurement!(document, row.fetch("oha_json")) }
@@ -144,7 +144,7 @@ control_rows = control_manifest
       )
     }
   end
-  .sort_by { |row| [row.fetch("architecture"), row.fetch("state")] }
+  .sort_by { |row| [ row.fetch("architecture"), row.fetch("state") ] }
 
 bridge_documents = Dir.glob(File.join(result_dir, "bridge-run*.json"))
   .sort

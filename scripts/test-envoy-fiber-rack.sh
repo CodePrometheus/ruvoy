@@ -109,7 +109,7 @@ mkdir -p "$result_dir"
   echo "envoy_package=envoy-server==1.39.0"
   echo "envoy_sdk_commit=8eea3285d6bdb89f8ea34632cfe7ce1608a8f374"
   echo "ruby_version=4.0.5"
-  echo "async_version=2.39.0"
+  echo "async_version=$("$repo_root/scripts/gem-version.sh" async)"
   echo "rustc=$(rustc --version)"
   echo "host=$(uname -srm)"
   "$repo_root/scripts/build-fiber-module.sh"
@@ -149,8 +149,9 @@ done
 get_prefix="$temporary_dir/get"
 get_status="$(curl_fiber "$get_prefix" "http://127.0.0.1:$fiber_port/info")"
 assert_status "$get_status" 200 "GET /info"
-[[ "$(header_value "$get_prefix.headers" "x-async-version")" == "2.39.0" ]] ||
-  fail "Envoy Fiber response did not report Async 2.39.0"
+expected_async="$("$repo_root/scripts/gem-version.sh" async)"
+[[ "$(header_value "$get_prefix.headers" "x-async-version")" == "$expected_async" ]] ||
+  fail "Envoy Fiber response did not report Async $expected_async"
 runtime_thread_id="$(header_value "$get_prefix.headers" "x-ruvoy-runtime-rust-thread-id")"
 worker_thread_id="$(header_value "$get_prefix.headers" "x-ruvoy-worker-rust-thread-id")"
 ruby_thread_object_id="$(header_value "$get_prefix.headers" "x-ruby-thread-object-id")"
@@ -206,9 +207,6 @@ stage_rack_call_ns="$(header_value "$large_request_prefix.headers" "x-ruvoy-stag
 stage_response_copy_ns="$(
   header_value "$large_request_prefix.headers" "x-ruvoy-stage-response-copy-ns"
 )"
-stage_scheduler_return_ns="$(
-  header_value "$large_request_prefix.headers" "x-ruvoy-stage-scheduler-return-ns"
-)"
 for value in \
   "$stage_ingress_ns" \
   "$stage_body_copy_ns" \
@@ -218,8 +216,7 @@ for value in \
   "$stage_runtime_queue_ns" \
   "$stage_rack_input_ns" \
   "$stage_rack_call_ns" \
-  "$stage_response_copy_ns" \
-  "$stage_scheduler_return_ns"; do
+  "$stage_response_copy_ns"; do
   [[ "$value" =~ ^[0-9]+$ ]] || fail "invalid or missing Fiber stage timing header: $value"
 done
 [[ "$stage_declared_capacity" == "1048576" ]] ||
@@ -526,7 +523,7 @@ fi
 
 {
   echo "result=PASS"
-  echo "async_version=2.39.0"
+  echo "async_version=$("$repo_root/scripts/gem-version.sh" async)"
   echo "get_post_headers_1mib=PASS"
   echo "chunked_1mib=PASS"
   echo "over_limit_413=PASS"

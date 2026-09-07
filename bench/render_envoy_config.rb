@@ -30,11 +30,11 @@ def downstream_tls_context(certificate_path, private_key_path)
         },
         "tls_certificates" => [
           {
-            "certificate_chain" => {"filename" => certificate_path},
-            "private_key" => {"filename" => private_key_path}
+            "certificate_chain" => { "filename" => certificate_path },
+            "private_key" => { "filename" => private_key_path }
           }
         ],
-        "alpn_protocols" => ["h2", "http/1.1"]
+        "alpn_protocols" => [ "h2", "http/1.1" ]
       }
     }
   }

@@ -1,3 +1,5 @@
+//! Drives the fiber runtime through cancellation and overload.
+
 use magnus::Ruby;
 use ruvoy::{
     BridgeError, Request, Response,
@@ -330,6 +332,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
+    // SAFETY: the program is about to exit and every client clone has been
+    // dropped, so no Ruby execution can still be in flight.
     unsafe {
         runtime.shutdown()?;
     }

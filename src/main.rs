@@ -1,4 +1,6 @@
-use ruvoy::{Request, RubyRuntime};
+//! Command-line demonstration of the serial runtime.
+
+use ruvoy::{Request, sync::RubyRuntime};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = RubyRuntime::start_default()?;

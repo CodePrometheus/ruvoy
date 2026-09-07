@@ -30,7 +30,12 @@ case "$(uname -s)" in
   Darwin)
     source_module="$repo_root/target/$profile/libruvoy_baseline.dylib"
     target_module="$module_dir/libruvoy_baseline.so"
-    cp "$source_module" "$target_module"
+    # Installed through a rename so the module always arrives at a fresh inode.
+    # Overwriting in place leaves the kernel validating new content against the
+    # code-signature pages it cached for the old file, which kills any process
+    # that loads it with no diagnostic beyond a signal.
+    cp "$source_module" "$target_module.staged"
+    mv "$target_module.staged" "$target_module"
     file "$target_module"
     otool -L "$target_module"
     nm -gU "$target_module" | grep 'envoy_dynamic_module_on_program_init'
@@ -38,7 +43,12 @@ case "$(uname -s)" in
   Linux)
     source_module="$repo_root/target/$profile/libruvoy_baseline.so"
     target_module="$module_dir/libruvoy_baseline.so"
-    cp "$source_module" "$target_module"
+    # Installed through a rename so the module always arrives at a fresh inode.
+    # Overwriting in place leaves the kernel validating new content against the
+    # code-signature pages it cached for the old file, which kills any process
+    # that loads it with no diagnostic beyond a signal.
+    cp "$source_module" "$target_module.staged"
+    mv "$target_module.staged" "$target_module"
     file "$target_module"
     ldd "$target_module"
     nm -D --defined-only "$target_module" | grep 'envoy_dynamic_module_on_program_init'

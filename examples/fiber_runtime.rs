@@ -1,3 +1,5 @@
+//! Exercises the fiber runtime without Envoy in the picture.
+
 use ruvoy::{
     Request, Response,
     fiber::{FiberRuntime, FiberRuntimeClient},
@@ -133,9 +135,14 @@ fn main() {
             .iter()
             .all(|response| response.status == 200)
     );
+    let async_version = async_responses
+        .first()
+        .and_then(|response| response.header("x-async-version"))
+        .expect("scheduler-aware responses report the Async version")
+        .to_owned();
     assert!(async_responses.iter().all(|response| {
         response.ruby_thread_object_id == runtime_thread_id
-            && response.header("x-async-version") == Some("2.39.0")
+            && response.header("x-async-version") == Some(async_version.as_str())
     }));
     let async_fiber_ids = async_responses
         .iter()
@@ -181,6 +188,8 @@ fn main() {
             .all(|response| response.status == 200)
     );
 
+    // SAFETY: the program is about to exit and every client clone has been
+    // dropped, so no Ruby execution can still be in flight.
     unsafe {
         runtime
             .shutdown()
@@ -188,7 +197,7 @@ fn main() {
     }
 
     println!("result=PASS");
-    println!("async_version=2.39.0");
+    println!("async_version={async_version}");
     println!("foreign_producer_threads=10");
     println!("runtime_rust_thread_id={runtime_rust_thread_id}");
     println!("producer_rust_thread_id={producer_rust_thread_id}");

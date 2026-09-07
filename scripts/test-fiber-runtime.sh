@@ -37,7 +37,7 @@ if ! BUNDLE_GEMFILE="$repo_root/Gemfile" \
 fi
 
 rg -q '^result=PASS$' "$result_file"
-rg -q '^async_version=2.39.0$' "$result_file"
+rg -q "^async_version=$("$repo_root/scripts/gem-version.sh" async)\$" "$result_file"
 rg -q '^scheduler_aware_unique_fibers=10$' "$result_file"
 rg -q '^scheduler_io_requests=10$' "$result_file"
 rg -q '^scheduler_io_unique_fibers=10$' "$result_file"

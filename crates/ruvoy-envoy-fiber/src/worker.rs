@@ -1,9 +1,15 @@
-use crate::runtime::{BodyBudget, BodyLease, FiberRackConfig};
+use crate::{
+    metrics::{
+        Metrics, OUTCOME_COMPLETED, OUTCOME_FAILED, REJECTED_ADMISSION, REJECTED_BODY_BUDGET,
+        REJECTED_BODY_TOO_LARGE, REJECTED_INTERNAL, REJECTED_INVALID_REQUEST,
+    },
+    runtime::FiberRackConfig,
+};
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use ruvoy::{
-    Request, RequestDiagnostics, RequestMetadata, ResponseHead, ResponseStream, StreamHandle,
-    StreamItem, StreamWaker, fiber::FiberRuntimeClient,
+    Budget, Lease, Request, RequestDiagnostics, RequestMetadata, ResponseHead, ResponseStream,
+    StreamHandle, StreamItem, StreamWaker, fiber::FiberRuntimeClient,
 };
 use std::{sync::Arc, time::Instant};
 
@@ -35,6 +41,8 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FiberRackConfig {
             request: None,
             stream: None,
             state: FilterState::Collecting,
+            metrics: self.metrics(),
+            submitted_at: None,
         })
     }
 }
@@ -50,14 +58,16 @@ enum FilterState {
 
 struct FiberRackFilter {
     client: FiberRuntimeClient,
-    body_budget: Arc<BodyBudget>,
-    body_lease: Option<BodyLease>,
+    body_budget: Budget,
+    body_lease: Option<Lease>,
     diagnostics_enabled: bool,
     runtime_thread_id: String,
     worker_thread_id: String,
     request: Option<Request>,
     stream: Option<Arc<ResponseStream>>,
     state: FilterState,
+    metrics: Option<Metrics>,
+    submitted_at: Option<Instant>,
 }
 
 impl Drop for FiberRackFilter {
@@ -74,7 +84,7 @@ impl FiberRackFilter {
         &self,
         envoy_filter: &EHF,
         received_at: Instant,
-    ) -> Result<(Request, BodyLease), BodyCopyError> {
+    ) -> Result<(Request, Lease), BodyCopyError> {
         let headers = envoy_filter
             .get_request_headers()
             .into_iter()
@@ -104,7 +114,7 @@ impl FiberRackFilter {
         let mut body = Vec::new();
         let body_lease = self
             .body_budget
-            .try_reserve(body_capacity)
+            .try_acquire(body_capacity)
             .map_err(|_| BodyCopyError::Overloaded)?;
         body.try_reserve_exact(body_capacity)
             .map_err(|_| BodyCopyError::Allocation)?;
@@ -152,7 +162,7 @@ impl FiberRackFilter {
         self.body_lease
             .as_mut()
             .ok_or(BodyCopyError::MissingRequest)?
-            .ensure_reserved(required_size)
+            .grow_to(required_size)
             .map_err(|_| BodyCopyError::Overloaded)?;
         let request = self.request.as_mut().ok_or(BodyCopyError::MissingRequest)?;
         let copy_started_at = Instant::now();
@@ -199,13 +209,16 @@ impl FiberRackFilter {
         {
             Ok(()) => {
                 self.state = FilterState::Waiting;
+                self.submitted_at = Some(Instant::now());
                 // The request body is no longer needed once Ruby owns the call.
                 drop(body_lease);
+                self.report_admission(envoy_filter, None);
             }
             Err(error) => {
                 self.stream = None;
                 drop(body_lease);
                 let body = error.to_string();
+                self.report_admission(envoy_filter, Some(REJECTED_ADMISSION));
                 self.send_bridge_error(
                     envoy_filter,
                     503,
@@ -214,6 +227,37 @@ impl FiberRackFilter {
                 );
             }
         }
+    }
+
+    /// Records the admission outcome and republishes how loaded the runtime is.
+    fn report_admission<EHF: EnvoyHttpFilter>(&self, envoy_filter: &EHF, rejected: Option<&str>) {
+        let Some(metrics) = self.metrics else {
+            return;
+        };
+        match rejected {
+            Some(reason) => metrics.rejected(envoy_filter, reason),
+            None => metrics.submitted(envoy_filter),
+        }
+        metrics.saturation(
+            envoy_filter,
+            self.client.inflight_requests(),
+            self.body_budget.used(),
+            self.client.reactor_idle_for(),
+        );
+    }
+
+    /// Records how a request that reached the application ended.
+    fn report_outcome<EHF: EnvoyHttpFilter>(&mut self, envoy_filter: &EHF, outcome: &str) {
+        let (Some(metrics), Some(submitted_at)) = (self.metrics, self.submitted_at.take()) else {
+            return;
+        };
+        metrics.responded(envoy_filter, outcome, submitted_at.elapsed());
+        metrics.saturation(
+            envoy_filter,
+            self.client.inflight_requests(),
+            self.body_budget.used(),
+            self.client.reactor_idle_for(),
+        );
     }
 
     fn send_bridge_error<EHF: EnvoyHttpFilter>(
@@ -239,6 +283,9 @@ impl FiberRackFilter {
         envoy_filter: &mut EHF,
         error: BodyCopyError,
     ) {
+        if let Some(metrics) = self.metrics {
+            metrics.rejected(envoy_filter, Self::rejection_reason(error));
+        }
         match error {
             BodyCopyError::TooLarge => self.send_bridge_error(
                 envoy_filter,
@@ -325,16 +372,23 @@ impl FiberRackFilter {
                     envoy_filter.send_response_data(&chunk, false);
                 }
                 StreamItem::End => {
-                    if self.state == FilterState::Streaming {
-                        envoy_filter.send_response_data(&[], true);
-                    }
+                    // Ending the stream destroys this filter, so every field is
+                    // settled and every metric recorded before that call.
+                    let streaming = self.state == FilterState::Streaming;
                     self.state = FilterState::Responded;
                     self.stream = None;
+                    self.report_outcome(envoy_filter, OUTCOME_COMPLETED);
+                    if streaming {
+                        envoy_filter.send_response_data(&[], true);
+                    }
                     return;
                 }
                 StreamItem::Failed(error) => {
                     let body = error.to_string();
-                    if self.state == FilterState::Waiting {
+                    let local_reply_possible = self.state == FilterState::Waiting;
+                    self.stream = None;
+                    self.report_outcome(envoy_filter, OUTCOME_FAILED);
+                    if local_reply_possible {
                         // Nothing is on the wire yet, so a clean local reply is
                         // still possible.
                         self.send_bridge_error(
@@ -346,13 +400,23 @@ impl FiberRackFilter {
                     } else {
                         // Headers are already out; the only honest signal left
                         // is to end the stream short rather than fake success.
-                        envoy_filter.send_response_data(&[], true);
                         self.state = FilterState::Responded;
+                        envoy_filter.send_response_data(&[], true);
                     }
-                    self.stream = None;
                     return;
                 }
             }
+        }
+    }
+}
+
+impl FiberRackFilter {
+    fn rejection_reason(error: BodyCopyError) -> &'static str {
+        match error {
+            BodyCopyError::TooLarge => REJECTED_BODY_TOO_LARGE,
+            BodyCopyError::Overloaded => REJECTED_BODY_BUDGET,
+            BodyCopyError::InvalidRequest(_) => REJECTED_INVALID_REQUEST,
+            BodyCopyError::Allocation | BodyCopyError::MissingRequest => REJECTED_INTERNAL,
         }
     }
 }

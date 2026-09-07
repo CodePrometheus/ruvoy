@@ -91,6 +91,13 @@ Request bodies are read completely before the application is called; request
 streaming is not implemented. Raw socket hijacking (`rack.hijack`) is not
 supported; the connection always belongs to Envoy.
 
+## Scaling
+
+Each Ruvoy process runs exactly one CRuby VM, so Ruby work in one process is
+limited to one core by the GVL. Scaling out means more processes, not more
+threads: run one Ruvoy per replica and scale horizontally as with any
+single-VM Ruby server.
+
 ## Benchmarks
 
 ### Environment

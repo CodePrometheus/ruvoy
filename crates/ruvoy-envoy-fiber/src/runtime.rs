@@ -1,14 +1,14 @@
+use crate::metrics::Metrics;
+use envoy_proxy_dynamic_modules_rust_sdk::envoy_log_info;
 use ruvoy::{
-    BridgeError,
+    BridgeError, Budget,
     fiber::{DEFAULT_MAX_INFLIGHT_REQUESTS, FiberRuntime, FiberRuntimeClient},
 };
+use serde::Deserialize;
 use std::{
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -20,22 +20,27 @@ static PROCESS_SHUTDOWN_HOOK: OnceLock<Result<(), BridgeError>> = OnceLock::new(
 
 pub(crate) struct FiberRackConfig {
     client: FiberRuntimeClient,
-    body_budget: Arc<BodyBudget>,
+    body_budget: Budget,
     diagnostics_enabled: bool,
     runtime_thread_id: String,
+    metrics: Option<Metrics>,
 }
 
 impl FiberRackConfig {
-    pub(crate) fn start(filter_config: &[u8]) -> Result<Self, BridgeError> {
+    pub(crate) fn start(
+        filter_config: &[u8],
+        metrics: Option<Metrics>,
+    ) -> Result<Self, BridgeError> {
         let requested = ProcessRuntimeConfig::from_filter_config(filter_config)?;
         let runtime = process_runtime(requested)?;
-        let (client, runtime_thread_id) = runtime.ready()?;
+        let ready = runtime.ready()?;
 
         Ok(Self {
-            client: client.clone(),
-            body_budget: Arc::clone(&runtime.body_budget),
+            client: ready.client.clone(),
+            body_budget: runtime.body_budget.clone(),
             diagnostics_enabled: runtime.config.diagnostics_enabled,
-            runtime_thread_id: runtime_thread_id.to_owned(),
+            runtime_thread_id: ready.runtime_thread_id.clone(),
+            metrics,
         })
     }
 
@@ -51,8 +56,12 @@ impl FiberRackConfig {
         &self.runtime_thread_id
     }
 
-    pub(crate) fn body_budget(&self) -> Arc<BodyBudget> {
-        Arc::clone(&self.body_budget)
+    pub(crate) fn body_budget(&self) -> Budget {
+        self.body_budget.clone()
+    }
+
+    pub(crate) fn metrics(&self) -> Option<Metrics> {
+        self.metrics
     }
 }
 
@@ -65,16 +74,43 @@ struct ProcessRuntimeConfig {
     diagnostics_enabled: bool,
 }
 
+/// The filter configuration as a control plane serializes it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilterConfig {
+    rackup: String,
+}
+
+/// Reads the rackup path out of the filter configuration.
+///
+/// Control planes deliver the configuration as JSON — either the path on its
+/// own or an object naming it — while a static Envoy configuration may pass the
+/// path unquoted.
+fn rackup_from_filter_config(filter_config: &[u8]) -> Result<String, BridgeError> {
+    let text = std::str::from_utf8(filter_config)
+        .map_err(|_| {
+            BridgeError::Startup("filter configuration must contain valid UTF-8".to_owned())
+        })?
+        .trim();
+    if text.is_empty() {
+        return Err(BridgeError::Startup(
+            "filter configuration must name a rackup file".to_owned(),
+        ));
+    }
+    if !text.starts_with(['{', '"']) {
+        return Ok(text.to_owned());
+    }
+    if let Ok(rackup) = serde_json::from_str::<String>(text) {
+        return Ok(rackup);
+    }
+    serde_json::from_str::<FilterConfig>(text)
+        .map(|config| config.rackup)
+        .map_err(|error| BridgeError::Startup(format!("invalid filter configuration: {error}")))
+}
+
 impl ProcessRuntimeConfig {
     fn from_filter_config(filter_config: &[u8]) -> Result<Self, BridgeError> {
-        let rackup = std::str::from_utf8(filter_config)
-            .map_err(|_| BridgeError::Startup("rackup path must contain valid UTF-8".to_owned()))?;
-        if rackup.is_empty() {
-            return Err(BridgeError::Startup(
-                "rackup path must not be empty".to_owned(),
-            ));
-        }
-        let rackup = canonical_rackup(rackup)?;
+        let rackup = canonical_rackup(rackup_from_filter_config(filter_config)?)?;
         let max_inflight_requests =
             positive_env_usize("RUVOY_MAX_INFLIGHT_REQUESTS", DEFAULT_MAX_INFLIGHT_REQUESTS)?;
         let max_inflight_body_bytes = positive_env_usize(
@@ -94,15 +130,48 @@ impl ProcessRuntimeConfig {
             diagnostics_enabled: flag_env("RUVOY_DIAGNOSTICS")?,
         })
     }
+
+    /// Names the first setting that differs, so a rejection says which one.
+    fn first_difference(&self, requested: &Self) -> Option<&'static str> {
+        if self.rackup != requested.rackup {
+            return Some("a different rackup");
+        }
+        [
+            (
+                "RUVOY_MAX_INFLIGHT_REQUESTS",
+                self.max_inflight_requests != requested.max_inflight_requests,
+            ),
+            (
+                "RUVOY_MAX_INFLIGHT_BODY_BYTES",
+                self.max_inflight_body_bytes != requested.max_inflight_body_bytes,
+            ),
+            (
+                "RUVOY_SHUTDOWN_TIMEOUT_MS",
+                self.shutdown_timeout != requested.shutdown_timeout,
+            ),
+            (
+                "RUVOY_DIAGNOSTICS",
+                self.diagnostics_enabled != requested.diagnostics_enabled,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(name, differs)| differs.then_some(name))
+    }
 }
 
 struct ProcessRuntime {
     config: ProcessRuntimeConfig,
-    client: Option<FiberRuntimeClient>,
-    body_budget: Arc<BodyBudget>,
-    runtime_thread_id: Option<String>,
-    startup_error: Option<BridgeError>,
+    body_budget: Budget,
     runtime: Mutex<Option<FiberRuntime>>,
+    /// `Err` once the application failed to load. The VM stays alive either way
+    /// so its cleanup remains ordered, but it can never serve.
+    ready: Result<Ready, BridgeError>,
+}
+
+/// What a runtime that loaded its application can hand to a filter.
+struct Ready {
+    client: FiberRuntimeClient,
+    runtime_thread_id: String,
 }
 
 impl ProcessRuntime {
@@ -112,17 +181,16 @@ impl ProcessRuntime {
             config.max_inflight_requests,
         )?;
         let (runtime, startup_error) = startup.into_parts();
-        let (client, runtime_thread_id) = if startup_error.is_none() {
-            (
-                Some(runtime.client()),
-                Some(runtime.info().rust_thread_id.clone()),
-            )
-        } else {
-            (None, None)
+        let ready = match startup_error {
+            Some(error) => Err(error),
+            None => Ok(Ready {
+                client: runtime.client(),
+                runtime_thread_id: runtime.info().rust_thread_id.clone(),
+            }),
         };
-        let body_budget = Arc::new(BodyBudget::new(config.max_inflight_body_bytes));
-        if startup_error.is_none() {
-            eprintln!(
+        let body_budget = Budget::new(config.max_inflight_body_bytes);
+        if ready.is_ok() {
+            envoy_log_info!(
                 "[ruvoy] Fiber runtime started: rackup={} max_inflight_requests={} \
                  max_inflight_body_bytes={} shutdown_timeout_ms={} diagnostics={}",
                 config.rackup.display(),
@@ -135,47 +203,41 @@ impl ProcessRuntime {
 
         Ok(Self {
             config,
-            client,
             body_budget,
-            runtime_thread_id,
-            startup_error,
             runtime: Mutex::new(Some(runtime)),
+            ready,
         })
     }
 
-    fn ready(&self) -> Result<(&FiberRuntimeClient, &str), BridgeError> {
-        if let Some(error) = &self.startup_error {
-            return Err(error.clone());
-        }
-        Ok((
-            self.client
-                .as_ref()
-                .expect("successful process runtime has a client"),
-            self.runtime_thread_id
-                .as_deref()
-                .expect("successful process runtime has thread information"),
-        ))
+    fn ready(&self) -> Result<&Ready, BridgeError> {
+        self.ready.as_ref().map_err(terminal_startup_failure)
     }
 
     fn ensure_compatible(&self, requested: &ProcessRuntimeConfig) -> Result<(), BridgeError> {
-        if &self.config == requested {
+        let Some(field) = self.config.first_difference(requested) else {
             return Ok(());
-        }
+        };
 
         Err(BridgeError::Startup(format!(
-            "Ruvoy is already initialized for rackup {} with process-wide limits; \
-             requested rackup {} or limits do not match",
+            "Ruvoy is already running with {field}; this process cannot serve a second \
+             configuration. The Ruby VM is created once per process, so restart Envoy to \
+             change it. active rackup={} requested rackup={}",
             self.config.rackup.display(),
             requested.rackup.display(),
         )))
     }
 
+    /// # Safety
+    ///
+    /// Must run only at process exit, after all Ruby execution has stopped.
     unsafe fn shutdown(&self) -> Result<(), BridgeError> {
         let runtime = match self.runtime.lock() {
             Ok(mut slot) => slot.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
         match runtime {
+            // SAFETY: the caller guarantees the process is exiting, which is
+            // when this function's own contract says it may run.
             Some(runtime) => unsafe { runtime.shutdown_with_timeout(self.config.shutdown_timeout) },
             None => Ok(()),
         }
@@ -189,7 +251,7 @@ fn process_runtime(
     let runtime = PROCESS_RUNTIME
         .get_or_init(|| ProcessRuntime::start(requested.clone()))
         .as_ref()
-        .map_err(Clone::clone)?;
+        .map_err(terminal_startup_failure)?;
     runtime.ensure_compatible(&requested)?;
     runtime.ready()?;
     Ok(runtime)
@@ -198,6 +260,8 @@ fn process_runtime(
 fn register_process_shutdown_hook() -> Result<(), BridgeError> {
     PROCESS_SHUTDOWN_HOOK
         .get_or_init(|| {
+            // SAFETY: the handler takes no arguments, unwinds nothing, and only
+            // touches statics that outlive it.
             let result = unsafe { libc::atexit(shutdown_process_runtime) };
             if result == 0 {
                 Ok(())
@@ -215,11 +279,27 @@ extern "C" fn shutdown_process_runtime() {
         let Some(Ok(runtime)) = PROCESS_RUNTIME.get() else {
             return;
         };
+        // SAFETY: `atexit` runs after Envoy has stopped serving, so no Ruby
+        // execution and no client clone can still be live.
+        // Envoy may already have torn its logger down by the time `atexit`
+        // handlers run, so this path stays on stderr.
         match unsafe { runtime.shutdown() } {
             Ok(()) => eprintln!("[ruvoy] Fiber runtime stopped"),
             Err(error) => eprintln!("[ruvoy] Fiber runtime shutdown failed: {error}"),
         }
     }));
+}
+
+/// Reports a failure that no later configuration can undo.
+///
+/// The Ruby VM is created once per process, so the first failure is final: an
+/// operator who fixes the configuration and pushes it again would otherwise see
+/// the original error and conclude the update never arrived.
+fn terminal_startup_failure(error: &BridgeError) -> BridgeError {
+    BridgeError::Startup(format!(
+        "{error}. The Ruby VM is created once per process, so Envoy must be restarted \
+         after fixing this."
+    ))
 }
 
 /// A relative rackup resolves against the Envoy working directory, so failures
@@ -275,106 +355,64 @@ fn positive_env_usize(name: &str, default: usize) -> Result<usize, BridgeError> 
     Ok(value)
 }
 
-pub(crate) struct BodyBudget {
-    reserved: AtomicUsize,
-    maximum: usize,
-}
-
-impl BodyBudget {
-    fn new(maximum: usize) -> Self {
-        Self {
-            reserved: AtomicUsize::new(0),
-            maximum,
-        }
-    }
-
-    pub(crate) fn try_reserve(
-        self: &Arc<Self>,
-        bytes: usize,
-    ) -> Result<BodyLease, BodyBudgetExceeded> {
-        self.try_add(bytes)?;
-        Ok(BodyLease {
-            budget: Arc::clone(self),
-            reserved: bytes,
-        })
-    }
-
-    fn try_add(&self, bytes: usize) -> Result<(), BodyBudgetExceeded> {
-        let mut reserved = self.reserved.load(Ordering::Relaxed);
-        loop {
-            if bytes > self.maximum.saturating_sub(reserved) {
-                return Err(BodyBudgetExceeded);
-            }
-            match self.reserved.compare_exchange_weak(
-                reserved,
-                reserved + bytes,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(observed) => reserved = observed,
-            }
-        }
-    }
-}
-
-pub(crate) struct BodyLease {
-    budget: Arc<BodyBudget>,
-    reserved: usize,
-}
-
-impl BodyLease {
-    pub(crate) fn ensure_reserved(&mut self, required: usize) -> Result<(), BodyBudgetExceeded> {
-        if required <= self.reserved {
-            return Ok(());
-        }
-        let additional = required - self.reserved;
-        self.budget.try_add(additional)?;
-        self.reserved = required;
-        Ok(())
-    }
-}
-
-impl Drop for BodyLease {
-    fn drop(&mut self) {
-        let previous = self
-            .budget
-            .reserved
-            .fetch_sub(self.reserved, Ordering::AcqRel);
-        debug_assert!(previous >= self.reserved);
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BodyBudgetExceeded;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn body_budget_rejects_overcommit_and_releases_capacity() {
-        let budget = Arc::new(BodyBudget::new(10));
-        let lease = budget.try_reserve(8).expect("first body should fit");
-        assert!(budget.try_reserve(3).is_err());
-        drop(lease);
-        budget
-            .try_reserve(10)
-            .expect("dropped body should release its capacity");
+    fn filter_config_accepts_json_and_plain_paths() {
+        let expected = "/srv/app/config.ru";
+        for encoding in [
+            r#"/srv/app/config.ru"#,
+            r#""/srv/app/config.ru""#,
+            r#"{"rackup": "/srv/app/config.ru"}"#,
+            "  /srv/app/config.ru  ",
+        ] {
+            assert_eq!(
+                rackup_from_filter_config(encoding.as_bytes()).as_deref(),
+                Ok(expected),
+                "failed to read {encoding}"
+            );
+        }
     }
 
     #[test]
-    fn chunked_body_lease_grows_without_double_reserving() {
-        let budget = Arc::new(BodyBudget::new(10));
-        let mut lease = budget.try_reserve(0).expect("empty body should fit");
-        lease.ensure_reserved(4).expect("first chunk should fit");
-        lease
-            .ensure_reserved(4)
-            .expect("same size must not reserve twice");
-        assert!(lease.ensure_reserved(11).is_err());
-        lease
-            .ensure_reserved(10)
-            .expect("remaining budget should fit");
+    fn filter_config_rejects_empty_and_malformed_json() {
+        assert!(rackup_from_filter_config(b"").is_err());
+        assert!(rackup_from_filter_config(b"   ").is_err());
+        assert!(rackup_from_filter_config(br#"{"rackup": 7}"#).is_err());
+        assert!(rackup_from_filter_config(br#"{"rack_up": "/a"}"#).is_err());
+    }
+
+    #[test]
+    fn a_rejected_reconfiguration_names_the_setting_that_differs() {
+        let active = ProcessRuntimeConfig {
+            rackup: PathBuf::from("/srv/app/config.ru"),
+            max_inflight_requests: 128,
+            max_inflight_body_bytes: 1024,
+            shutdown_timeout: Duration::from_secs(5),
+            diagnostics_enabled: false,
+        };
+        assert_eq!(active.first_difference(&active), None);
+
+        let mut other = active.clone();
+        other.rackup = PathBuf::from("/srv/other/config.ru");
+        assert_eq!(active.first_difference(&other), Some("a different rackup"));
+
+        let mut other = active.clone();
+        other.max_inflight_body_bytes = 2048;
+        assert_eq!(
+            active.first_difference(&other),
+            Some("RUVOY_MAX_INFLIGHT_BODY_BYTES")
+        );
+    }
+
+    #[test]
+    fn a_startup_failure_says_it_survives_the_next_configuration() {
+        let message =
+            terminal_startup_failure(&BridgeError::Startup("no such file".to_owned())).to_string();
+        assert!(message.contains("no such file"), "{message}");
+        assert!(message.contains("restarted"), "{message}");
     }
 
     #[test]

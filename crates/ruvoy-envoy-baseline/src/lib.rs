@@ -1,3 +1,8 @@
+//! Envoy dynamic module that answers without entering Ruby.
+//!
+//! It measures what the surrounding machinery costs, so the Rack modules can be
+//! read against a ceiling rather than against nothing.
+
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use std::thread::JoinHandle;

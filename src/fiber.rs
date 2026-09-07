@@ -1,49 +1,38 @@
-use super::{
-    BridgeError, DEFAULT_RESPONSE_TIMEOUT, RACK_STREAMING_BODY_READER_SOURCE, RackCallContext,
-    RackConcurrency, Request, Response, ResponseStream, RuntimeInfo, StreamHandle, StreamItem,
-    StreamWaker, call_app_streaming, drain_wake_bytes, map_recv_timeout, panic_message, ruby_error,
-    runtime_info, wake_runtime,
+//! The fiber runtime: one fiber per request, responses streamed as produced.
+//!
+//! Scheduler-aware Ruby I/O suspends its fiber instead of the thread, so a call
+//! waiting on I/O leaves the runtime free to serve others.
+
+use crate::{
+    BridgeError, Budget, DEFAULT_RESPONSE_TIMEOUT, Lease, Request, Response, ResponseHead,
+    ResponseStream, RuntimeInfo, StreamHandle, StreamItem, StreamWaker,
+    error::{panic_message, ruby_error},
+    rack::{self, CallContext, Concurrency},
+    response::Completion,
+    vm::runtime_info,
+    wake,
 };
 use magnus::{RArray, RClass, RModule, Ruby, Value, kwargs, method, prelude::*, value::BoxValue};
 use std::{
     cell::RefCell,
+    fmt,
     os::{fd::AsRawFd, unix::net::UnixStream},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+/// In-flight requests admitted before the runtime starts rejecting work.
 pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 1024;
 
-const FIBER_RUNNER_SOURCE: &str = r#"
-lambda do |bridge, app, rack_errors, body_reader|
-  io = IO.for_fd(bridge.fd, autoclose: false)
-
-  begin
-    Async do |parent|
-      shutting_down = false
-      until shutting_down
-        io.wait_readable
-        envelopes, shutting_down = bridge.drain
-        envelopes.each do |envelope|
-          parent.async(envelope) do |_task, current_envelope|
-            bridge.execute(current_envelope, app, rack_errors, body_reader)
-          end
-        end
-      end
-      parent.wait_all
-    end
-  ensure
-    bridge.ack_shutdown
-  end
-end
-"#;
+/// Drives the reactor that runs one fiber per request.
+const FIBER_RUNNER_SOURCE: &str = include_str!("../ruby/fiber_runner.rb");
 
 enum FiberApp {
     Source(String),
@@ -60,7 +49,43 @@ struct FiberCall {
     handle: StreamHandle,
     /// Held for the lifetime of the response so admission capacity is released
     /// only once the body has been fully produced, not when the head is sent.
-    permit: RequestPermit,
+    permit: Lease,
+}
+
+/// How long the reactor loop has gone without running.
+///
+/// The loop waits with a deadline, so it reports in regularly whether or not
+/// there is work. A growing age therefore means some fiber is holding the
+/// thread instead of yielding, which stalls every other request.
+#[derive(Debug)]
+struct ReactorHeartbeat {
+    started_at: Instant,
+    last_pass_ms: AtomicU64,
+}
+
+impl ReactorHeartbeat {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            last_pass_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn record_pass(&self) {
+        self.last_pass_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn idle_for(&self) -> Duration {
+        Duration::from_millis(
+            self.elapsed_ms()
+                .saturating_sub(self.last_pass_ms.load(Ordering::Relaxed)),
+        )
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 /// The Ruby-facing half of a streaming response.
@@ -72,6 +97,8 @@ struct StreamSink {
 impl StreamSink {
     fn write(&self, chunk: magnus::RString) -> bool {
         // SAFETY: the bytes are copied before any further Ruby call can run.
+        // SAFETY: the bytes are copied before control returns to Ruby, so the
+        // string cannot be moved or collected while the slice is alive.
         let bytes = unsafe { chunk.as_slice() }.to_vec();
         if !self.handle.stream.push_chunk(bytes) {
             return false;
@@ -98,6 +125,7 @@ struct FiberBridge {
     wake_reader: RefCell<UnixStream>,
     shutdown_reply: RefCell<Option<SyncSender<()>>>,
     ruby_thread_object_id: u64,
+    heartbeat: Arc<ReactorHeartbeat>,
 }
 
 impl FiberBridge {
@@ -106,7 +134,9 @@ impl FiberBridge {
     }
 
     fn drain(ruby: &Ruby, bridge: &Self) -> Result<RArray, magnus::Error> {
-        drain_wake_bytes(&mut bridge.wake_reader.borrow_mut())
+        // Called once per pass of the reactor loop, whether or not work arrived.
+        bridge.heartbeat.record_pass();
+        wake::drain(&mut bridge.wake_reader.borrow_mut())
             .map_err(|error| fiber_bridge_error(ruby, error))?;
 
         let envelopes = ruby.ary_new();
@@ -148,19 +178,19 @@ impl FiberBridge {
             envelope.0.borrow_mut().take().ok_or_else(|| {
                 magnus::Error::new(ruby.exception_runtime_error(), "request reused")
             })?;
-        let context = RackCallContext {
+        let context = CallContext {
             app,
             string_io_class: ruby.class_object().const_get::<_, RClass>("StringIO")?,
             rack_errors,
             body_reader,
             ruby_thread_object_id: bridge.ruby_thread_object_id,
-            concurrency: RackConcurrency::Interleaved,
+            concurrency: Concurrency::Interleaved,
         };
         let sink = ruby.obj_wrap(StreamSink {
             handle: call.handle.clone(),
         });
         let result =
-            call_app_streaming(ruby, &context, call.request, &call.handle, sink.as_value());
+            rack::call_streaming(ruby, &context, call.request, &call.handle, sink.as_value());
         if let Err(error) = result {
             // The worker decides what a failure means: a local reply if nothing
             // has been sent yet, otherwise resetting the half-written stream.
@@ -180,9 +210,9 @@ impl FiberBridge {
 }
 
 struct CollectingResponse {
-    head: Option<super::ResponseHead>,
+    head: Option<ResponseHead>,
     body: Vec<u8>,
-    completion: Option<super::Completion>,
+    completion: Option<Completion>,
 }
 
 impl CollectingResponse {
@@ -197,11 +227,13 @@ fn fiber_bridge_error(ruby: &Ruby, error: BridgeError) -> magnus::Error {
     magnus::Error::new(ruby.exception_runtime_error(), error.to_string())
 }
 
+/// A cloneable handle used to submit work from any thread.
 #[derive(Clone)]
 pub struct FiberRuntimeClient {
     command_tx: Sender<FiberCommand>,
     wake_writer: Arc<Mutex<UnixStream>>,
-    admission: Arc<RequestAdmission>,
+    admission: Budget,
+    heartbeat: Arc<ReactorHeartbeat>,
 }
 
 impl FiberRuntimeClient {
@@ -218,7 +250,7 @@ impl FiberRuntimeClient {
         self.submit(request, handle)?;
 
         let deadline = std::time::Instant::now() + DEFAULT_RESPONSE_TIMEOUT;
-        let mut head: Option<super::ResponseHead> = None;
+        let mut head: Option<ResponseHead> = None;
         let mut body = Vec::new();
         loop {
             while let Some(item) = stream.take_next() {
@@ -293,8 +325,27 @@ impl FiberRuntimeClient {
         self.submit(request, StreamHandle::new(stream, waker))
     }
 
+    /// In-flight requests currently admitted.
+    #[must_use]
+    pub fn inflight_requests(&self) -> usize {
+        self.admission.used()
+    }
+
+    /// How long the reactor loop has gone without running.
+    ///
+    /// Anything beyond the loop's own deadline means a fiber is blocking the
+    /// thread rather than yielding, so every other request is waiting on it.
+    #[must_use]
+    pub fn reactor_idle_for(&self) -> Duration {
+        self.heartbeat.idle_for()
+    }
+
+    /// Queues the request and streams its response into `handle`.
     pub fn submit(&self, request: Request, handle: StreamHandle) -> Result<(), BridgeError> {
-        let permit = self.admission.try_acquire()?;
+        let permit = self
+            .admission
+            .try_acquire(1)
+            .map_err(|_| BridgeError::Overloaded)?;
         self.send_and_wake(FiberCommand::Call(Box::new(FiberCall {
             request,
             handle,
@@ -305,29 +356,49 @@ impl FiberRuntimeClient {
     fn request_shutdown(&self, timeout: Duration) -> Result<(), BridgeError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.send_and_wake(FiberCommand::Shutdown { reply: reply_tx })?;
-        reply_rx.recv_timeout(timeout).map_err(map_recv_timeout)
+        reply_rx
+            .recv_timeout(timeout)
+            .map_err(wake::map_recv_timeout)
     }
 
     fn send_and_wake(&self, command: FiberCommand) -> Result<(), BridgeError> {
         self.command_tx
             .send(command)
             .map_err(|_| BridgeError::RuntimeStopped)?;
-        wake_runtime(&self.wake_writer)
+        wake::signal(&self.wake_writer)
     }
 }
 
+impl fmt::Debug for FiberRuntimeClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FiberRuntimeClient")
+            .field("admission", &self.admission)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owns the Ruby VM, its reactor thread, and the admission budget.
+#[derive(Debug)]
 pub struct FiberRuntime {
     client: Option<FiberRuntimeClient>,
     info: Option<RuntimeInfo>,
     join: Option<JoinHandle<Result<(), BridgeError>>>,
 }
 
+/// A runtime that started its thread, whether or not the application loaded.
+///
+/// A failed application still owns a live Ruby VM, so the runtime is returned
+/// alongside the error rather than dropped: tearing the VM down mid-process is
+/// what the caller must avoid.
+#[derive(Debug)]
 pub struct FiberRuntimeStartup {
     runtime: FiberRuntime,
     startup_error: Option<BridgeError>,
 }
 
 impl FiberRuntimeStartup {
+    /// Splits the runtime from the error the application raised, if any.
+    #[must_use]
     pub fn into_parts(self) -> (FiberRuntime, Option<BridgeError>) {
         (self.runtime, self.startup_error)
     }
@@ -344,10 +415,12 @@ impl FiberRuntimeStartup {
 }
 
 impl FiberRuntime {
+    /// Starts a runtime whose application is the value `app_source` evaluates to.
     pub fn start(app_source: impl Into<String>) -> Result<Self, BridgeError> {
         Self::start_with_limit(app_source, DEFAULT_MAX_INFLIGHT_REQUESTS)
     }
 
+    /// Starts an application source with a bounded number of in-flight requests.
     pub fn start_with_limit(
         app_source: impl Into<String>,
         max_inflight_requests: usize,
@@ -369,6 +442,7 @@ impl FiberRuntime {
         Self::start_rackup_with_limit_retained(path, max_inflight_requests)?.into_result()
     }
 
+    /// Starts a rackup application, keeping the VM alive even if loading fails.
     pub fn start_rackup_with_limit_retained(
         path: impl AsRef<Path>,
         max_inflight_requests: usize,
@@ -408,10 +482,14 @@ impl FiberRuntime {
             .set_nonblocking(true)
             .map_err(|error| BridgeError::Io(error.to_string()))?;
 
+        let heartbeat = Arc::new(ReactorHeartbeat::new());
+        let runtime_heartbeat = Arc::clone(&heartbeat);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
             .name("ruvoy-ruby-fiber-runtime".to_owned())
-            .spawn(move || fiber_runtime_main(app, command_rx, wake_reader, ready_tx))
+            .spawn(move || {
+                fiber_runtime_main(app, command_rx, wake_reader, ready_tx, runtime_heartbeat)
+            })
             .map_err(|error| BridgeError::Spawn(error.to_string()))?;
 
         let readiness = match ready_rx.recv() {
@@ -428,7 +506,8 @@ impl FiberRuntime {
             client: Some(FiberRuntimeClient {
                 command_tx,
                 wake_writer: Arc::new(Mutex::new(wake_writer)),
-                admission: Arc::new(RequestAdmission::new(max_inflight_requests)),
+                admission: Budget::new(max_inflight_requests),
+                heartbeat,
             }),
             info,
             join: Some(join),
@@ -440,6 +519,11 @@ impl FiberRuntime {
         })
     }
 
+    /// Returns a handle for submitting work.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after shutdown.
     pub fn client(&self) -> FiberRuntimeClient {
         self.client
             .as_ref()
@@ -447,6 +531,11 @@ impl FiberRuntime {
             .clone()
     }
 
+    /// Identity of the embedded VM.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the application failed to load.
     pub fn info(&self) -> &RuntimeInfo {
         self.info
             .as_ref()
@@ -490,53 +579,6 @@ impl FiberRuntime {
     }
 }
 
-struct RequestAdmission {
-    active: AtomicUsize,
-    maximum: usize,
-}
-
-impl RequestAdmission {
-    fn new(maximum: usize) -> Self {
-        Self {
-            active: AtomicUsize::new(0),
-            maximum,
-        }
-    }
-
-    fn try_acquire(self: &Arc<Self>) -> Result<RequestPermit, BridgeError> {
-        let mut active = self.active.load(Ordering::Relaxed);
-        loop {
-            if active >= self.maximum {
-                return Err(BridgeError::Overloaded);
-            }
-            match self.active.compare_exchange_weak(
-                active,
-                active + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    return Ok(RequestPermit {
-                        admission: Arc::clone(self),
-                    });
-                }
-                Err(observed) => active = observed,
-            }
-        }
-    }
-}
-
-struct RequestPermit {
-    admission: Arc<RequestAdmission>,
-}
-
-impl Drop for RequestPermit {
-    fn drop(&mut self) {
-        let previous = self.admission.active.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0);
-    }
-}
-
 impl Drop for FiberRuntime {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
@@ -553,7 +595,10 @@ fn fiber_runtime_main(
     command_rx: Receiver<FiberCommand>,
     wake_reader: UnixStream,
     ready_tx: SyncSender<Result<RuntimeInfo, BridgeError>>,
+    heartbeat: Arc<ReactorHeartbeat>,
 ) -> Result<(), BridgeError> {
+    // SAFETY: this thread owns the process-wide VM for its whole lifetime and
+    // never hands a Ruby handle to another thread.
     let cleanup = unsafe { magnus::embed::init() };
     let ruby = &*cleanup;
 
@@ -578,6 +623,7 @@ fn fiber_runtime_main(
         wake_reader: RefCell::new(wake_reader),
         shutdown_reply: RefCell::new(None),
         ruby_thread_object_id: info.ruby_thread_object_id,
+        heartbeat,
     });
     if ready_tx.send(Ok(info)).is_err() {
         std::mem::forget(cleanup);
@@ -651,7 +697,7 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
             .map_err(|error| ruby_error("loading rack.errors", error))?,
     );
     let body_reader = BoxValue::new(
-        ruby.eval::<Value>(RACK_STREAMING_BODY_READER_SOURCE)
+        ruby.eval::<Value>(rack::STREAMING_BODY_READER_SOURCE)
             .map_err(|error| ruby_error("loading Rack body reader", error))?,
     );
     let runner = BoxValue::new(
@@ -717,20 +763,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admission_is_non_blocking_and_releases_capacity() {
-        let admission = Arc::new(RequestAdmission::new(1));
-        let permit = admission.try_acquire().expect("first request should fit");
-        assert!(matches!(
-            admission.try_acquire(),
-            Err(BridgeError::Overloaded)
-        ));
-        drop(permit);
-        admission
-            .try_acquire()
-            .expect("capacity should be released after completion");
-    }
-
-    #[test]
     fn failed_runtime_rejects_calls_and_waits_for_final_shutdown() {
         let (command_tx, command_rx) = mpsc::channel();
         let startup_error = BridgeError::Startup("invalid rackup".to_owned());
@@ -739,7 +771,7 @@ mod tests {
 
         let (woken_tx, woken_rx) = mpsc::sync_channel(1);
         let stream = Arc::new(ResponseStream::new(1024));
-        let admission = Arc::new(RequestAdmission::new(1));
+        let admission = Budget::new(1);
         command_tx
             .send(FiberCommand::Call(Box::new(FiberCall {
                 request: Request::new("GET", "/", Vec::new()),
@@ -749,7 +781,7 @@ mod tests {
                         let _ = woken_tx.try_send(());
                     }),
                 ),
-                permit: admission.try_acquire().expect("capacity should be free"),
+                permit: admission.try_acquire(1).expect("capacity should be free"),
             })))
             .expect("failed runtime should remain available to reject work");
         woken_rx

@@ -127,7 +127,7 @@ for port in "$fiber_port" "$control_port"; do
 done
 
 {
-  printf 'run_id=%s\nruby_version=%s\nasync_version=2.39.0\n' "$run_id" "$ruby_version"
+  printf 'run_id=%s\nruby_version=%s\nasync_version=%s\n' "$run_id" "$ruby_version" "$("$repo_root/scripts/gem-version.sh" async)"
   printf 'request_bytes=%s\nrequests_per_wave=%s\nconcurrency=%s\nwaves=%s\nwave_timeout_seconds=%s\n' \
     "$request_bytes" "$requests_per_wave" "$concurrency" "$waves" "$wave_timeout_seconds"
   printf 'envoy_package=envoy-server==1.39.0\noha=%s\n' "$("$oha" --version)"

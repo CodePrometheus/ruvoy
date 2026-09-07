@@ -1,8 +1,9 @@
 [package]
 name = "ruvoy-envoy-fiber"
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
+description = "Envoy dynamic module serving Rack applications on a fiber runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 publish = false
 
 [lib]
@@ -10,9 +11,11 @@ name = "ruvoy_fiber"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-libc = "0.2"
-ruvoy = { path = "../.." }
+envoy-proxy-dynamic-modules-rust-sdk.workspace = true
+libc.workspace = true
+ruvoy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
-[dependencies.envoy-proxy-dynamic-modules-rust-sdk]
-git = "https://github.com/envoyproxy/envoy"
-rev = "8eea3285d6bdb89f8ea34632cfe7ce1608a8f374"
+[lints]
+workspace = true

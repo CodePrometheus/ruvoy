@@ -1,7 +1,7 @@
 use crate::runtime::SyncRackConfig;
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
-use ruvoy::{BridgeError, Request, Response, RuntimeClient};
+use ruvoy::{BridgeError, Request, Response, sync::RuntimeClient};
 use std::sync::{Arc, Mutex};
 
 const RESPONSE_EVENT_ID: u64 = 1;

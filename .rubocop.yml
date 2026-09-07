@@ -1,0 +1,14 @@
+inherit_gem:
+  rubocop-rails-omakase: rubocop.yml
+
+AllCops:
+  TargetRubyVersion: 4.0
+  Exclude:
+    - vendor/**/*
+
+# These files are evaluated by the runtime rather than required, so the magic
+# comment would have no effect on the string literals inside them.
+Style/FrozenStringLiteralComment:
+  Exclude:
+    - ruby/**/*.rb
+    - crates/**/ruby/*.rb

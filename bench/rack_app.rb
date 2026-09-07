@@ -42,11 +42,11 @@ class RuvoyBenchmarkApp
         "content-length" => response_body.bytesize.to_s,
         "x-request-bytes" => request_body.bytesize.to_s
       },
-      [response_body]
+      [ response_body ]
     ]
   rescue ArgumentError => error
     body = error.message
-    [400, { "content-type" => "text/plain", "content-length" => body.bytesize.to_s }, [body]]
+    [ 400, { "content-type" => "text/plain", "content-length" => body.bytesize.to_s }, [ body ] ]
   end
 
   private
@@ -60,12 +60,12 @@ class RuvoyBenchmarkApp
         "content-length" => body.bytesize.to_s,
         "x-benchmark-served" => body
       },
-      [body]
+      [ body ]
     ]
   end
 
   def not_found
     body = "not found"
-    [404, { "content-type" => "text/plain", "content-length" => body.bytesize.to_s }, [body]]
+    [ 404, { "content-type" => "text/plain", "content-length" => body.bytesize.to_s }, [ body ] ]
   end
 end

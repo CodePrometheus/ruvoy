@@ -1403,7 +1403,9 @@ assert_server_host_idle
   printf 'tls_modes=%s\ntls_key=%s\n' "${tls_modes[*]}" "${tls_key_details:-none}"
   printf 'ruby=%s\nbundler=%s\noha=%s\n' \
     "$("$ruby_bin" --version)" "$bundle_version" "$oha_version"
-  printf 'rustc=%s\nrack=3.2.6\npuma=7.2.0\nfalcon=0.55.6\n' "$(rustc --version)"
+  printf 'rustc=%s\nrack=%s\npuma=%s\nfalcon=%s\nasync=%s\n' \
+    "$(rustc --version)" "$("$repo_root/scripts/gem-version.sh" rack)" "$("$repo_root/scripts/gem-version.sh" puma)" \
+    "$("$repo_root/scripts/gem-version.sh" falcon)" "$("$repo_root/scripts/gem-version.sh" async)"
   printf 'rounds=%s\nbench_duration=%s\nwarmup_duration=%s\nwarmup_concurrency=%s\noha_timeout_seconds=%s\n' \
     "$measurement_rounds" "$bench_duration" "$warmup_duration" "$warmup_concurrency" "$oha_timeout_seconds"
   printf 'envoy_concurrency=%s\npuma_workers=%s\npuma_threads=%s\nfalcon_count=%s\n' \

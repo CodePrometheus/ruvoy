@@ -1,4 +1,6 @@
-use ruvoy::{Request, Response, RubyRuntime};
+//! Measures the fixed cost of one owned call into CRuby.
+
+use ruvoy::{Request, Response, sync::RubyRuntime};
 use std::hint::black_box;
 use std::time::Instant;
 

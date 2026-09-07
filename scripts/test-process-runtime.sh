@@ -239,7 +239,11 @@ else
   fail "Envoy stayed up with two different rackup paths"
 fi
 envoy_pid=""
-grep -q 'already initialized for rackup' "$result_dir/mismatch.log" &&
+# Assert what the operator needs from the message, not its wording: both
+# rackups named, and that a restart is what resolves it.
+grep -q 'active rackup=' "$result_dir/mismatch.log" &&
+  grep -q 'requested rackup=' "$result_dir/mismatch.log" &&
+  grep -qi 'restart' "$result_dir/mismatch.log" &&
   pass "the refusal names the active rackup" ||
   fail "no explicit mismatch error in mismatch.log"
 [[ "$(runtime_started_count "$result_dir/mismatch.log")" -eq 1 ]] &&
