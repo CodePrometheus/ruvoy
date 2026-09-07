@@ -18,11 +18,15 @@ lambda do |bridge, app, rack_errors, body_reader|
       until shutting_down
         io.wait_readable(heartbeat_seconds)
         envelopes, shutting_down = bridge.drain
+        # Registered from inside the task rather than from its return value:
+        # a request that never blocks finishes before `async` returns, so an
+        # assignment made out here would land after the task had already left.
         envelopes.each do |envelope|
-          running[envelope] = parent.async(envelope) do |_task, current_envelope|
+          parent.async(envelope) do |task, current_envelope|
+            running[current_envelope] = task
             bridge.execute(current_envelope, app, rack_errors, body_reader)
           ensure
-            running.delete(envelope)
+            running.delete(current_envelope)
           end
         end
         # Stopping the fiber is what frees the admission slot and abandons the

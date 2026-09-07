@@ -1,7 +1,7 @@
 use crate::metrics::Metrics;
 use envoy_proxy_dynamic_modules_rust_sdk::envoy_log_info;
 use ruvoy::{
-    BridgeError, Budget,
+    BridgeError,
     fiber::{DEFAULT_MAX_INFLIGHT_REQUESTS, FiberRuntime, FiberRuntimeClient},
 };
 use serde::Deserialize;
@@ -12,7 +12,6 @@ use std::{
     time::Duration,
 };
 
-const DEFAULT_MAX_INFLIGHT_BODY_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: usize = 10_000;
 
 static PROCESS_RUNTIME: OnceLock<Result<ProcessRuntime, BridgeError>> = OnceLock::new();
@@ -20,7 +19,6 @@ static PROCESS_SHUTDOWN_HOOK: OnceLock<Result<(), BridgeError>> = OnceLock::new(
 
 pub(crate) struct FiberRackConfig {
     client: FiberRuntimeClient,
-    body_budget: Budget,
     diagnostics_enabled: bool,
     runtime_thread_id: String,
     metrics: Option<Metrics>,
@@ -37,7 +35,6 @@ impl FiberRackConfig {
 
         Ok(Self {
             client: ready.client.clone(),
-            body_budget: runtime.body_budget.clone(),
             diagnostics_enabled: runtime.config.diagnostics_enabled,
             runtime_thread_id: ready.runtime_thread_id.clone(),
             metrics,
@@ -56,10 +53,6 @@ impl FiberRackConfig {
         &self.runtime_thread_id
     }
 
-    pub(crate) fn body_budget(&self) -> Budget {
-        self.body_budget.clone()
-    }
-
     pub(crate) fn metrics(&self) -> Option<Metrics> {
         self.metrics
     }
@@ -69,7 +62,6 @@ impl FiberRackConfig {
 struct ProcessRuntimeConfig {
     rackup: PathBuf,
     max_inflight_requests: usize,
-    max_inflight_body_bytes: usize,
     shutdown_timeout: Duration,
     diagnostics_enabled: bool,
 }
@@ -113,17 +105,12 @@ impl ProcessRuntimeConfig {
         let rackup = canonical_rackup(rackup_from_filter_config(filter_config)?)?;
         let max_inflight_requests =
             positive_env_usize("RUVOY_MAX_INFLIGHT_REQUESTS", DEFAULT_MAX_INFLIGHT_REQUESTS)?;
-        let max_inflight_body_bytes = positive_env_usize(
-            "RUVOY_MAX_INFLIGHT_BODY_BYTES",
-            DEFAULT_MAX_INFLIGHT_BODY_BYTES,
-        )?;
         let shutdown_timeout_ms =
             positive_env_usize("RUVOY_SHUTDOWN_TIMEOUT_MS", DEFAULT_SHUTDOWN_TIMEOUT_MS)?;
 
         Ok(Self {
             rackup,
             max_inflight_requests,
-            max_inflight_body_bytes,
             shutdown_timeout: Duration::from_millis(shutdown_timeout_ms.try_into().map_err(
                 |_| BridgeError::Startup("RUVOY_SHUTDOWN_TIMEOUT_MS is too large".to_owned()),
             )?),
@@ -134,7 +121,6 @@ impl ProcessRuntimeConfig {
 
 struct ProcessRuntime {
     config: ProcessRuntimeConfig,
-    body_budget: Budget,
     runtime: Mutex<Option<FiberRuntime>>,
     /// `Err` once the application failed to load. The VM stays alive either way
     /// so its cleanup remains ordered, but it can never serve.
@@ -161,14 +147,12 @@ impl ProcessRuntime {
                 runtime_thread_id: runtime.info().rust_thread_id.clone(),
             }),
         };
-        let body_budget = Budget::new(config.max_inflight_body_bytes);
         if ready.is_ok() {
             envoy_log_info!(
                 "[ruvoy] Fiber runtime started: rackup={} max_inflight_requests={} \
-                 max_inflight_body_bytes={} shutdown_timeout_ms={} diagnostics={}",
+                 shutdown_timeout_ms={} diagnostics={}",
                 config.rackup.display(),
                 config.max_inflight_requests,
-                config.max_inflight_body_bytes,
                 config.shutdown_timeout.as_millis(),
                 u8::from(config.diagnostics_enabled),
             );
@@ -176,7 +160,6 @@ impl ProcessRuntime {
 
         Ok(Self {
             config,
-            body_budget,
             runtime: Mutex::new(Some(runtime)),
             ready,
         })
@@ -370,7 +353,6 @@ mod tests {
         let active = ProcessRuntimeConfig {
             rackup: PathBuf::from("/srv/app/config.ru"),
             max_inflight_requests: 128,
-            max_inflight_body_bytes: 1024,
             shutdown_timeout: Duration::from_secs(5),
             diagnostics_enabled: false,
         };

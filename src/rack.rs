@@ -1,7 +1,7 @@
 //! Translation between owned Rust requests and the Rack protocol.
 
 use crate::{
-    BridgeError, Request, RequestDiagnostics, Response, ResponseHead, StreamHandle,
+    BridgeError, Request, RequestDiagnostics, Response, ResponseHead, StreamHandle, StreamItem,
     error::ruby_error,
 };
 use magnus::{IntoValue, RArray, RClass, RHash, RString, Ruby, Value, prelude::*, r_hash::ForEach};
@@ -13,6 +13,47 @@ pub(crate) const BODY_READER_SOURCE: &str = include_str!("../ruby/rack_body_read
 /// Feeds a Rack body into a stream sink; used by the fiber runtime.
 pub(crate) const STREAMING_BODY_READER_SOURCE: &str =
     include_str!("../ruby/rack_streaming_body_reader.rb");
+
+/// The Ruby-facing half of a request body still arriving from the client.
+///
+/// Chunks are handed over as owned bytes; `park` returns the `Async::Variable`
+/// the reactor resolves once more of them land.
+#[magnus::wrap(class = "Ruvoy::RequestChunks", free_immediately)]
+pub(crate) struct RequestChunks {
+    handle: StreamHandle,
+}
+
+impl RequestChunks {
+    /// Takes the next chunk, or `nil` when none is buffered right now.
+    pub(crate) fn next_chunk(ruby: &Ruby, chunks: &Self) -> Option<RString> {
+        let stream = &chunks.handle.stream;
+        let item = stream.take_next()?;
+        // Envoy stopped sending once the queue filled up; taking from it is what
+        // lets the worker ask for the rest.
+        chunks.handle.wake();
+        match item {
+            StreamItem::Chunk(bytes) => Some(ruby.str_from_slice(&bytes)),
+            _ => None,
+        }
+    }
+
+    /// True when a read would not have to wait: bytes are buffered, or the
+    /// client will send nothing more.
+    pub(crate) fn ready(&self) -> bool {
+        let stream = &self.handle.stream;
+        stream.buffered_bytes() > 0 || stream.is_finished()
+    }
+
+    /// True once the client will send nothing more.
+    pub(crate) fn finished(&self) -> bool {
+        self.handle.stream.is_finished()
+    }
+
+    /// Parks the calling fiber on `waiter` until more of the body arrives.
+    pub(crate) fn park(&self, waiter: Value) {
+        self.handle.stream.park(waiter.into());
+    }
+}
 
 /// Whether the runtime may re-enter `app.call` before an earlier call returns.
 ///
@@ -34,6 +75,9 @@ impl Concurrency {
 pub(crate) struct CallContext {
     pub(crate) app: Value,
     pub(crate) string_io_class: RClass,
+    /// Wraps a body that is still arriving. Absent for the serial runtime,
+    /// which only ever has the whole body already.
+    pub(crate) request_body_class: Option<Value>,
     pub(crate) rack_errors: Value,
     pub(crate) body_reader: Value,
     pub(crate) ruby_thread_object_id: u64,
@@ -159,6 +203,7 @@ fn build_env(
         method,
         path,
         body,
+        body_stream,
         headers,
         metadata,
         force_gc,
@@ -196,12 +241,10 @@ fn build_env(
     }
 
     let rack_input_started_at = Instant::now();
-    let rack_input = string_io_class
-        .funcall::<_, _, Value>("new", (ruby.str_from_slice(&body),))
-        .map_err(|error| ruby_error("creating rack.input StringIO", error))?;
-    rack_input
-        .funcall::<_, _, Value>("binmode", ())
-        .map_err(|error| ruby_error("setting rack.input binary mode", error))?;
+    let rack_input = match body_stream {
+        Some(handle) => streaming_input(ruby, context, handle)?,
+        None => collected_input(ruby, string_io_class, &body)?,
+    };
     set(env, "rack.input", rack_input)?;
 
     Ok(EnvBuild {
@@ -210,6 +253,38 @@ fn build_env(
         runtime_queue_time,
         rack_input_time: rack_input_started_at.elapsed(),
     })
+}
+
+/// Wraps a body that has already been collected.
+fn collected_input(
+    ruby: &Ruby,
+    string_io_class: RClass,
+    body: &[u8],
+) -> Result<Value, BridgeError> {
+    let input = string_io_class
+        .funcall::<_, _, Value>("new", (ruby.str_from_slice(body),))
+        .map_err(|error| ruby_error("creating rack.input StringIO", error))?;
+    input
+        .funcall::<_, _, Value>("binmode", ())
+        .map_err(|error| ruby_error("setting rack.input binary mode", error))?;
+    Ok(input)
+}
+
+/// Wraps a body the client is still sending.
+fn streaming_input(
+    ruby: &Ruby,
+    context: &CallContext,
+    handle: StreamHandle,
+) -> Result<Value, BridgeError> {
+    let Some(class) = context.request_body_class else {
+        return Err(BridgeError::InvalidResponse(
+            "this runtime cannot serve a streaming request body".to_owned(),
+        ));
+    };
+    let chunks = ruby.obj_wrap(RequestChunks { handle });
+    class
+        .funcall::<_, _, Value>("new", (chunks,))
+        .map_err(|error| ruby_error("creating rack.input", error))
 }
 
 fn set(env: RHash, key: &str, value: impl IntoValue) -> Result<(), BridgeError> {
@@ -312,14 +387,6 @@ fn stage_timing_headers(
         (
             "x-ruvoy-stage-body-callbacks".to_owned(),
             diagnostics.body_callbacks.to_string(),
-        ),
-        (
-            "x-ruvoy-stage-body-reallocations".to_owned(),
-            diagnostics.body_reallocations.to_string(),
-        ),
-        (
-            "x-ruvoy-stage-declared-capacity".to_owned(),
-            diagnostics.declared_capacity.to_string(),
         ),
         (
             "x-ruvoy-stage-runtime-queue-ns".to_owned(),

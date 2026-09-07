@@ -67,6 +67,22 @@ start_envoy() {
   envoy_pid=$!
 }
 
+# Ports are picked at run time: a fixed admin port makes the run fail whenever
+# anything unrelated on the machine already holds it.
+free_port() {
+  local port
+  for port in $(seq "$1" "$(($1 + 40))"); do
+    if ! nc -z 127.0.0.1 "$port" 2>/dev/null; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done
+  printf 'no free port near %s\n' "$1" >&2
+  return 1
+}
+
+admin_port="$(free_port 19001)"
+
 wait_for_port() {
   local port="$1"
 
@@ -352,7 +368,7 @@ grep -Eqi 'panic|segmentation fault|SIGSEGV|use-after-free' "$result_dir/timeout
 # runtime stops cleanly. Draining through the admin endpoint is what tells us
 # whether an in-flight Ruby request is allowed to finish.
 {
-  printf 'admin:\n  address:\n    socket_address:\n      address: 127.0.0.1\n      port_value: 19001\n'
+  printf 'admin:\n  address:\n    socket_address:\n      address: 127.0.0.1\n      port_value: '"$admin_port"'\n'
   printf 'static_resources:\n  listeners:\n'
   listener_config ruvoy_first 18098 "$rackup"
 } >"$temporary_dir/admin.yaml"
@@ -363,7 +379,7 @@ if wait_for_port 18098; then
   drain2_curl=$!
   sleep 0.4
   curl --silent --max-time 10 --request POST --output /dev/null \
-    "http://127.0.0.1:19001/drain_listeners?graceful" || true
+    "http://127.0.0.1:$admin_port/drain_listeners?graceful" || true
   wait "$drain2_curl" 2>/dev/null || true
 
   drain2_status="$(cat "$temporary_dir/drain2.status" 2>/dev/null)"

@@ -36,7 +36,7 @@ pub use crate::{
     error::BridgeError,
     request::{Request, RequestDiagnostics, RequestMetadata},
     response::{Response, ResponseHead},
-    stream::{ResponseStream, StreamHandle, StreamItem, StreamWaker},
+    stream::{ResponseStream, StreamHandle, StreamItem, StreamWaker, Wakeups},
 };
 
 #[cfg(not(loom))]

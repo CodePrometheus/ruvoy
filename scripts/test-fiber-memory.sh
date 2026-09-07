@@ -7,6 +7,7 @@ run_id="$(date -u '+%Y%m%dT%H%M%SZ')"
 result_root="${RUVOY_RESULTS_DIR:-"$repo_root/.agents/results"}"
 result_dir="$result_root/poc3-fiber-memory-$run_id"
 envoy_log="$result_dir/envoy.log"
+envoy_config="$result_dir/envoy.yaml"
 waves_file="$result_dir/waves.tsv"
 oha="$repo_root/.tools/oha/oha"
 ruby_version="$(tr -d '[:space:]' <"$repo_root/.ruby-version")"
@@ -126,6 +127,12 @@ for port in "$fiber_port" "$control_port"; do
   fi
 done
 
+sed \
+  "s|value: bench/config.ru|value: $repo_root/test/fixtures/rack/config.ru|" \
+  "$repo_root/config/envoy-fiber-rack.yaml" >"$envoy_config"
+grep -Fq "value: $repo_root/test/fixtures/rack/config.ru" "$envoy_config" ||
+  fail "failed to configure the Rack fixture"
+
 {
   printf 'run_id=%s\nruby_version=%s\nasync_version=%s\n' "$run_id" "$ruby_version" "$("$repo_root/scripts/gem-version.sh" async)"
   printf 'request_bytes=%s\nrequests_per_wave=%s\nconcurrency=%s\nwaves=%s\nwave_timeout_seconds=%s\n' \
@@ -139,7 +146,7 @@ BUNDLE_GEMFILE="$repo_root/Gemfile" \
   BUNDLE_FROZEN=true \
   ENVOY_DYNAMIC_MODULES_SEARCH_PATH="$repo_root/build/modules" \
   uvx --from envoy-server==1.39.0 envoy \
-  --config-path "$repo_root/config/envoy-fiber-rack.yaml" \
+  --config-path "$envoy_config" \
   --concurrency 1 \
   --disable-hot-restart \
   --log-level warning \

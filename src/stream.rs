@@ -2,6 +2,7 @@ use crate::{
     BridgeError, ResponseHead,
     concurrency::{Arc, Mutex, MutexGuard},
 };
+use magnus::{Value, value::Opaque};
 use std::{collections::VecDeque, fmt};
 
 /// What the Envoy worker still has to send downstream.
@@ -28,13 +29,20 @@ pub struct ResponseStream {
     max_buffered_bytes: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ResponseStreamInner {
     items: VecDeque<StreamItem>,
     buffered_bytes: usize,
     cancelled: bool,
+    /// Set once the producer has said there is nothing more to come.
+    ended: bool,
     /// Set while the downstream write buffer is over its high watermark.
     paused: bool,
+    /// An `Async::Variable` the waiting fiber is parked on.
+    ///
+    /// Held as an opaque handle because only the Ruby thread may touch it; the
+    /// fiber blocked on it keeps it reachable from the garbage collector.
+    waiter: Option<Opaque<Value>>,
 }
 
 impl ResponseStream {
@@ -62,6 +70,26 @@ impl ResponseStream {
         inner.buffered_bytes = 0;
     }
 
+    /// Parks a fiber on `waiter` until the other side makes progress.
+    ///
+    /// Called from the Ruby thread only, which is also the only thread that
+    /// takes the handle back out again.
+    pub fn park(&self, waiter: Opaque<Value>) {
+        self.lock().waiter = Some(waiter);
+    }
+
+    /// Takes the parked fiber's handle, if any.
+    pub fn unpark(&self) -> Option<Opaque<Value>> {
+        self.lock().waiter.take()
+    }
+
+    /// True once nothing more will arrive and everything queued has been taken.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        let inner = self.lock();
+        inner.cancelled || (inner.ended && inner.buffered_bytes == 0)
+    }
+
     /// True once the downstream has gone away.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
@@ -77,6 +105,13 @@ impl ResponseStream {
     #[must_use]
     pub fn buffered_bytes(&self) -> usize {
         self.lock().buffered_bytes
+    }
+
+    /// How many more bytes the queue accepts before it is full.
+    #[must_use]
+    pub fn spare_capacity(&self) -> usize {
+        let inner = self.lock();
+        self.max_buffered_bytes.saturating_sub(inner.buffered_bytes)
     }
 
     /// True while the producer must wait: either the buffer is full or the
@@ -112,8 +147,10 @@ impl ResponseStream {
         if inner.cancelled {
             return false;
         }
-        if let StreamItem::Chunk(chunk) = &item {
-            inner.buffered_bytes += chunk.len();
+        match &item {
+            StreamItem::Chunk(chunk) => inner.buffered_bytes += chunk.len(),
+            StreamItem::End | StreamItem::Failed(_) => inner.ended = true,
+            StreamItem::Head(_) => {}
         }
         inner.items.push_back(item);
         true
@@ -131,6 +168,19 @@ impl ResponseStream {
             inner.buffered_bytes = inner.buffered_bytes.saturating_sub(chunk.len());
         }
         Some(item)
+    }
+}
+
+impl fmt::Debug for ResponseStreamInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResponseStreamInner")
+            .field("items", &self.items.len())
+            .field("buffered_bytes", &self.buffered_bytes)
+            .field("cancelled", &self.cancelled)
+            .field("ended", &self.ended)
+            .field("paused", &self.paused)
+            .field("parked", &self.waiter.is_some())
+            .finish()
     }
 }
 
@@ -159,6 +209,31 @@ impl StreamHandle {
     /// Signals the owning worker that there is something to send.
     pub fn wake(&self) {
         (self.waker)();
+    }
+}
+
+/// Streams whose parked fiber is owed a wakeup.
+///
+/// Envoy workers append to it and signal the runtime; the reactor drains it and
+/// resolves each waiter, which is the only thread allowed to touch them.
+#[derive(Clone, Debug, Default)]
+pub struct Wakeups(Arc<Mutex<Vec<Arc<ResponseStream>>>>);
+
+impl Wakeups {
+    /// Records that `stream` made progress a parked fiber is waiting on.
+    pub fn owe(&self, stream: Arc<ResponseStream>) {
+        self.lock().push(stream);
+    }
+
+    /// Takes everything owed so far.
+    pub fn take(&self) -> Vec<Arc<ResponseStream>> {
+        std::mem::take(&mut *self.lock())
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<Arc<ResponseStream>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

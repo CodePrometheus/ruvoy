@@ -1,14 +1,16 @@
 use std::time::{Duration, Instant};
 
 /// One request, owned outright so it can cross into the Ruby runtime thread.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Request {
     /// HTTP method.
     pub method: String,
     /// Request target, query string included.
     pub path: String,
-    /// Fully received request body.
+    /// Body bytes already collected. Empty when `body_stream` carries them.
     pub body: Vec<u8>,
+    /// A body still arriving, delivered chunk by chunk instead of collected.
+    pub body_stream: Option<crate::StreamHandle>,
     /// Request headers in arrival order, values kept as raw bytes.
     pub headers: Vec<(String, Vec<u8>)>,
     /// Connection facts the Rack environment needs.
@@ -30,6 +32,7 @@ impl Request {
             method: method.into(),
             path: path.into(),
             body: body.into(),
+            body_stream: None,
             headers: Vec::new(),
             metadata: RequestMetadata::default(),
             force_gc: false,
@@ -98,10 +101,6 @@ pub struct RequestDiagnostics {
     pub body_copy_time: Duration,
     /// Number of body callbacks Envoy delivered.
     pub body_callbacks: u64,
-    /// Number of times the owned body had to grow.
-    pub body_reallocations: u64,
-    /// Capacity reserved from the `content-length` header.
-    pub declared_capacity: usize,
     /// When the request was handed to the runtime.
     pub submitted_at: Option<Instant>,
 }
@@ -109,13 +108,11 @@ pub struct RequestDiagnostics {
 impl RequestDiagnostics {
     /// Starts collecting timings for a request received at `received_at`.
     #[must_use]
-    pub fn new(received_at: Instant, declared_capacity: usize) -> Self {
+    pub fn new(received_at: Instant) -> Self {
         Self {
             received_at,
             body_copy_time: Duration::ZERO,
             body_callbacks: 0,
-            body_reallocations: 0,
-            declared_capacity,
             submitted_at: None,
         }
     }

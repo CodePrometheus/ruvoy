@@ -5,14 +5,18 @@
 
 use crate::{
     BridgeError, Budget, DEFAULT_RESPONSE_TIMEOUT, Lease, Request, Response, ResponseHead,
-    ResponseStream, RuntimeInfo, StreamHandle, StreamItem, StreamWaker,
+    ResponseStream, RuntimeInfo, StreamHandle, StreamItem, StreamWaker, Wakeups,
     error::{panic_message, ruby_error},
     rack::{self, CallContext, Concurrency},
     response::Completion,
     vm::runtime_info,
     wake,
 };
-use magnus::{RArray, RClass, RModule, Ruby, Value, kwargs, method, prelude::*, value::BoxValue};
+use magnus::{
+    RArray, RClass, RModule, Ruby, Value, kwargs, method,
+    prelude::*,
+    value::{BoxValue, Opaque},
+};
 use std::{
     cell::RefCell,
     fmt,
@@ -33,6 +37,9 @@ pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 1024;
 
 /// Drives the reactor that runs one fiber per request.
 const FIBER_RUNNER_SOURCE: &str = include_str!("../ruby/fiber_runner.rb");
+
+/// Rack input over a body that is still arriving.
+const REQUEST_BODY_SOURCE: &str = include_str!("../ruby/request_body.rb");
 
 enum FiberApp {
     Source(String),
@@ -137,6 +144,9 @@ struct FiberBridge {
     shutdown_reply: RefCell<Option<SyncSender<()>>>,
     ruby_thread_object_id: u64,
     heartbeat: Arc<ReactorHeartbeat>,
+    wakeups: Wakeups,
+    /// The Rack input class, kept here so every call can instantiate it.
+    request_body_class: Opaque<Value>,
 }
 
 impl FiberBridge {
@@ -147,6 +157,7 @@ impl FiberBridge {
     fn drain(ruby: &Ruby, bridge: &Self) -> Result<RArray, magnus::Error> {
         // Called once per pass of the reactor loop, whether or not work arrived.
         bridge.heartbeat.record_pass();
+        bridge.resolve_wakeups(ruby)?;
         wake::drain(&mut bridge.wake_reader.borrow_mut())
             .map_err(|error| fiber_bridge_error(ruby, error))?;
 
@@ -195,6 +206,7 @@ impl FiberBridge {
         let context = CallContext {
             app,
             string_io_class: ruby.class_object().const_get::<_, RClass>("StringIO")?,
+            request_body_class: Some(bridge.request_body_class(ruby)?),
             rack_errors,
             body_reader,
             ruby_thread_object_id: bridge.ruby_thread_object_id,
@@ -212,6 +224,21 @@ impl FiberBridge {
             call.handle.wake();
         }
         drop(call.permit);
+        Ok(())
+    }
+
+    fn request_body_class(&self, ruby: &Ruby) -> Result<Value, magnus::Error> {
+        Ok(ruby.get_inner(self.request_body_class))
+    }
+
+    /// Wakes every fiber a worker parked, on the one thread allowed to do it.
+    fn resolve_wakeups(&self, ruby: &Ruby) -> Result<(), magnus::Error> {
+        for stream in self.wakeups.take() {
+            if let Some(waiter) = stream.unpark() {
+                ruby.get_inner(waiter)
+                    .funcall::<_, _, Value>("resolve", ())?;
+            }
+        }
         Ok(())
     }
 
@@ -248,6 +275,7 @@ pub struct FiberRuntimeClient {
     wake_writer: Arc<Mutex<UnixStream>>,
     admission: Budget,
     heartbeat: Arc<ReactorHeartbeat>,
+    wakeups: Wakeups,
 }
 
 impl FiberRuntimeClient {
@@ -343,6 +371,15 @@ impl FiberRuntimeClient {
     #[must_use]
     pub fn inflight_requests(&self) -> usize {
         self.admission.used()
+    }
+
+    /// Reports that a body stream made progress a parked fiber is waiting on.
+    ///
+    /// Called from Envoy workers, which may not touch Ruby: the waiter is only
+    /// resolved later, on the reactor thread.
+    pub fn wake_body(&self, stream: Arc<ResponseStream>) {
+        self.wakeups.owe(stream);
+        let _ = wake::signal(&self.wake_writer);
     }
 
     /// How long the reactor loop has gone without running.
@@ -498,11 +535,20 @@ impl FiberRuntime {
 
         let heartbeat = Arc::new(ReactorHeartbeat::new());
         let runtime_heartbeat = Arc::clone(&heartbeat);
+        let wakeups = Wakeups::default();
+        let runtime_wakeups = wakeups.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
             .name("ruvoy-ruby-fiber-runtime".to_owned())
             .spawn(move || {
-                fiber_runtime_main(app, command_rx, wake_reader, ready_tx, runtime_heartbeat)
+                fiber_runtime_main(
+                    app,
+                    command_rx,
+                    wake_reader,
+                    ready_tx,
+                    runtime_heartbeat,
+                    runtime_wakeups,
+                )
             })
             .map_err(|error| BridgeError::Spawn(error.to_string()))?;
 
@@ -522,6 +568,7 @@ impl FiberRuntime {
                 wake_writer: Arc::new(Mutex::new(wake_writer)),
                 admission: Budget::new(max_inflight_requests),
                 heartbeat,
+                wakeups,
             }),
             info,
             join: Some(join),
@@ -610,6 +657,7 @@ fn fiber_runtime_main(
     wake_reader: UnixStream,
     ready_tx: SyncSender<Result<RuntimeInfo, BridgeError>>,
     heartbeat: Arc<ReactorHeartbeat>,
+    wakeups: Wakeups,
 ) -> Result<(), BridgeError> {
     // SAFETY: this thread owns the process-wide VM for its whole lifetime and
     // never hands a Ruby handle to another thread.
@@ -617,7 +665,7 @@ fn fiber_runtime_main(
     let ruby = &*cleanup;
 
     let prepared = panic::catch_unwind(AssertUnwindSafe(|| prepare_fiber_runtime(ruby, app)));
-    let (app, rack_errors, body_reader, runner, info) = match prepared {
+    let (app, rack_errors, body_reader, runner, request_body_class, info) = match prepared {
         Ok(Ok(prepared)) => prepared,
         Ok(Err(error)) => {
             let _ = ready_tx.send(Err(error.clone()));
@@ -638,6 +686,8 @@ fn fiber_runtime_main(
         shutdown_reply: RefCell::new(None),
         ruby_thread_object_id: info.ruby_thread_object_id,
         heartbeat,
+        wakeups,
+        request_body_class: (*request_body_class).into(),
     });
     if ready_tx.send(Ok(info)).is_err() {
         std::mem::forget(cleanup);
@@ -670,11 +720,18 @@ type PreparedFiberRuntime = (
     BoxValue<Value>,
     BoxValue<Value>,
     BoxValue<Value>,
+    BoxValue<Value>,
     RuntimeInfo,
 );
 
 fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRuntime, BridgeError> {
-    for feature in ["bundler/setup", "stringio", "io/wait", "async"] {
+    for feature in [
+        "bundler/setup",
+        "stringio",
+        "io/wait",
+        "async",
+        "async/variable",
+    ] {
         ruby.require(feature)
             .map_err(|error| ruby_error(&format!("loading {feature}"), error))?;
     }
@@ -699,6 +756,18 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
     envelope_class
         .define_method("cancelled?", method!(FiberEnvelope::cancelled, 0))
         .map_err(|error| ruby_error("defining FiberEnvelope methods", error))?;
+    let chunks_class = ruvoy_module
+        .define_class("RequestChunks", ruby.class_object())
+        .map_err(|error| ruby_error("defining RequestChunks", error))?;
+    chunks_class
+        .define_method("next_chunk", method!(rack::RequestChunks::next_chunk, 0))
+        .and_then(|()| chunks_class.define_method("ready?", method!(rack::RequestChunks::ready, 0)))
+        .and_then(|()| {
+            chunks_class.define_method("finished?", method!(rack::RequestChunks::finished, 0))
+        })
+        .and_then(|()| chunks_class.define_method("park", method!(rack::RequestChunks::park, 1)))
+        .map_err(|error| ruby_error("defining RequestChunks methods", error))?;
+
     let sink_class = ruvoy_module
         .define_class("StreamSink", ruby.class_object())
         .map_err(|error| ruby_error("defining StreamSink", error))?;
@@ -721,9 +790,20 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
         ruby.eval::<Value>(FIBER_RUNNER_SOURCE)
             .map_err(|error| ruby_error("evaluating fiber runner", error))?,
     );
+    let request_body_class = BoxValue::new(
+        ruby.eval::<Value>(REQUEST_BODY_SOURCE)
+            .map_err(|error| ruby_error("loading the Rack input class", error))?,
+    );
     let info = runtime_info(ruby)?;
 
-    Ok((app, rack_errors, body_reader, runner, info))
+    Ok((
+        app,
+        rack_errors,
+        body_reader,
+        runner,
+        request_body_class,
+        info,
+    ))
 }
 
 fn retain_failed_runtime(command_rx: Receiver<FiberCommand>, startup_error: BridgeError) {

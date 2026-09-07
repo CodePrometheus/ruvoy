@@ -191,12 +191,6 @@ cmp "$temporary_dir/one-mib.bin" "$large_request_prefix.body" ||
 stage_ingress_ns="$(header_value "$large_request_prefix.headers" "x-ruvoy-stage-ingress-ns")"
 stage_body_copy_ns="$(header_value "$large_request_prefix.headers" "x-ruvoy-stage-body-copy-ns")"
 stage_body_callbacks="$(header_value "$large_request_prefix.headers" "x-ruvoy-stage-body-callbacks")"
-stage_body_reallocations="$(
-  header_value "$large_request_prefix.headers" "x-ruvoy-stage-body-reallocations"
-)"
-stage_declared_capacity="$(
-  header_value "$large_request_prefix.headers" "x-ruvoy-stage-declared-capacity"
-)"
 stage_runtime_queue_ns="$(
   header_value "$large_request_prefix.headers" "x-ruvoy-stage-runtime-queue-ns"
 )"
@@ -211,18 +205,12 @@ for value in \
   "$stage_ingress_ns" \
   "$stage_body_copy_ns" \
   "$stage_body_callbacks" \
-  "$stage_body_reallocations" \
-  "$stage_declared_capacity" \
   "$stage_runtime_queue_ns" \
   "$stage_rack_input_ns" \
   "$stage_rack_call_ns" \
   "$stage_response_copy_ns"; do
   [[ "$value" =~ ^[0-9]+$ ]] || fail "invalid or missing Fiber stage timing header: $value"
 done
-[[ "$stage_declared_capacity" == "1048576" ]] ||
-  fail "1 MiB request did not use the declared body capacity"
-[[ "$stage_body_reallocations" == "0" ]] ||
-  fail "1 MiB request unexpectedly reallocated its owned body"
 
 chunked_prefix="$temporary_dir/chunked-request"
 chunked_status="$(
@@ -238,19 +226,21 @@ chunked_status="$(
 assert_status "$chunked_status" 200 "Fiber chunked 1 MiB POST /echo"
 cmp "$temporary_dir/one-mib.bin" "$chunked_prefix.body" ||
   fail "Fiber chunked 1 MiB request body was not echoed exactly"
-[[ "$(header_value "$chunked_prefix.headers" "x-ruvoy-stage-declared-capacity")" == "0" ]] ||
-  fail "chunked request unexpectedly used a declared body capacity"
 
-dd if=/dev/zero of="$temporary_dir/over-limit.bin" bs=2097153 count=1 2>/dev/null
-over_limit_prefix="$temporary_dir/over-limit"
-over_limit_status="$(
-  curl_fiber "$over_limit_prefix" \
+# Several times the runtime's own buffer, so it can only be served by taking
+# the body in pieces while the rest waits in Envoy.
+dd if=/dev/zero of="$temporary_dir/large.bin" bs=1048576 count=8 2>/dev/null
+large_prefix="$temporary_dir/beyond-buffer"
+large_status="$(
+  curl_fiber "$large_prefix" \
     --request POST \
     --header 'Expect:' \
-    --data-binary "@$temporary_dir/over-limit.bin" \
+    --data-binary "@$temporary_dir/large.bin" \
     "http://127.0.0.1:$fiber_port/echo"
 )"
-assert_status "$over_limit_status" 413 "Fiber over-limit POST /echo"
+assert_status "$large_status" 200 "Fiber 8 MiB POST /echo"
+cmp "$temporary_dir/large.bin" "$large_prefix.body" ||
+  fail "Fiber 8 MiB request body was not echoed exactly"
 
 stage_benchmark_prefix="$temporary_dir/stage-benchmark"
 stage_benchmark_status="$(
@@ -269,12 +259,6 @@ assert_status "$stage_benchmark_status" 200 "Fiber timed 1 MiB POST /benchmark"
 stage_ingress_ns="$(header_value "$stage_benchmark_prefix.headers" "x-ruvoy-stage-ingress-ns")"
 stage_body_copy_ns="$(header_value "$stage_benchmark_prefix.headers" "x-ruvoy-stage-body-copy-ns")"
 stage_body_callbacks="$(header_value "$stage_benchmark_prefix.headers" "x-ruvoy-stage-body-callbacks")"
-stage_body_reallocations="$(
-  header_value "$stage_benchmark_prefix.headers" "x-ruvoy-stage-body-reallocations"
-)"
-stage_declared_capacity="$(
-  header_value "$stage_benchmark_prefix.headers" "x-ruvoy-stage-declared-capacity"
-)"
 stage_runtime_queue_ns="$(
   header_value "$stage_benchmark_prefix.headers" "x-ruvoy-stage-runtime-queue-ns"
 )"
@@ -526,12 +510,10 @@ fi
   echo "async_version=$("$repo_root/scripts/gem-version.sh" async)"
   echo "get_post_headers_1mib=PASS"
   echo "chunked_1mib=PASS"
-  echo "over_limit_413=PASS"
+  echo "beyond_buffer_body=PASS"
   echo "stage_ingress_ns=$stage_ingress_ns"
   echo "stage_body_copy_ns=$stage_body_copy_ns"
   echo "stage_body_callbacks=$stage_body_callbacks"
-  echo "stage_body_reallocations=$stage_body_reallocations"
-  echo "stage_declared_capacity=$stage_declared_capacity"
   echo "stage_runtime_queue_ns=$stage_runtime_queue_ns"
   echo "stage_rack_input_ns=$stage_rack_input_ns"
   echo "stage_rack_call_ns=$stage_rack_call_ns"

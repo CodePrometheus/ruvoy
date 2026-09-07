@@ -1,9 +1,8 @@
 //! A bounded counter that releases what it lent when the lease is dropped.
 //!
-//! Both admission limits are the same shape: a ceiling, a non-blocking
-//! acquire, and release tied to the lifetime of the work. Requests count as one
-//! each; request bodies count as bytes and may grow as more of the body
-//! arrives.
+//! Admission is a ceiling, a non-blocking acquire, and a release tied to the
+//! lifetime of the work: a request that finds the runtime full is refused
+//! rather than queued behind one that may never finish.
 
 use crate::concurrency::{
     Arc,
@@ -74,25 +73,6 @@ pub struct Lease {
     held: usize,
 }
 
-impl Lease {
-    /// Raises the lease to `required`, taking only the difference, and reports
-    /// whether it fit.
-    ///
-    /// Used while a request body arrives in pieces, so a body that outgrows its
-    /// declared length is charged once rather than per chunk.
-    #[must_use]
-    pub fn grow_to(&mut self, required: usize) -> bool {
-        if required <= self.held {
-            return true;
-        }
-        if !self.budget.take(required - self.held) {
-            return false;
-        }
-        self.held = required;
-        true
-    }
-}
-
 impl Drop for Lease {
     fn drop(&mut self) {
         let previous = self.budget.0.used.fetch_sub(self.held, Ordering::AcqRel);
@@ -113,16 +93,6 @@ mod tests {
         budget
             .try_acquire(10)
             .expect("dropped lease should release its capacity");
-    }
-
-    #[test]
-    fn growing_a_lease_charges_only_the_difference() {
-        let budget = Budget::new(10);
-        let mut lease = budget.try_acquire(0).expect("empty body should fit");
-        assert!(lease.grow_to(4), "first chunk should fit");
-        assert!(lease.grow_to(4), "same size must not charge twice");
-        assert!(!lease.grow_to(11));
-        assert!(lease.grow_to(10), "remaining budget should fit");
     }
 
     #[test]
@@ -167,21 +137,21 @@ mod loom_tests {
         });
     }
 
-    /// Growing a lease races the same counter as a fresh acquire.
+    /// A lease released while another thread is acquiring must return every
+    /// unit it took, whichever order the two observe.
     #[test]
-    fn growing_races_acquiring_without_losing_capacity() {
+    fn releasing_races_acquiring_without_losing_capacity() {
         loom::model(|| {
             let budget = Budget::new(4);
-            let mut lease = budget.try_acquire(1).expect("initial lease should fit");
+            let lease = budget.try_acquire(1).expect("initial lease should fit");
 
             let other = {
                 let budget = budget.clone();
                 thread::spawn(move || drop(budget.try_acquire(2)))
             };
-            let _ = lease.grow_to(3);
+            drop(lease);
             other.join().expect("worker should not panic");
 
-            drop(lease);
             assert_eq!(budget.used(), 0, "every lease must return what it took");
         });
     }

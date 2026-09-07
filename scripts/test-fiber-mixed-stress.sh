@@ -19,7 +19,6 @@ ruby_version="$(tr -d '[:space:]' <"$repo_root/.ruby-version")"
 fiber_port=18083
 control_port=18084
 max_inflight_requests=256
-max_inflight_body_bytes=67108864
 mode="${RUVOY_MIXED_MODE:-full}"
 cycles="${RUVOY_MIXED_CYCLES:-3}"
 envoy_concurrency="${RUVOY_MIXED_ENVOY_CONCURRENCY:-1}"
@@ -451,7 +450,7 @@ grep -Fq "value: $repo_root/test/fixtures/rack/config.ru" "$envoy_config" ||
 {
   printf 'run_id=%s\nmode=%s\ncycles=%s\nhost=%s\n' "$run_id" "$mode" "$cycles" "$(uname -srm)"
   printf 'envoy_concurrency=%s\n' "$envoy_concurrency"
-  printf 'max_inflight_requests=%s\nmax_inflight_body_bytes=%s\n' "$max_inflight_requests" "$max_inflight_body_bytes"
+  printf 'max_inflight_requests=%s\n' "$max_inflight_requests"
   printf 'steady_duration=%s\noverload_duration=%s\nrecovery_duration=%s\ndisconnect_requests=%s\n' \
     "$steady_duration" "$overload_duration" "$recovery_duration" "$disconnect_requests"
   printf 'ruby=%s\nrustc=%s\noha=%s\n' \
@@ -470,7 +469,6 @@ grep -Fq "value: $repo_root/test/fixtures/rack/config.ru" "$envoy_config" ||
 } >"$result_dir/preflight.log" 2>&1 || fail "Fiber build or worker-boundary preflight failed"
 
 RUVOY_MAX_INFLIGHT_REQUESTS="$max_inflight_requests" \
-  RUVOY_MAX_INFLIGHT_BODY_BYTES="$max_inflight_body_bytes" \
   BUNDLE_GEMFILE="$repo_root/Gemfile" \
   BUNDLE_PATH="$repo_root/vendor/bundle" \
   BUNDLE_FROZEN=true \

@@ -39,8 +39,11 @@ soak has been run. Interfaces may change.
 - **Streaming responses** — response bodies are delivered chunk by chunk as the
   application produces them, with downstream backpressure applied to the Ruby
   producer instead of buffering.
-- **Bounded admission** — request-count and aggregate request-body budgets
-  reject excess work before it reaches Ruby.
+- **Streaming requests** — the application is called as soon as the headers
+  arrive and reads the body as it lands, with a client the application cannot
+  keep up with slowed down instead of buffered.
+- **Bounded admission** — a request-count budget rejects excess work before it
+  reaches Ruby.
 - **No upstream HTTP hop** — Rack calls do not require a loopback connection to
   a separate Ruby application server.
 
@@ -87,9 +90,11 @@ before the body is complete. A slow client applies backpressure to the Ruby
 producer rather than accumulating in memory, and a client that disconnects
 stops the enumeration and closes the body.
 
-Request bodies are read completely before the application is called; request
-streaming is not implemented. Raw socket hijacking (`rack.hijack`) is not
-supported; the connection always belongs to Envoy.
+Request bodies stream as well: the application is called once the headers
+arrive and reads through `rack.input` as the body lands, so uploading and
+processing overlap. What the application has not read yet waits in Envoy, which
+stops reading from the client until there is room again. Raw socket hijacking
+(`rack.hijack`) is not supported; the connection always belongs to Envoy.
 
 ## Scaling
 

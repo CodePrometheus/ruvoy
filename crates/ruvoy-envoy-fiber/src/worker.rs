@@ -1,44 +1,50 @@
 use crate::{
     metrics::{
-        Metrics, OUTCOME_COMPLETED, OUTCOME_FAILED, REJECTED_ADMISSION, REJECTED_BODY_BUDGET,
-        REJECTED_BODY_TOO_LARGE, REJECTED_INTERNAL, REJECTED_INVALID_REQUEST,
+        Metrics, OUTCOME_COMPLETED, OUTCOME_FAILED, REJECTED_ADMISSION, REJECTED_INTERNAL,
+        REJECTED_INVALID_REQUEST,
     },
     runtime::FiberRackConfig,
 };
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use ruvoy::{
-    Budget, Lease, Request, RequestDiagnostics, RequestMetadata, ResponseHead, ResponseStream,
-    StreamHandle, StreamItem, StreamWaker, fiber::FiberRuntimeClient,
+    Request, RequestDiagnostics, RequestMetadata, ResponseHead, ResponseStream, StreamHandle,
+    StreamItem, StreamWaker, fiber::FiberRuntimeClient,
 };
 use std::{sync::Arc, time::Instant};
 
 const RESPONSE_EVENT_ID: u64 = 1;
-const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+const REQUEST_EVENT_ID: u64 = 2;
 
-/// Caps what one response may hold in memory between the Ruby producer and the
-/// downstream write buffer. Beyond this the producer is asked to wait.
-const MAX_BUFFERED_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Caps what one body may hold in memory between Envoy and Ruby, in either
+/// direction. Beyond this the producing side is asked to wait, so a body of any
+/// size costs the same and the runtime's admission limit bounds the total.
+const MAX_BUFFERED_BODY_BYTES: usize = 1024 * 1024;
 
+/// What a request was missing, in the words sent back to the client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BodyCopyError {
-    Allocation,
-    InvalidRequest(&'static str),
-    MissingRequest,
-    Overloaded,
-    TooLarge,
+struct InvalidRequest(&'static str);
+
+/// Which of Envoy's request buffers a copy reads from.
+#[derive(Clone, Copy)]
+enum BodySource {
+    /// The frame handed to the callback that is running.
+    Received,
+    /// What earlier callbacks left for Envoy to hold on to.
+    Retained,
 }
 
 impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FiberRackConfig {
     fn new_http_filter(&self, _envoy_filter: &mut EHF) -> Box<dyn HttpFilter<EHF>> {
         Box::new(FiberRackFilter {
             client: self.client(),
-            body_budget: self.body_budget(),
-            body_lease: None,
             diagnostics_enabled: self.diagnostics_enabled(),
             runtime_thread_id: self.runtime_thread_id().to_owned(),
             worker_thread_id: format!("{:?}", std::thread::current().id()),
             request: None,
+            request_body: None,
+            request_end_pending: false,
+            diagnostics: None,
             stream: None,
             state: FilterState::Collecting,
             metrics: self.metrics(),
@@ -58,12 +64,15 @@ enum FilterState {
 
 struct FiberRackFilter {
     client: FiberRuntimeClient,
-    body_budget: Budget,
-    body_lease: Option<Lease>,
     diagnostics_enabled: bool,
     runtime_thread_id: String,
     worker_thread_id: String,
     request: Option<Request>,
+    request_body: Option<StreamHandle>,
+    /// Set once Envoy has delivered the last request byte, and cleared once
+    /// that end has been passed on to the runtime behind the bytes before it.
+    request_end_pending: bool,
+    diagnostics: Option<RequestDiagnostics>,
     stream: Option<Arc<ResponseStream>>,
     state: FilterState,
     metrics: Option<Metrics>,
@@ -84,7 +93,7 @@ impl FiberRackFilter {
         &self,
         envoy_filter: &EHF,
         received_at: Instant,
-    ) -> Result<(Request, Lease), BodyCopyError> {
+    ) -> Result<Request, InvalidRequest> {
         let headers = envoy_filter
             .get_request_headers()
             .into_iter()
@@ -99,91 +108,88 @@ impl FiberRackFilter {
         let method = envoy_filter
             .get_request_header_value(":method")
             .map(|value| String::from_utf8_lossy(value.as_slice()).into_owned())
-            .ok_or(BodyCopyError::InvalidRequest("missing :method"))?;
+            .ok_or(InvalidRequest("missing :method"))?;
         let path = envoy_filter
             .get_request_header_value(":path")
             .map(|value| String::from_utf8_lossy(value.as_slice()).into_owned())
-            .ok_or(BodyCopyError::InvalidRequest("missing :path"))?;
+            .ok_or(InvalidRequest("missing :path"))?;
         let metadata = request_metadata(envoy_filter)?;
-        let body_capacity = declared_body_capacity(
-            envoy_filter
-                .get_request_header_value("content-length")
-                .as_ref()
-                .map(|value| value.as_slice()),
-        )?;
-        let mut body = Vec::new();
-        let body_lease = self
-            .body_budget
-            .try_acquire(body_capacity)
-            .ok_or(BodyCopyError::Overloaded)?;
-        body.try_reserve_exact(body_capacity)
-            .map_err(|_| BodyCopyError::Allocation)?;
         let stage_timing_requested = self.diagnostics_enabled
             && envoy_filter
                 .get_request_header_value("x-ruvoy-stage-timing")
                 .is_some_and(|value| value.as_slice() == b"1");
 
-        Ok((
-            Request {
-                method,
-                path,
-                body,
-                headers,
-                metadata,
-                force_gc: false,
-                diagnostics: stage_timing_requested
-                    .then(|| RequestDiagnostics::new(received_at, body_capacity)),
-            },
-            body_lease,
-        ))
+        Ok(Request {
+            method,
+            path,
+            body: Vec::new(),
+            body_stream: None,
+            headers,
+            metadata,
+            force_gc: false,
+            diagnostics: stage_timing_requested.then(|| RequestDiagnostics::new(received_at)),
+        })
     }
 
-    fn copy_received_body<EHF: EnvoyHttpFilter>(
-        &mut self,
-        envoy_filter: &mut EHF,
-    ) -> Result<(), BodyCopyError> {
-        let buffers = envoy_filter.get_received_request_body().unwrap_or_default();
-        let received_size = buffers.iter().try_fold(0usize, |size, buffer| {
-            size.checked_add(buffer.as_slice().len())
-                .ok_or(BodyCopyError::TooLarge)
-        })?;
-        let current_size = self
-            .request
-            .as_ref()
-            .ok_or(BodyCopyError::MissingRequest)?
-            .body
-            .len();
-        let required_size = current_size
-            .checked_add(received_size)
-            .ok_or(BodyCopyError::TooLarge)?;
-        if required_size > MAX_REQUEST_BODY_BYTES {
-            return Err(BodyCopyError::TooLarge);
-        }
-        if !self
-            .body_lease
-            .as_mut()
-            .ok_or(BodyCopyError::MissingRequest)?
-            .grow_to(required_size)
-        {
-            return Err(BodyCopyError::Overloaded);
-        }
-        let request = self.request.as_mut().ok_or(BodyCopyError::MissingRequest)?;
+    /// Moves as much of the request body as the runtime has room for.
+    ///
+    /// Whatever does not fit stays where Envoy put it. Returning
+    /// `StopIterationAndWatermark` makes that a watermark buffer, so filling it
+    /// stops Envoy reading from the client and draining it starts the client
+    /// again: a slow application slows the upload down instead of being charged
+    /// for a body it has not read.
+    fn forward_request_body<EHF: EnvoyHttpFilter>(&mut self, envoy_filter: &mut EHF) {
+        let Some(handle) = self.request_body.clone() else {
+            return;
+        };
         let copy_started_at = Instant::now();
-        let capacity_before = request.body.capacity();
-        let result = append_body_slices(
-            &mut request.body,
-            buffers.iter().map(|buffer| buffer.as_slice()),
-        );
-        if let Some(diagnostics) = request.diagnostics.as_mut() {
+
+        // A filter ahead of us may resume by re-delivering what it buffered, in
+        // which case both accessors name the same bytes.
+        let received_is_retained = envoy_filter.received_buffered_request_body();
+        let retained = envoy_filter.get_buffered_request_body_size();
+        let received = if received_is_retained {
+            0
+        } else {
+            envoy_filter.get_received_request_body_size()
+        };
+
+        let room = (retained + received).min(handle.stream.spare_capacity());
+        // Retained bytes arrived before the frame in hand, so a short copy from
+        // them must not let the newer frame overtake.
+        let mut copied = copy_body(envoy_filter, BodySource::Retained, room, &handle.stream);
+        if copied < room && !received_is_retained {
+            copied += copy_body(
+                envoy_filter,
+                BodySource::Received,
+                room - copied,
+                &handle.stream,
+            );
+        }
+
+        // The end may only follow the last byte, which Envoy still holds
+        // whenever the runtime had no room for all of it.
+        let ended = self.request_end_pending
+            && envoy_filter.get_buffered_request_body_size() == 0
+            && envoy_filter.get_received_request_body_size() == 0;
+        if ended {
+            handle.stream.push_end();
+            self.request_end_pending = false;
+        }
+        if copied > 0 || ended {
+            self.client.wake_body(Arc::clone(&handle.stream));
+        }
+        if let Some(diagnostics) = self.diagnostics.as_mut() {
             diagnostics.body_copy_time += copy_started_at.elapsed();
             diagnostics.body_callbacks += 1;
-            diagnostics.body_reallocations += u64::from(request.body.capacity() != capacity_before);
         }
-        result
     }
 
     fn submit<EHF: EnvoyHttpFilter>(&mut self, envoy_filter: &mut EHF) {
         let Some(mut request) = self.request.take() else {
+            if let Some(metrics) = self.metrics {
+                metrics.rejected(envoy_filter, REJECTED_INTERNAL);
+            }
             self.send_bridge_error(
                 envoy_filter,
                 500,
@@ -195,10 +201,18 @@ impl FiberRackFilter {
         if let Some(diagnostics) = request.diagnostics.as_mut() {
             diagnostics.submitted_at = Some(Instant::now());
         }
+        self.diagnostics = request.diagnostics.clone();
 
         let scheduler = envoy_filter.new_scheduler();
-        let body_lease = self.body_lease.take();
-        let stream = Arc::new(ResponseStream::new(MAX_BUFFERED_RESPONSE_BYTES));
+        let request_scheduler = envoy_filter.new_scheduler();
+        let request_stream = Arc::new(ResponseStream::new(MAX_BUFFERED_BODY_BYTES));
+        let request_handle = StreamHandle::new(
+            Arc::clone(&request_stream),
+            Arc::new(move || request_scheduler.commit(REQUEST_EVENT_ID)),
+        );
+        self.request_body = Some(request_handle.clone());
+        request.body_stream = Some(request_handle);
+        let stream = Arc::new(ResponseStream::new(MAX_BUFFERED_BODY_BYTES));
         // The waker only signals; the worker thread does every Envoy call when
         // the scheduled event arrives.
         let waker: StreamWaker = Arc::new(move || {
@@ -213,13 +227,10 @@ impl FiberRackFilter {
             Ok(()) => {
                 self.state = FilterState::Waiting;
                 self.submitted_at = Some(Instant::now());
-                // The request body is no longer needed once Ruby owns the call.
-                drop(body_lease);
                 self.report_admission(envoy_filter, None);
             }
             Err(error) => {
                 self.stream = None;
-                drop(body_lease);
                 let body = error.to_string();
                 self.report_admission(envoy_filter, Some(REJECTED_ADMISSION));
                 self.send_bridge_error(
@@ -248,7 +259,6 @@ impl FiberRackFilter {
         metrics.saturation(
             envoy_filter,
             self.client.inflight_requests(),
-            self.body_budget.used(),
             self.client.reactor_idle_for(),
         );
     }
@@ -269,8 +279,11 @@ impl FiberRackFilter {
         body: &[u8],
         details: &str,
     ) {
+        // Nothing may touch this filter once the reply goes out, so everything
+        // it owns is released first.
         self.request = None;
-        self.body_lease = None;
+        self.request_body = None;
+        self.request_end_pending = false;
         self.state = FilterState::Responded;
         envoy_filter.send_response(
             status,
@@ -280,46 +293,20 @@ impl FiberRackFilter {
         );
     }
 
-    fn send_body_error<EHF: EnvoyHttpFilter>(
+    fn send_invalid_request<EHF: EnvoyHttpFilter>(
         &mut self,
         envoy_filter: &mut EHF,
-        error: BodyCopyError,
+        InvalidRequest(message): InvalidRequest,
     ) {
         if let Some(metrics) = self.metrics {
-            metrics.rejected(envoy_filter, Self::rejection_reason(error));
+            metrics.rejected(envoy_filter, REJECTED_INVALID_REQUEST);
         }
-        match error {
-            BodyCopyError::TooLarge => self.send_bridge_error(
-                envoy_filter,
-                413,
-                b"request body exceeds 2 MiB PoC limit",
-                "ruvoy_fiber_body_too_large",
-            ),
-            BodyCopyError::Allocation => self.send_bridge_error(
-                envoy_filter,
-                503,
-                b"request body allocation failed",
-                "ruvoy_fiber_body_allocation_failed",
-            ),
-            BodyCopyError::InvalidRequest(message) => self.send_bridge_error(
-                envoy_filter,
-                400,
-                message.as_bytes(),
-                "ruvoy_fiber_invalid_request",
-            ),
-            BodyCopyError::Overloaded => self.send_bridge_error(
-                envoy_filter,
-                503,
-                b"request body admission limit reached",
-                "ruvoy_fiber_body_overloaded",
-            ),
-            BodyCopyError::MissingRequest => self.send_bridge_error(
-                envoy_filter,
-                500,
-                b"missing owned request",
-                "ruvoy_fiber_missing_request",
-            ),
-        }
+        self.send_bridge_error(
+            envoy_filter,
+            400,
+            message.as_bytes(),
+            "ruvoy_fiber_invalid_request",
+        );
     }
 
     fn send_response_head<EHF: EnvoyHttpFilter>(
@@ -412,17 +399,6 @@ impl FiberRackFilter {
     }
 }
 
-impl FiberRackFilter {
-    fn rejection_reason(error: BodyCopyError) -> &'static str {
-        match error {
-            BodyCopyError::TooLarge => REJECTED_BODY_TOO_LARGE,
-            BodyCopyError::Overloaded => REJECTED_BODY_BUDGET,
-            BodyCopyError::InvalidRequest(_) => REJECTED_INVALID_REQUEST,
-            BodyCopyError::Allocation | BodyCopyError::MissingRequest => REJECTED_INTERNAL,
-        }
-    }
-}
-
 impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
     fn on_request_headers(
         &mut self,
@@ -430,17 +406,18 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
         end_of_stream: bool,
     ) -> envoy_dynamic_module_type_on_http_filter_request_headers_status {
         match self.copy_headers(envoy_filter, Instant::now()) {
-            Ok((request, body_lease)) => {
-                self.request = Some(request);
-                self.body_lease = Some(body_lease);
-            }
+            Ok(request) => self.request = Some(request),
             Err(error) => {
-                self.send_body_error(envoy_filter, error);
+                self.send_invalid_request(envoy_filter, error);
                 return envoy_dynamic_module_type_on_http_filter_request_headers_status::StopIteration;
             }
         }
+        // The application starts before the body has arrived, which is what
+        // lets it overlap with the upload.
+        self.submit(envoy_filter);
+        self.request_end_pending = end_of_stream;
         if end_of_stream {
-            self.submit(envoy_filter);
+            self.forward_request_body(envoy_filter);
         }
         envoy_dynamic_module_type_on_http_filter_request_headers_status::StopIteration
     }
@@ -450,39 +427,32 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
         envoy_filter: &mut EHF,
         end_of_stream: bool,
     ) -> envoy_dynamic_module_type_on_http_filter_request_body_status {
-        if self.state != FilterState::Collecting {
-            return envoy_dynamic_module_type_on_http_filter_request_body_status::StopIterationNoBuffer;
-        }
-
-        if let Err(error) = self.copy_received_body(envoy_filter) {
-            self.send_body_error(envoy_filter, error);
-            return envoy_dynamic_module_type_on_http_filter_request_body_status::StopIterationNoBuffer;
-        }
-
-        if end_of_stream {
-            self.submit(envoy_filter);
-        }
-        envoy_dynamic_module_type_on_http_filter_request_body_status::StopIterationNoBuffer
+        self.request_end_pending |= end_of_stream;
+        self.forward_request_body(envoy_filter);
+        envoy_dynamic_module_type_on_http_filter_request_body_status::StopIterationAndWatermark
     }
 
     fn on_request_trailers(
         &mut self,
         envoy_filter: &mut EHF,
     ) -> envoy_dynamic_module_type_on_http_filter_request_trailers_status {
-        if self.state == FilterState::Collecting {
-            self.submit(envoy_filter);
-        }
+        self.request_end_pending = true;
+        self.forward_request_body(envoy_filter);
         envoy_dynamic_module_type_on_http_filter_request_trailers_status::StopIteration
     }
 
     fn on_scheduled(&mut self, envoy_filter: &mut EHF, event_id: u64) {
-        if event_id != RESPONSE_EVENT_ID {
-            return;
+        match event_id {
+            // The runtime took bytes out of the request queue, so there is room
+            // for more of what Envoy has been holding back.
+            REQUEST_EVENT_ID => self.forward_request_body(envoy_filter),
+            RESPONSE_EVENT_ID
+                if matches!(self.state, FilterState::Waiting | FilterState::Streaming) =>
+            {
+                self.drain_stream(envoy_filter);
+            }
+            _ => {}
         }
-        if self.state != FilterState::Waiting && self.state != FilterState::Streaming {
-            return;
-        }
-        self.drain_stream(envoy_filter);
     }
 
     fn on_downstream_above_write_buffer_high_watermark(&mut self, _envoy_filter: &mut EHF) {
@@ -509,12 +479,12 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
 
 fn request_metadata<EHF: EnvoyHttpFilter>(
     envoy_filter: &EHF,
-) -> Result<RequestMetadata, BodyCopyError> {
+) -> Result<RequestMetadata, InvalidRequest> {
     let scheme = attribute_string(
         envoy_filter,
         envoy_dynamic_module_type_attribute_id::RequestScheme,
     )
-    .ok_or(BodyCopyError::InvalidRequest("missing request scheme"))?;
+    .ok_or(InvalidRequest("missing request scheme"))?;
     let authority = attribute_string(
         envoy_filter,
         envoy_dynamic_module_type_attribute_id::RequestHost,
@@ -524,12 +494,12 @@ fn request_metadata<EHF: EnvoyHttpFilter>(
             .get_request_header_value(":authority")
             .map(|value| String::from_utf8_lossy(value.as_slice()).into_owned())
     })
-    .ok_or(BodyCopyError::InvalidRequest("missing request authority"))?;
+    .ok_or(InvalidRequest("missing request authority"))?;
     let protocol = attribute_string(
         envoy_filter,
         envoy_dynamic_module_type_attribute_id::RequestProtocol,
     )
-    .ok_or(BodyCopyError::InvalidRequest("missing request protocol"))?;
+    .ok_or(InvalidRequest("missing request protocol"))?;
 
     let destination_address = attribute_string(
         envoy_filter,
@@ -537,14 +507,14 @@ fn request_metadata<EHF: EnvoyHttpFilter>(
     );
     let server_name = authority_host(&authority)
         .or_else(|| destination_address.as_deref().and_then(authority_host))
-        .ok_or(BodyCopyError::InvalidRequest("invalid request authority"))?
+        .ok_or(InvalidRequest("invalid request authority"))?
         .to_owned();
     let server_port = envoy_filter
         .get_attribute_int(envoy_dynamic_module_type_attribute_id::DestinationPort)
         .and_then(|port| u16::try_from(port).ok())
         .or_else(|| authority_port(&authority))
         .or_else(|| default_port(&scheme))
-        .ok_or(BodyCopyError::InvalidRequest("missing destination port"))?;
+        .ok_or(InvalidRequest("missing destination port"))?;
     let remote_addr = attribute_string(
         envoy_filter,
         envoy_dynamic_module_type_attribute_id::SourceAddress,
@@ -559,6 +529,41 @@ fn request_metadata<EHF: EnvoyHttpFilter>(
         protocol,
         remote_addr,
     })
+}
+
+/// Moves up to `limit` bytes out of one of Envoy's request buffers.
+fn copy_body<EHF: EnvoyHttpFilter>(
+    envoy_filter: &mut EHF,
+    source: BodySource,
+    limit: usize,
+    stream: &ResponseStream,
+) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+    let buffers = match source {
+        BodySource::Received => envoy_filter.get_received_request_body(),
+        BodySource::Retained => envoy_filter.get_buffered_request_body(),
+    }
+    .unwrap_or_default();
+    let mut copied = 0;
+    for buffer in &buffers {
+        let slice = buffer.as_slice();
+        let take = slice.len().min(limit - copied);
+        if take == 0 {
+            break;
+        }
+        stream.push_chunk(slice[..take].to_vec());
+        copied += take;
+    }
+    drop(buffers);
+    if copied > 0 {
+        match source {
+            BodySource::Received => envoy_filter.drain_received_request_body(copied),
+            BodySource::Retained => envoy_filter.drain_buffered_request_body(copied),
+        };
+    }
+    copied
 }
 
 fn attribute_string<EHF: EnvoyHttpFilter>(
@@ -603,79 +608,9 @@ fn default_port(scheme: &str) -> Option<u16> {
     }
 }
 
-fn declared_body_capacity(value: Option<&[u8]>) -> Result<usize, BodyCopyError> {
-    let Some(value) = value else {
-        return Ok(0);
-    };
-    let Ok(value) = std::str::from_utf8(value) else {
-        return Ok(0);
-    };
-    let Ok(value) = value.parse::<usize>() else {
-        return Ok(0);
-    };
-    if value > MAX_REQUEST_BODY_BYTES {
-        return Err(BodyCopyError::TooLarge);
-    }
-    Ok(value)
-}
-
-fn append_body_slices<'a, I>(body: &mut Vec<u8>, slices: I) -> Result<(), BodyCopyError>
-where
-    I: IntoIterator<Item = &'a [u8]>,
-    I::IntoIter: Clone,
-{
-    let slices = slices.into_iter();
-    let received_size = slices.clone().try_fold(0usize, |size, slice| {
-        size.checked_add(slice.len()).ok_or(BodyCopyError::TooLarge)
-    })?;
-    let new_size = body
-        .len()
-        .checked_add(received_size)
-        .ok_or(BodyCopyError::TooLarge)?;
-    if new_size > MAX_REQUEST_BODY_BYTES {
-        return Err(BodyCopyError::TooLarge);
-    }
-    body.try_reserve_exact(received_size)
-        .map_err(|_| BodyCopyError::Allocation)?;
-    for slice in slices {
-        body.extend_from_slice(slice);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn declared_length_is_bounded_and_optional() {
-        assert_eq!(declared_body_capacity(None), Ok(0));
-        assert_eq!(declared_body_capacity(Some(b"1048576")), Ok(1_048_576));
-        assert_eq!(declared_body_capacity(Some(b"chunked")), Ok(0));
-        assert_eq!(
-            declared_body_capacity(Some(b"2097153")),
-            Err(BodyCopyError::TooLarge)
-        );
-    }
-
-    #[test]
-    fn body_slices_are_appended_directly_into_the_owned_request() {
-        let mut body = Vec::with_capacity(11);
-        append_body_slices(&mut body, [b"hello ".as_slice(), b"world".as_slice()])
-            .expect("body should fit");
-        assert_eq!(body, b"hello world");
-        assert_eq!(body.capacity(), 11);
-    }
-
-    #[test]
-    fn body_limit_applies_across_callbacks() {
-        let mut body = vec![0; MAX_REQUEST_BODY_BYTES - 1];
-        assert_eq!(
-            append_body_slices(&mut body, [b"ab".as_slice()]),
-            Err(BodyCopyError::TooLarge)
-        );
-        assert_eq!(body.len(), MAX_REQUEST_BODY_BYTES - 1);
-    }
 
     #[test]
     fn authority_is_split_without_corrupting_ipv6_hosts() {

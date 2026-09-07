@@ -4,7 +4,7 @@
 //! numbers reach whatever sink the proxy is already configured with.
 //!
 //! Counters record events as they happen; the saturation gauges are republished
-//! from the budgets themselves so a missed update cannot leave them drifting.
+//! from the runtime itself so a missed update cannot leave them drifting.
 
 use envoy_proxy_dynamic_modules_rust_sdk::{
     EnvoyCounterId, EnvoyCounterVecId, EnvoyGaugeId, EnvoyHistogramId, EnvoyHttpFilter,
@@ -25,8 +25,6 @@ static SAMPLES: AtomicU64 = AtomicU64::new(0);
 
 /// Why a request never reached the application.
 pub(crate) const REJECTED_ADMISSION: &str = "admission";
-pub(crate) const REJECTED_BODY_BUDGET: &str = "body_budget";
-pub(crate) const REJECTED_BODY_TOO_LARGE: &str = "body_too_large";
 pub(crate) const REJECTED_INVALID_REQUEST: &str = "invalid_request";
 pub(crate) const REJECTED_INTERNAL: &str = "internal";
 
@@ -40,7 +38,6 @@ pub(crate) struct Metrics {
     rejected: EnvoyCounterVecId,
     responses: EnvoyCounterVecId,
     inflight_requests: EnvoyGaugeId,
-    inflight_body_bytes: EnvoyGaugeId,
     resident_bytes: EnvoyGaugeId,
     reactor_idle_ms: EnvoyGaugeId,
     duration_ms: EnvoyHistogramId,
@@ -62,7 +59,6 @@ impl Metrics {
                     .define_counter_vec("responses_total", &["outcome"])
                     .ok()?,
                 inflight_requests: config.define_gauge("inflight_requests").ok()?,
-                inflight_body_bytes: config.define_gauge("inflight_body_bytes").ok()?,
                 resident_bytes: config.define_gauge("resident_bytes").ok()?,
                 reactor_idle_ms: config.define_gauge("reactor_idle_ms").ok()?,
                 duration_ms: config.define_histogram("duration_ms").ok()?,
@@ -100,11 +96,9 @@ impl Metrics {
         self,
         envoy_filter: &EHF,
         requests: usize,
-        body_bytes: usize,
         reactor_idle: Duration,
     ) {
         let _ = envoy_filter.set_gauge(self.inflight_requests, requests as u64);
-        let _ = envoy_filter.set_gauge(self.inflight_body_bytes, body_bytes as u64);
         let _ = envoy_filter.set_gauge(self.reactor_idle_ms, reactor_idle.as_millis() as u64);
 
         if SAMPLES

@@ -279,6 +279,7 @@ impl Prepared {
         CallContext {
             app: *self.app,
             string_io_class: self.string_io_class,
+            request_body_class: None,
             rack_errors: *self.rack_errors,
             body_reader: *self.body_reader,
             ruby_thread_object_id: self.info.ruby_thread_object_id,
