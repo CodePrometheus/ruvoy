@@ -130,33 +130,6 @@ impl ProcessRuntimeConfig {
             diagnostics_enabled: flag_env("RUVOY_DIAGNOSTICS")?,
         })
     }
-
-    /// Names the first setting that differs, so a rejection says which one.
-    fn first_difference(&self, requested: &Self) -> Option<&'static str> {
-        if self.rackup != requested.rackup {
-            return Some("a different rackup");
-        }
-        [
-            (
-                "RUVOY_MAX_INFLIGHT_REQUESTS",
-                self.max_inflight_requests != requested.max_inflight_requests,
-            ),
-            (
-                "RUVOY_MAX_INFLIGHT_BODY_BYTES",
-                self.max_inflight_body_bytes != requested.max_inflight_body_bytes,
-            ),
-            (
-                "RUVOY_SHUTDOWN_TIMEOUT_MS",
-                self.shutdown_timeout != requested.shutdown_timeout,
-            ),
-            (
-                "RUVOY_DIAGNOSTICS",
-                self.diagnostics_enabled != requested.diagnostics_enabled,
-            ),
-        ]
-        .into_iter()
-        .find_map(|(name, differs)| differs.then_some(name))
-    }
 }
 
 struct ProcessRuntime {
@@ -214,14 +187,14 @@ impl ProcessRuntime {
     }
 
     fn ensure_compatible(&self, requested: &ProcessRuntimeConfig) -> Result<(), BridgeError> {
-        let Some(field) = self.config.first_difference(requested) else {
+        if &self.config == requested {
             return Ok(());
-        };
+        }
 
         Err(BridgeError::Startup(format!(
-            "Ruvoy is already running with {field}; this process cannot serve a second \
-             configuration. The Ruby VM is created once per process, so restart Envoy to \
-             change it. active rackup={} requested rackup={}",
+            "Ruvoy is already running with a different rackup; this process cannot serve a \
+             second configuration. The Ruby VM is created once per process, so restart Envoy \
+             to change it. active rackup={} requested rackup={}",
             self.config.rackup.display(),
             requested.rackup.display(),
         )))
@@ -382,29 +355,6 @@ mod tests {
         assert!(rackup_from_filter_config(b"   ").is_err());
         assert!(rackup_from_filter_config(br#"{"rackup": 7}"#).is_err());
         assert!(rackup_from_filter_config(br#"{"rack_up": "/a"}"#).is_err());
-    }
-
-    #[test]
-    fn a_rejected_reconfiguration_names_the_setting_that_differs() {
-        let active = ProcessRuntimeConfig {
-            rackup: PathBuf::from("/srv/app/config.ru"),
-            max_inflight_requests: 128,
-            max_inflight_body_bytes: 1024,
-            shutdown_timeout: Duration::from_secs(5),
-            diagnostics_enabled: false,
-        };
-        assert_eq!(active.first_difference(&active), None);
-
-        let mut other = active.clone();
-        other.rackup = PathBuf::from("/srv/other/config.ru");
-        assert_eq!(active.first_difference(&other), Some("a different rackup"));
-
-        let mut other = active.clone();
-        other.max_inflight_body_bytes = 2048;
-        assert_eq!(
-            active.first_difference(&other),
-            Some("RUVOY_MAX_INFLIGHT_BODY_BYTES")
-        );
     }
 
     #[test]

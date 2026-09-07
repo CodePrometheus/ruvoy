@@ -185,7 +185,22 @@ printf 'disconnect: yielded %s -> %s, closed %s -> %s\n' \
   pass "the abandoned body was closed" ||
   fail "the abandoned body was never closed"
 
-# --- 4. The server still works afterwards ------------------------------------
+# --- 4. A client that leaves stops the application, not just its output -------
+# The fixture waits before it counts the call, so a request that was stopped
+# mid-wait never counts. Both probes do count, so a working cancellation leaves
+# the counter one higher, and a request that ran to completion leaves it two.
+calls_before="$(curl --silent --max-time 5 "http://127.0.0.1:$port/counted")"
+curl --silent --output /dev/null --max-time 1 \
+  "http://127.0.0.1:$port/async-sleep?seconds=4" || true
+sleep 6
+calls_after="$(curl --silent --max-time 5 "http://127.0.0.1:$port/counted")"
+printf 'abandoned request: call count %s -> %s\n' "$calls_before" "$calls_after"
+
+[[ "$calls_after" -eq "$((calls_before + 1))" ]] &&
+  pass "the abandoned request was stopped before it finished" ||
+  fail "the abandoned request ran to completion: $calls_before -> $calls_after"
+
+# --- 5. The server still works afterwards ------------------------------------
 survivor="$(curl --silent --max-time 5 --output /dev/null --write-out '%{http_code}' \
   "http://127.0.0.1:$port/rack-env")"
 [[ "$survivor" == 200 ]] &&
@@ -195,7 +210,7 @@ grep -Eqi 'panic|segmentation fault|SIGSEGV' "$result_dir/envoy.log" &&
   fail "the streaming run produced a crash signature" ||
   pass "no crash signature in the streaming run"
 
-# --- 5. A slow client applies backpressure instead of growing memory ---------
+# --- 6. A slow client applies backpressure instead of growing memory ---------
 # The producer may run ahead by at most the queue (1 MiB) plus Envoy's write
 # buffer (64 KiB). With a 4 MiB body that is well under half the chunks, so a
 # producer that ignored backpressure would be obvious.

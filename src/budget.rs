@@ -9,19 +9,6 @@ use crate::concurrency::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::fmt;
-
-/// The request would have pushed the counter past its ceiling.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BudgetExceeded;
-
-impl fmt::Display for BudgetExceeded {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("admission budget exhausted")
-    }
-}
-
-impl std::error::Error for BudgetExceeded {}
 
 /// A ceiling shared by every producer, enforced without blocking.
 ///
@@ -45,10 +32,10 @@ impl Budget {
         }))
     }
 
-    /// Takes `amount` from the budget, or reports that it does not fit.
-    pub fn try_acquire(&self, amount: usize) -> Result<Lease, BudgetExceeded> {
-        self.take(amount)?;
-        Ok(Lease {
+    /// Takes `amount` from the budget, or nothing if it does not fit.
+    #[must_use]
+    pub fn try_acquire(&self, amount: usize) -> Option<Lease> {
+        self.take(amount).then(|| Lease {
             budget: self.clone(),
             held: amount,
         })
@@ -60,12 +47,12 @@ impl Budget {
         self.0.used.load(Ordering::Relaxed)
     }
 
-    fn take(&self, amount: usize) -> Result<(), BudgetExceeded> {
+    fn take(&self, amount: usize) -> bool {
         let ceiling = &*self.0;
         let mut used = ceiling.used.load(Ordering::Relaxed);
         loop {
             if amount > ceiling.capacity.saturating_sub(used) {
-                return Err(BudgetExceeded);
+                return false;
             }
             match ceiling.used.compare_exchange_weak(
                 used,
@@ -73,7 +60,7 @@ impl Budget {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => return true,
                 Err(observed) => used = observed,
             }
         }
@@ -88,17 +75,21 @@ pub struct Lease {
 }
 
 impl Lease {
-    /// Raises the lease to `required`, taking only the difference.
+    /// Raises the lease to `required`, taking only the difference, and reports
+    /// whether it fit.
     ///
     /// Used while a request body arrives in pieces, so a body that outgrows its
     /// declared length is charged once rather than per chunk.
-    pub fn grow_to(&mut self, required: usize) -> Result<(), BudgetExceeded> {
+    #[must_use]
+    pub fn grow_to(&mut self, required: usize) -> bool {
         if required <= self.held {
-            return Ok(());
+            return true;
         }
-        self.budget.take(required - self.held)?;
+        if !self.budget.take(required - self.held) {
+            return false;
+        }
         self.held = required;
-        Ok(())
+        true
     }
 }
 
@@ -117,7 +108,7 @@ mod tests {
     fn rejects_overcommit_and_releases_capacity() {
         let budget = Budget::new(10);
         let lease = budget.try_acquire(8).expect("first request should fit");
-        assert_eq!(budget.try_acquire(3).unwrap_err(), BudgetExceeded);
+        assert!(budget.try_acquire(3).is_none());
         drop(lease);
         budget
             .try_acquire(10)
@@ -128,17 +119,17 @@ mod tests {
     fn growing_a_lease_charges_only_the_difference() {
         let budget = Budget::new(10);
         let mut lease = budget.try_acquire(0).expect("empty body should fit");
-        lease.grow_to(4).expect("first chunk should fit");
-        lease.grow_to(4).expect("same size must not charge twice");
-        assert_eq!(lease.grow_to(11), Err(BudgetExceeded));
-        lease.grow_to(10).expect("remaining budget should fit");
+        assert!(lease.grow_to(4), "first chunk should fit");
+        assert!(lease.grow_to(4), "same size must not charge twice");
+        assert!(!lease.grow_to(11));
+        assert!(lease.grow_to(10), "remaining budget should fit");
     }
 
     #[test]
     fn a_single_permit_is_exclusive() {
         let budget = Budget::new(1);
         let permit = budget.try_acquire(1).expect("first request should fit");
-        assert_eq!(budget.try_acquire(1).unwrap_err(), BudgetExceeded);
+        assert!(budget.try_acquire(1).is_none());
         drop(permit);
         budget
             .try_acquire(1)
@@ -161,7 +152,7 @@ mod loom_tests {
                 .map(|_| {
                     let budget = budget.clone();
                     thread::spawn(move || {
-                        if let Ok(lease) = budget.try_acquire(2) {
+                        if let Some(lease) = budget.try_acquire(2) {
                             assert!(budget.used() <= 2);
                             drop(lease);
                         }

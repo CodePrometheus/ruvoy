@@ -32,7 +32,7 @@ mod vm;
 mod wake;
 
 pub use crate::{
-    budget::{Budget, BudgetExceeded, Lease},
+    budget::{Budget, Lease},
     error::BridgeError,
     request::{Request, RequestDiagnostics, RequestMetadata},
     response::{Response, ResponseHead},

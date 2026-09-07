@@ -84,7 +84,7 @@ impl ReactorHeartbeat {
     }
 
     fn elapsed_ms(&self) -> u64 {
-        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+        self.started_at.elapsed().as_millis() as u64
     }
 }
 
@@ -117,7 +117,18 @@ impl StreamSink {
 }
 
 #[magnus::wrap(class = "Ruvoy::FiberEnvelope", free_immediately)]
-struct FiberEnvelope(RefCell<Option<FiberCall>>);
+struct FiberEnvelope {
+    /// Kept past the call itself so a fiber can still be asked whether the
+    /// client it was serving has gone away.
+    stream: Arc<ResponseStream>,
+    call: RefCell<Option<FiberCall>>,
+}
+
+impl FiberEnvelope {
+    fn cancelled(&self) -> bool {
+        self.stream.is_cancelled()
+    }
+}
 
 #[magnus::wrap(class = "Ruvoy::FiberBridge", free_immediately)]
 struct FiberBridge {
@@ -144,7 +155,10 @@ impl FiberBridge {
         loop {
             match bridge.command_rx.borrow().try_recv() {
                 Ok(FiberCommand::Call(call)) => {
-                    let envelope = ruby.obj_wrap(FiberEnvelope(RefCell::new(Some(*call))));
+                    let envelope = ruby.obj_wrap(FiberEnvelope {
+                        stream: Arc::clone(&call.handle.stream),
+                        call: RefCell::new(Some(*call)),
+                    });
                     envelopes.push(envelope)?;
                 }
                 Ok(FiberCommand::Shutdown { reply }) => {
@@ -175,7 +189,7 @@ impl FiberBridge {
         body_reader: Value,
     ) -> Result<(), magnus::Error> {
         let call =
-            envelope.0.borrow_mut().take().ok_or_else(|| {
+            envelope.call.borrow_mut().take().ok_or_else(|| {
                 magnus::Error::new(ruby.exception_runtime_error(), "request reused")
             })?;
         let context = CallContext {
@@ -345,7 +359,7 @@ impl FiberRuntimeClient {
         let permit = self
             .admission
             .try_acquire(1)
-            .map_err(|_| BridgeError::Overloaded)?;
+            .ok_or(BridgeError::Overloaded)?;
         self.send_and_wake(FiberCommand::Call(Box::new(FiberCall {
             request,
             handle,
@@ -679,9 +693,12 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
             bridge_class.define_method("ack_shutdown", method!(FiberBridge::ack_shutdown, 0))
         })
         .map_err(|error| ruby_error("defining FiberBridge methods", error))?;
-    ruvoy_module
+    let envelope_class = ruvoy_module
         .define_class("FiberEnvelope", ruby.class_object())
         .map_err(|error| ruby_error("defining FiberEnvelope", error))?;
+    envelope_class
+        .define_method("cancelled?", method!(FiberEnvelope::cancelled, 0))
+        .map_err(|error| ruby_error("defining FiberEnvelope methods", error))?;
     let sink_class = ruvoy_module
         .define_class("StreamSink", ruby.class_object())
         .map_err(|error| ruby_error("defining StreamSink", error))?;

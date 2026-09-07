@@ -115,7 +115,7 @@ impl FiberRackFilter {
         let body_lease = self
             .body_budget
             .try_acquire(body_capacity)
-            .map_err(|_| BodyCopyError::Overloaded)?;
+            .ok_or(BodyCopyError::Overloaded)?;
         body.try_reserve_exact(body_capacity)
             .map_err(|_| BodyCopyError::Allocation)?;
         let stage_timing_requested = self.diagnostics_enabled
@@ -159,11 +159,14 @@ impl FiberRackFilter {
         if required_size > MAX_REQUEST_BODY_BYTES {
             return Err(BodyCopyError::TooLarge);
         }
-        self.body_lease
+        if !self
+            .body_lease
             .as_mut()
             .ok_or(BodyCopyError::MissingRequest)?
             .grow_to(required_size)
-            .map_err(|_| BodyCopyError::Overloaded)?;
+        {
+            return Err(BodyCopyError::Overloaded);
+        }
         let request = self.request.as_mut().ok_or(BodyCopyError::MissingRequest)?;
         let copy_started_at = Instant::now();
         let capacity_before = request.body.capacity();
@@ -238,6 +241,10 @@ impl FiberRackFilter {
             Some(reason) => metrics.rejected(envoy_filter, reason),
             None => metrics.submitted(envoy_filter),
         }
+        self.publish_saturation(envoy_filter, metrics);
+    }
+
+    fn publish_saturation<EHF: EnvoyHttpFilter>(&self, envoy_filter: &EHF, metrics: Metrics) {
         metrics.saturation(
             envoy_filter,
             self.client.inflight_requests(),
@@ -252,12 +259,7 @@ impl FiberRackFilter {
             return;
         };
         metrics.responded(envoy_filter, outcome, submitted_at.elapsed());
-        metrics.saturation(
-            envoy_filter,
-            self.client.inflight_requests(),
-            self.body_budget.used(),
-            self.client.reactor_idle_for(),
-        );
+        self.publish_saturation(envoy_filter, metrics);
     }
 
     fn send_bridge_error<EHF: EnvoyHttpFilter>(

@@ -79,6 +79,7 @@ class RackCompatibilityApp
     return enumerable_response if path == "/enumerable"
     return paced_response(query) if path == "/paced"
     return text_response(PacedRackBody.yielded_count.to_s) if path == "/paced-yielded"
+    return text_response(@calls.to_s) if path == "/counted"
     return text_response(TrackedRackBody.closed_count.to_s) if path == "/closed"
 
     response_body = route_body(env, path, query, request_body)

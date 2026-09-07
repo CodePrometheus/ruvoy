@@ -92,10 +92,7 @@ impl Metrics {
         duration: Duration,
     ) {
         let _ = envoy_filter.increment_counter_vec(self.responses, &[outcome], 1);
-        let _ = envoy_filter.record_histogram_value(
-            self.duration_ms,
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-        );
+        let _ = envoy_filter.record_histogram_value(self.duration_ms, duration.as_millis() as u64);
     }
 
     /// Republishes how loaded and how responsive the runtime currently is.
@@ -108,10 +105,7 @@ impl Metrics {
     ) {
         let _ = envoy_filter.set_gauge(self.inflight_requests, requests as u64);
         let _ = envoy_filter.set_gauge(self.inflight_body_bytes, body_bytes as u64);
-        let _ = envoy_filter.set_gauge(
-            self.reactor_idle_ms,
-            u64::try_from(reactor_idle.as_millis()).unwrap_or(u64::MAX),
-        );
+        let _ = envoy_filter.set_gauge(self.reactor_idle_ms, reactor_idle.as_millis() as u64);
 
         if SAMPLES
             .fetch_add(1, Ordering::Relaxed)
