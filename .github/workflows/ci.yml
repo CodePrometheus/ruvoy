@@ -53,14 +53,15 @@ jobs:
 
   ruby:
     runs-on: ubuntu-latest
+    # RuboCop lives in an optional group, so every step has to opt into it.
+    env:
+      BUNDLE_WITH: lint
     steps:
       - uses: actions/checkout@v6
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: .ruby-version
           bundler-cache: true
-        env:
-          BUNDLE_WITH: lint
       - run: bundle exec rubocop
       - run: ruby -c ruby/*.rb crates/*/ruby/*.rb
       - run: bash -n scripts/*.sh

@@ -1,16 +1,19 @@
 //! Links the module against the Ruby the crate is built for.
 
 fn main() {
-    // Examples link against libruby too. The dynamic modules get their RUNPATH
-    // from their own build scripts; without this the example binaries would
-    // still depend on the caller exporting LD_LIBRARY_PATH.
+    // Everything this crate produces links against libruby: the binary, the
+    // examples, and the test harness. The dynamic modules get their RUNPATH
+    // from their own build scripts; without this the rest would depend on the
+    // caller exporting LD_LIBRARY_PATH.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "linux" {
         return;
     }
     println!("cargo:rerun-if-env-changed=RUBY");
     if let Some(libdir) = ruby_libdir() {
-        println!("cargo:rustc-link-arg-examples=-Wl,-rpath,{libdir}");
+        for target in ["bins", "examples", "tests", "benches"] {
+            println!("cargo:rustc-link-arg-{target}=-Wl,-rpath,{libdir}");
+        }
     }
 }
 

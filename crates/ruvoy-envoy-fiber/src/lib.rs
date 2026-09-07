@@ -9,9 +9,16 @@ mod worker;
 declare_init_functions!(init, new_http_filter_config_fn);
 
 fn init() -> bool {
-    // The Ruby VM outlives any single filter configuration, so refuse to load
-    // at all rather than risk being unmapped once the last one goes away.
-    ruvoy::host::pin_in_memory()
+    // The Ruby VM outlives any single filter configuration, so the object that
+    // hosts it must stay loaded once the last one goes away.
+    if let Err(reason) = ruvoy::host::pin_in_memory() {
+        envoy_log_warn!(
+            "[ruvoy] could not pin the module in memory ({reason}); set do_not_close \
+             on the module configuration so a configuration update cannot unload a \
+             running Ruby VM"
+        );
+    }
+    true
 }
 
 fn new_http_filter_config_fn<EC: EnvoyHttpFilterConfig, EHF: EnvoyHttpFilter>(
