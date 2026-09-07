@@ -1,7 +1,7 @@
 use crate::{
     metrics::{
-        Metrics, OUTCOME_COMPLETED, OUTCOME_FAILED, REJECTED_ADMISSION, REJECTED_INTERNAL,
-        REJECTED_INVALID_REQUEST,
+        Metrics, OUTCOME_CANCELLED, OUTCOME_COMPLETED, OUTCOME_FAILED, REJECTED_ADMISSION,
+        REJECTED_INTERNAL, REJECTED_INVALID_REQUEST,
     },
     runtime::FiberRackConfig,
 };
@@ -264,6 +264,9 @@ impl FiberRackFilter {
     }
 
     /// Records how a request that reached the application ended.
+    ///
+    /// The first call for a request wins, so an outcome already recorded is not
+    /// overwritten by the one the stream's end would otherwise assign.
     fn report_outcome<EHF: EnvoyHttpFilter>(&mut self, envoy_filter: &EHF, outcome: &str) {
         let (Some(metrics), Some(submitted_at)) = (self.metrics, self.submitted_at.take()) else {
             return;
@@ -453,6 +456,15 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
             }
             _ => {}
         }
+    }
+
+    /// Envoy is done with this stream, however it ended.
+    ///
+    /// A request whose client walked away never reaches `drain_stream`, so this
+    /// is the only place its end can still be recorded: without it every
+    /// disconnect drives `requests_total` and `responses_total` further apart.
+    fn on_stream_complete(&mut self, envoy_filter: &mut EHF) {
+        self.report_outcome(envoy_filter, OUTCOME_CANCELLED);
     }
 
     fn on_downstream_above_write_buffer_high_watermark(&mut self, _envoy_filter: &mut EHF) {

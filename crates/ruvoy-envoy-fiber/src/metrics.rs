@@ -31,6 +31,7 @@ pub(crate) const REJECTED_INTERNAL: &str = "internal";
 /// How a request that reached the application ended.
 pub(crate) const OUTCOME_COMPLETED: &str = "completed";
 pub(crate) const OUTCOME_FAILED: &str = "failed";
+pub(crate) const OUTCOME_CANCELLED: &str = "cancelled";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Metrics {
@@ -92,6 +93,10 @@ impl Metrics {
     }
 
     /// Republishes how loaded and how responsive the runtime currently is.
+    ///
+    /// Only a worker thread may write statistics, so these are sampled as
+    /// requests begin and end. An idle proxy therefore reports what it last saw
+    /// rather than what is true right now.
     pub(crate) fn saturation<EHF: EnvoyHttpFilter>(
         self,
         envoy_filter: &EHF,
