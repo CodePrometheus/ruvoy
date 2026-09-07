@@ -11,9 +11,10 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=RUBY");
     if let Some(libdir) = ruby_libdir() {
-        for target in ["bins", "examples", "tests", "benches"] {
-            println!("cargo:rustc-link-arg-{target}=-Wl,-rpath,{libdir}");
-        }
+        // Covers every linked target this package produces, including the unit
+        // test harness. The per-target forms are rejected outright when the
+        // package has no target of that kind.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
     }
 }
 
