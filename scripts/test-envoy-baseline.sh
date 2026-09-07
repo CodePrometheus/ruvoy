@@ -39,7 +39,7 @@ assert_response() {
       --dump-header "$prefix.headers" \
       --output "$prefix.body" \
       --write-out '%{http_code}' \
-      "http://127.0.0.1:18080$path"
+      "http://127.0.0.1:19180$path"
   )"
 
   [[ "$status" == "200" ]] || fail "$path returned HTTP $status"
@@ -53,8 +53,8 @@ for tool in cargo curl dd uvx; do
   command -v "$tool" >/dev/null || fail "$tool is required"
 done
 
-if command -v lsof >/dev/null && lsof -nP -iTCP:18080 -sTCP:LISTEN >/dev/null 2>&1; then
-  fail "TCP port 18080 is already in use"
+if command -v lsof >/dev/null && lsof -nP -iTCP:19180 -sTCP:LISTEN >/dev/null 2>&1; then
+  fail "TCP port 19180 is already in use"
 fi
 
 mkdir -p "$result_dir"
@@ -80,7 +80,7 @@ envoy_pid=$!
 
 ready=false
 for _ in $(seq 1 100); do
-  if curl --silent --fail --output /dev/null http://127.0.0.1:18080/direct; then
+  if curl --silent --fail --output /dev/null http://127.0.0.1:19180/direct; then
     ready=true
     break
   fi
@@ -105,7 +105,7 @@ two_mib_status="$(
     --dump-header "$two_mib_prefix.headers" \
     --output "$two_mib_prefix.body" \
     --write-out '%{http_code}' \
-    'http://127.0.0.1:18080/benchmark?wait_ms=0&response_bytes=0&expected_request_bytes=2097152'
+    'http://127.0.0.1:19180/benchmark?wait_ms=0&response_bytes=0&expected_request_bytes=2097152'
 )"
 [[ "$two_mib_status" == "200" ]] ||
   fail "2 MiB POST /benchmark returned HTTP $two_mib_status"

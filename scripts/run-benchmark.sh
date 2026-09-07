@@ -691,10 +691,10 @@ architecture_supports_protocol() {
 control_port_for_architecture() {
   case "$1" in
     sync)
-      printf '18082'
+      printf '19182'
       ;;
     fiber)
-      printf '18084'
+      printf '19184'
       ;;
     *)
       return 1
@@ -829,30 +829,30 @@ start_architecture() {
   case "$architecture" in
     baseline)
       config="$result_dir/config/$current_tls_mode/envoy-baseline.yaml"
-      listener_port=18080
+      listener_port=19180
       ;;
     sync)
       config="$result_dir/config/$current_tls_mode/envoy-sync-rack.yaml"
-      listener_port=18081
+      listener_port=19181
       ;;
     fiber)
       config="$result_dir/config/$current_tls_mode/envoy-fiber-rack.yaml"
-      listener_port=18083
+      listener_port=19183
       ;;
     envoy_puma)
-      start_puma 18110 plain
+      start_puma 19210 plain
       config="$result_dir/config/$current_tls_mode/envoy-puma-benchmark.yaml"
-      listener_port=18103
+      listener_port=19203
       ;;
     puma_direct)
-      start_puma 18111 "$current_tls_mode"
-      current_listener_port=18111
+      start_puma 19211 "$current_tls_mode"
+      current_listener_port=19211
       server_pid_csv="$current_puma_pid_csv"
       return
       ;;
     falcon_direct)
-      start_falcon 18112
-      current_listener_port=18112
+      start_falcon 19212
+      current_listener_port=19212
       server_pid_csv="$current_falcon_pid_csv"
       return
       ;;
@@ -1297,7 +1297,7 @@ if [[ "$load_generator" == "local" ]]; then
   [[ "$oha_version" == "oha 1.15.0" ]] || fail "expected oha 1.15.0, got: $oha_version"
 fi
 
-for port in 18080 18081 18082 18083 18084 18103 18104 18110 18111 18112; do
+for port in 19180 19181 19182 19183 19184 19203 19204 19210 19211 19212; do
   if command -v lsof >/dev/null &&
     lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
     fail "TCP port $port is already in use"
