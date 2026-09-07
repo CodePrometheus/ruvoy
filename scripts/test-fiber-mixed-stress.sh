@@ -17,8 +17,8 @@ phase_file="$temporary_dir/phase"
 oha="$repo_root/.tools/oha/oha"
 ruby_version="$(tr -d '[:space:]' <"$repo_root/.ruby-version")"
 ruby_bin="${RUVOY_RUBY:-"$HOME/.rbenv/versions/$ruby_version/bin/ruby"}"
-fiber_port=18083
-control_port=18084
+fiber_port=19183
+control_port=19184
 max_inflight_requests=256
 mode="${RUVOY_MIXED_MODE:-full}"
 cycles="${RUVOY_MIXED_CYCLES:-3}"
@@ -225,6 +225,21 @@ validate_success() {
   record_status "$label" "$json_file"
 }
 
+# Bodies are not refused when they pile up: what the runtime has no room for
+# waits in Envoy, which stops reading from the client. Sustained upload pressure
+# therefore has to come back entirely successful, only slower.
+validate_throttled() {
+  local label="$1"
+  local json_file="$2"
+
+  jq -e '
+    (.errorDistribution | length) == 0
+    and (.statusCodeDistribution | keys) == ["200"]
+  ' "$json_file" >/dev/null ||
+    fail "$label was refused or errored instead of being slowed down"
+  record_status "$label" "$json_file"
+}
+
 validate_overload() {
   local label="$1"
   local json_file="$2"
@@ -254,6 +269,9 @@ wait_and_validate() {
       ;;
     overload)
       validate_overload "$label" "$json_file"
+      ;;
+    throttled)
+      validate_throttled "$label" "$json_file"
       ;;
     *)
       fail "unknown expectation: $expectation"
@@ -330,9 +348,9 @@ run_request_overload() {
   current_load_pids=()
 }
 
-run_body_overload() {
+run_body_pressure() {
   local cycle="$1"
-  local label="cycle-$cycle-body-overload"
+  local label="cycle-$cycle-body-pressure"
   local json_file="$result_dir/$label.json"
   local pid
 
@@ -346,7 +364,7 @@ run_body_overload() {
   current_load_pids=("$pid")
   sleep 0.5
   probe_control "$label"
-  wait_and_validate "$pid" "$label" "$json_file" overload
+  wait_and_validate "$pid" "$label" "$json_file" throttled
   current_load_pids=()
 }
 
@@ -508,7 +526,7 @@ record_heap baseline
 for cycle in $(seq 1 "$cycles"); do
   run_steady_mix "$cycle"
   run_request_overload "$cycle"
-  run_body_overload "$cycle"
+  run_body_pressure "$cycle"
   run_disconnect_churn "$cycle"
   run_recovery "$cycle"
   record_heap "cycle-$cycle-recovered"

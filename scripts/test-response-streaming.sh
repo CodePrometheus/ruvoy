@@ -16,7 +16,7 @@ envoy_package="envoy-server==1.39.0"
 ruby_version="$(tr -d '[:space:]' <"$repo_root/.ruby-version")"
 ruby_bin="${RUVOY_RUBY:-"$HOME/.rbenv/versions/$ruby_version/bin/ruby"}"
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/ruvoy-streaming.XXXXXX")"
-port=18101
+port=19201
 envoy_pid=""
 failures=0
 
@@ -236,6 +236,31 @@ slow_expected=$((backpressure_chunks * 131072))
 [[ "$slow_size" == "$slow_expected" ]] &&
   pass "the slow client still received the whole body ($slow_expected bytes)" ||
   fail "the slow client received $slow_size of $slow_expected bytes"
+
+# --- 7. A body that fails midway stops rather than inventing the rest --------
+# The status and headers are already on the wire when the failure happens, and a
+# module cannot reset the stream through the current ABI, so the only honest
+# thing left is to stop. The client sees a short body, which is why the
+# limitation is written down rather than hidden.
+mid_prefix="$temporary_dir/raise-mid-body"
+mid_status="$(curl --silent --max-time 10 \
+  --dump-header "$mid_prefix.headers" \
+  --output "$mid_prefix.body" \
+  --write-out '%{http_code}' \
+  "http://127.0.0.1:$port/raise-mid-body" || true)"
+mid_bytes="$(wc -c <"$mid_prefix.body" | tr -d ' ')"
+[[ "$mid_status" == 200 ]] &&
+  pass "the response that failed midway kept the status it had already sent" ||
+  fail "the failing body returned '$mid_status' after its headers were sent"
+(( mid_bytes > 0 && mid_bytes < 8 * 4096 )) &&
+  pass "the failing body stopped early ($mid_bytes of $((8 * 4096)) bytes)" ||
+  fail "the failing body delivered $mid_bytes bytes instead of stopping early"
+
+survivor_after_failure="$(curl --silent --max-time 5 --output /dev/null \
+  --write-out '%{http_code}' "http://127.0.0.1:$port/rack-env")"
+[[ "$survivor_after_failure" == 200 ]] &&
+  pass "the listener still serves after a body failed midway" ||
+  fail "the listener returned '$survivor_after_failure' after a mid-body failure"
 
 printf '\nraw results: %s\n' "$result_dir"
 if [[ "$failures" -gt 0 ]]; then

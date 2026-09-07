@@ -22,9 +22,9 @@ envoy_package="envoy-server==1.39.0"
 ruby_version="$(tr -d '[:space:]' <"$repo_root/.ruby-version")"
 ruby_bin="${RUVOY_RUBY:-"$HOME/.rbenv/versions/$ruby_version/bin/ruby"}"
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/ruvoy-config-lifecycle.XXXXXX")"
-rack_port=18120
-second_port=18121
-admin_port=18122
+rack_port=19220
+second_port=19221
+admin_port=19222
 envoy_log="$result_dir/envoy.log"
 envoy_pid=""
 failures=0

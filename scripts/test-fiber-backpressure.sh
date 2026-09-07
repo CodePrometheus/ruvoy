@@ -8,9 +8,9 @@ result_root="${RUVOY_RESULTS_DIR:-"$repo_root/.agents/results"}"
 result_dir="$result_root/poc4-fiber-backpressure-$run_id"
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/ruvoy-backpressure.XXXXXX")"
 envoy_config="$temporary_dir/envoy.yaml"
-fiber_port=18083
-control_port=18084
-admin_port=18085
+fiber_port=19183
+control_port=19184
+admin_port=19185
 envoy_pid=""
 envoy_log=""
 
@@ -297,6 +297,30 @@ for index in 1 2; do
   [[ "$(header_value "$unread_dir/$index.headers" "x-request-bytes")" == "8388608" ]] ||
     fail "unread-body upload $index was truncated"
 done
+
+# A client that leaves in the middle of its upload strands a body split between
+# Envoy and the runtime. Both have to be reclaimed and the request has to be
+# accounted for, or the counters drift for every disconnect.
+module_stat() {
+  curl --silent --max-time 5 "http://127.0.0.1:$admin_port/stats" |
+    awk -F': ' -v name="$1" '$0 ~ "dynamicmodules.*" name { print $2; exit }'
+}
+abandoned_before="$(module_stat 'responses_total.*cancelled')"
+curl --silent --limit-rate 200k --max-time 1 \
+  --request POST --header 'Expect:' \
+  --data-binary "@$temporary_dir/eight-mib.bin" \
+  --output /dev/null \
+  "http://127.0.0.1:$fiber_port/echo" >/dev/null 2>&1 || true
+sleep 1
+abandoned_after="$(module_stat 'responses_total.*cancelled')"
+(( ${abandoned_after:-0} > ${abandoned_before:-0} )) ||
+  fail "an upload abandoned mid-body was never accounted for (${abandoned_before:-0} -> ${abandoned_after:-0})"
+
+survivor_prefix="$body_dir/after-abandoned-upload"
+survivor_status="$(
+  curl_fiber "$survivor_prefix" "http://127.0.0.1:$fiber_port/info"
+)"
+assert_status "$survivor_status" 200 "request after an abandoned upload"
 
 paused_after="$(counter_value 'http.ruvoy_fiber_rack.downstream_flow_control_paused_reading_total')"
 paused_reading=$((paused_after - paused_before))

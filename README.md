@@ -96,6 +96,11 @@ processing overlap. What the application has not read yet waits in Envoy, which
 stops reading from the client until there is room again. Raw socket hijacking
 (`rack.hijack`) is not supported; the connection always belongs to Envoy.
 
+A response body that fails after its headers are already on the wire can only
+stop: a dynamic module cannot reset a stream it has started answering, so the
+client receives a short body rather than an error. Applications that can fail
+partway through should send their own length or checksum.
+
 ## Scaling
 
 Each Ruvoy process runs exactly one CRuby VM, so Ruby work in one process is

@@ -76,7 +76,7 @@ free_port() {
   return 1
 }
 
-admin_port="$(free_port 19001)"
+admin_port="$(free_port 19601)"
 
 wait_for_port() {
   local port="$1"
@@ -208,15 +208,15 @@ fi
 
 # --- 1. Two filter configs share one runtime ---------------------------------
 write_config "$temporary_dir/shared.yaml" \
-  ruvoy_first 18090 "$rackup" \
-  ruvoy_second 18091 "$rackup"
+  ruvoy_first 19190 "$rackup" \
+  ruvoy_second 19191 "$rackup"
 start_envoy "$temporary_dir/shared.yaml" "$result_dir/shared.log"
-if wait_for_port 18090 && wait_for_port 18091; then
+if wait_for_port 19190 && wait_for_port 19191; then
   first_thread="$(curl --silent --dump-header - --output /dev/null \
-    "http://127.0.0.1:18090/rack-env" |
+    "http://127.0.0.1:19190/rack-env" |
     awk -F': ' 'tolower($1) == "x-ruvoy-runtime-rust-thread-id" { print $2 }' | tr -d '\r')"
   second_thread="$(curl --silent --dump-header - --output /dev/null \
-    "http://127.0.0.1:18091/rack-env" |
+    "http://127.0.0.1:19191/rack-env" |
     awk -F': ' 'tolower($1) == "x-ruvoy-runtime-rust-thread-id" { print $2 }' | tr -d '\r')"
   started="$(runtime_started_count "$result_dir/shared.log")"
 
@@ -241,8 +241,8 @@ grep -q '\[ruvoy\] Fiber runtime stopped' "$result_dir/shared.log" &&
 cp "$rackup" "$temporary_dir/other.ru"
 cp "$repo_root/test/fixtures/rack/app.rb" "$temporary_dir/app.rb"
 write_config "$temporary_dir/mismatch.yaml" \
-  ruvoy_first 18092 "$rackup" \
-  ruvoy_second 18093 "$temporary_dir/other.ru"
+  ruvoy_first 19192 "$rackup" \
+  ruvoy_second 19193 "$temporary_dir/other.ru"
 start_envoy "$temporary_dir/mismatch.yaml" "$result_dir/mismatch.log"
 if wait_for_exit "$envoy_pid" 600; then
   pass "Envoy refused the mismatched configuration instead of starting"
@@ -266,7 +266,7 @@ grep -Eqi 'panic|segmentation fault|SIGSEGV' "$result_dir/mismatch.log" &&
 
 # --- 3. A missing rackup fails closed ----------------------------------------
 write_config "$temporary_dir/missing.yaml" \
-  ruvoy_first 18094 "$temporary_dir/does-not-exist.ru"
+  ruvoy_first 19194 "$temporary_dir/does-not-exist.ru"
 start_envoy "$temporary_dir/missing.yaml" "$result_dir/missing.log"
 if wait_for_exit "$envoy_pid" 600; then
   pass "Envoy refused to start with a missing rackup"
@@ -284,7 +284,7 @@ grep -q 'working directory' "$result_dir/missing.log" &&
 # --- 4. A raising rackup fails closed ----------------------------------------
 printf 'raise "intentional startup failure"\n' >"$temporary_dir/raising.ru"
 write_config "$temporary_dir/raising.yaml" \
-  ruvoy_first 18095 "$temporary_dir/raising.ru"
+  ruvoy_first 19195 "$temporary_dir/raising.ru"
 start_envoy "$temporary_dir/raising.yaml" "$result_dir/raising.log"
 if wait_for_exit "$envoy_pid" 600; then
   pass "Envoy refused to start after a Ruby startup exception"
@@ -300,12 +300,12 @@ grep -Eqi 'segmentation fault|SIGSEGV' "$result_dir/raising.log" &&
   pass "no crash signature in the raising case"
 
 # --- 5. Shutdown drains an in-flight request ---------------------------------
-write_config "$temporary_dir/drain.yaml" ruvoy_first 18096 "$rackup"
+write_config "$temporary_dir/drain.yaml" ruvoy_first 19196 "$rackup"
 start_envoy "$temporary_dir/drain.yaml" "$result_dir/drain.log"
-if wait_for_port 18096; then
+if wait_for_port 19196; then
   curl --silent --max-time 20 --output "$temporary_dir/drain.body" \
     --write-out '%{http_code}' \
-    "http://127.0.0.1:18096/async-sleep?duration=1" >"$temporary_dir/drain.status" &
+    "http://127.0.0.1:19196/async-sleep?duration=1" >"$temporary_dir/drain.status" &
   drain_curl=$!
   sleep 0.3
   kill -TERM "$envoy_pid" 2>/dev/null || true
@@ -331,19 +331,19 @@ else
 fi
 
 # --- 6. A late completion after the stream timed out must stay silent --------
-write_config "$temporary_dir/timeout.yaml" ruvoy_first 18097 "$rackup"
+write_config "$temporary_dir/timeout.yaml" ruvoy_first 19197 "$rackup"
 start_envoy "$temporary_dir/timeout.yaml" "$result_dir/timeout.log"
-if wait_for_port 18097; then
+if wait_for_port 19197; then
   # stream_idle_timeout is 5s, so a 9s Ruby request is abandoned by Envoy while
   # the Fiber keeps running; its completion then commits onto a destroyed filter.
   timeout_status="$(curl --silent --max-time 30 --output /dev/null \
     --write-out '%{http_code}' \
-    "http://127.0.0.1:18097/async-sleep?duration=9" || true)"
+    "http://127.0.0.1:19197/async-sleep?duration=9" || true)"
   printf 'timed-out request returned %s\n' "$timeout_status"
   sleep 6
 
   survivor="$(curl --silent --max-time 10 --output /dev/null \
-    --write-out '%{http_code}' "http://127.0.0.1:18097/rack-env" || true)"
+    --write-out '%{http_code}' "http://127.0.0.1:19197/rack-env" || true)"
   [[ "$survivor" == 200 ]] &&
     pass "Envoy still serves requests after a late Fiber completion" ||
     fail "Envoy stopped serving after the late completion (got '$survivor')"
@@ -365,12 +365,12 @@ grep -Eqi 'panic|segmentation fault|SIGSEGV|use-after-free' "$result_dir/timeout
 {
   printf 'admin:\n  address:\n    socket_address:\n      address: 127.0.0.1\n      port_value: '"$admin_port"'\n'
   printf 'static_resources:\n  listeners:\n'
-  listener_config ruvoy_first 18098 "$rackup"
+  listener_config ruvoy_first 19198 "$rackup"
 } >"$temporary_dir/admin.yaml"
 start_envoy "$temporary_dir/admin.yaml" "$result_dir/admin.log"
-if wait_for_port 18098; then
+if wait_for_port 19198; then
   curl --silent --max-time 25 --output /dev/null --write-out '%{http_code}' \
-    "http://127.0.0.1:18098/async-sleep?duration=2" >"$temporary_dir/drain2.status" &
+    "http://127.0.0.1:19198/async-sleep?duration=2" >"$temporary_dir/drain2.status" &
   drain2_curl=$!
   sleep 0.4
   curl --silent --max-time 10 --request POST --output /dev/null \
@@ -389,7 +389,7 @@ stop_envoy
 # --- 8. Hot restart hands over without disturbing the runtime ----------------
 # Each epoch is its own process and therefore its own Ruby VM; the point is that
 # the old epoch tears its VM down exactly once while the new one serves.
-write_config "$temporary_dir/hot.yaml" ruvoy_first 18099 "$rackup"
+write_config "$temporary_dir/hot.yaml" ruvoy_first 19199 "$rackup"
 BUNDLE_GEMFILE="$repo_root/Gemfile" \
   BUNDLE_PATH="$repo_root/vendor/bundle" \
   BUNDLE_FROZEN=true \
@@ -407,7 +407,7 @@ BUNDLE_GEMFILE="$repo_root/Gemfile" \
 epoch0_pid=$!
 envoy_pid="$epoch0_pid"
 
-if wait_for_port 18099; then
+if wait_for_port 19199; then
   BUNDLE_GEMFILE="$repo_root/Gemfile" \
     BUNDLE_PATH="$repo_root/vendor/bundle" \
     BUNDLE_FROZEN=true \
@@ -434,7 +434,7 @@ if wait_for_port 18099; then
   envoy_pid="$epoch1_pid"
 
   handover="$(curl --silent --max-time 10 --output /dev/null \
-    --write-out '%{http_code}' "http://127.0.0.1:18099/rack-env" || true)"
+    --write-out '%{http_code}' "http://127.0.0.1:19199/rack-env" || true)"
   [[ "$handover" == 200 ]] &&
     pass "the new epoch serves requests after the handover" ||
     fail "the new epoch returned '$handover' after the handover"

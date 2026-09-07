@@ -9,8 +9,8 @@ result_file="$result_dir/poc2-envoy-sync-rack-$run_id.log"
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/ruvoy-sync.XXXXXX")"
 envoy_log="$temporary_dir/envoy.log"
 envoy_pid=""
-sync_port=18081
-control_port=18082
+sync_port=19181
+control_port=19182
 build_profile="${RUVOY_BUILD_PROFILE:-release}"
 
 cleanup() {

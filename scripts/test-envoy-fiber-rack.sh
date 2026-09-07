@@ -12,8 +12,8 @@ temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/ruvoy-fiber.XXXXXX")"
 envoy_log="$temporary_dir/envoy.log"
 envoy_config="$temporary_dir/envoy.yaml"
 envoy_pid=""
-fiber_port=18083
-control_port=18084
+fiber_port=19183
+control_port=19184
 ruby_bin="${RUVOY_RUBY:-"$HOME/.rbenv/versions/4.0.5/bin/ruby"}"
 
 cleanup() {
@@ -226,6 +226,80 @@ chunked_status="$(
 assert_status "$chunked_status" 200 "Fiber chunked 1 MiB POST /echo"
 cmp "$temporary_dir/one-mib.bin" "$chunked_prefix.body" ||
   fail "Fiber chunked 1 MiB request body was not echoed exactly"
+
+# A request that says it has a body and then has none still has to reach the
+# application with a readable, empty `rack.input`.
+empty_prefix="$temporary_dir/empty-body"
+empty_status="$(
+  curl_fiber "$empty_prefix" \
+    --request POST \
+    --header 'Expect:' \
+    --header 'content-type: application/octet-stream' \
+    --data-binary '' \
+    "http://127.0.0.1:$fiber_port/echo"
+)"
+assert_status "$empty_status" 200 "Fiber empty POST /echo"
+[[ ! -s "$empty_prefix.body" ]] ||
+  fail "Fiber empty request body came back with $(wc -c <"$empty_prefix.body") bytes"
+
+# Without `Expect:` curl asks permission before sending a large body, so the
+# application starts on headers that are not yet followed by anything.
+continue_prefix="$temporary_dir/expect-continue"
+continue_status="$(
+  curl_fiber "$continue_prefix" \
+    --request POST \
+    --data-binary "@$temporary_dir/one-mib.bin" \
+    "http://127.0.0.1:$fiber_port/echo"
+)"
+assert_status "$continue_status" 200 "Fiber 1 MiB POST /echo with 100-continue"
+cmp "$temporary_dir/one-mib.bin" "$continue_prefix.body" ||
+  fail "Fiber 100-continue request body was not echoed exactly"
+
+# HTTP/2 frames the body differently from chunked HTTP/1.1 and is what a real
+# deployment usually carries.
+h2_prefix="$temporary_dir/http2-request"
+h2_status="$(
+  curl --http2-prior-knowledge \
+    --silent --show-error --max-time 30 \
+    --dump-header "$h2_prefix.headers" \
+    --output "$h2_prefix.body" \
+    --write-out '%{http_code}' \
+    --request POST \
+    --data-binary "@$temporary_dir/one-mib.bin" \
+    "http://127.0.0.1:$fiber_port/echo"
+)"
+assert_status "$h2_status" 200 "Fiber 1 MiB POST /echo over HTTP/2"
+cmp "$temporary_dir/one-mib.bin" "$h2_prefix.body" ||
+  fail "Fiber HTTP/2 request body was not echoed exactly"
+
+# Trailers arrive after the last body byte and reach a different callback than
+# the body itself, so a body that ends in one must still be complete.
+"$ruby_bin" -rsocket -e '
+  body = File.binread(ARGV[0])
+  socket = TCPSocket.new("127.0.0.1", Integer(ARGV[1], 10))
+  # A stalled read has to fail the test rather than hang it.
+  socket.timeout = 15
+  # Read to EOF needs the server to close, which keep-alive would never do.
+  socket.write("POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n" \
+    "Transfer-Encoding: chunked\r\nTrailer: x-ruvoy-trailer\r\n\r\n")
+  body.each_char.each_slice(65536) do |slice|
+    chunk = slice.join
+    socket.write(format("%x\r\n", chunk.bytesize)); socket.write(chunk); socket.write("\r\n")
+  end
+  socket.write("0\r\nx-ruvoy-trailer: done\r\n\r\n")
+  File.binwrite(ARGV[2], socket.read)
+  socket.close
+' "$temporary_dir/one-mib.bin" "$fiber_port" "$temporary_dir/trailer.raw" ||
+  fail "Fiber trailered request could not be sent"
+grep -aq '^HTTP/1.1 200' "$temporary_dir/trailer.raw" ||
+  fail "Fiber trailered request did not return 200"
+trailer_bytes="$("$ruby_bin" -e '
+  raw = File.binread(ARGV[0])
+  head, body = raw.split("\r\n\r\n", 2)
+  print head.include?("chunked") ? body.scan(/^([0-9a-f]+)\r\n/i).sum { |m| m[0].to_i(16) } : body.bytesize
+' "$temporary_dir/trailer.raw")"
+[[ "$trailer_bytes" == 1048576 ]] ||
+  fail "Fiber trailered request echoed $trailer_bytes of 1048576 bytes"
 
 # Several times the runtime's own buffer, so it can only be served by taking
 # the body in pieces while the rest waits in Envoy.

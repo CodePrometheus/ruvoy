@@ -60,6 +60,27 @@ class PacedRackBody
   end
 end
 
+# Fails partway through the body, when the status and headers are already on
+# the wire and cannot be taken back.
+class FailingRackBody
+  def initialize(chunks:, chunk_bytes:)
+    @chunks = chunks
+    @chunk_bytes = chunk_bytes
+    @failed_at = chunks / 2
+  end
+
+  def each
+    @chunks.times do |index|
+      raise "intentional mid-body failure" if index == @failed_at
+      yield "D".b * @chunk_bytes
+    end
+  end
+
+  def close
+    TrackedRackBody.closed_count += 1
+  end
+end
+
 class RackCompatibilityApp
   MAX_BODY_BYTES = 2 * 1024 * 1024
   MAX_WAIT_MS = 1_000
@@ -78,6 +99,7 @@ class RackCompatibilityApp
     return rack_env_response(env) if path == "/rack-env"
     return enumerable_response if path == "/enumerable"
     return paced_response(query) if path == "/paced"
+    return failing_body_response if path == "/raise-mid-body"
     return text_response(PacedRackBody.yielded_count.to_s) if path == "/paced-yielded"
     return text_response(@calls.to_s) if path == "/counted"
     return text_response(TrackedRackBody.closed_count.to_s) if path == "/closed"
@@ -188,6 +210,15 @@ class RackCompatibilityApp
         "x-paced-chunk-bytes" => chunk_bytes.to_s
       },
       PacedRackBody.new(chunks: chunks, chunk_bytes: chunk_bytes, gap_seconds: gap_ms / 1000.0)
+    ]
+  end
+
+  # No content-length: the length is not known once the body may stop early.
+  def failing_body_response
+    [
+      200,
+      { "content-type" => "application/octet-stream", "x-failing-chunks" => "8" },
+      FailingRackBody.new(chunks: 8, chunk_bytes: 4096)
     ]
   end
 
