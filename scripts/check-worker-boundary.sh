@@ -10,15 +10,15 @@ worker_sources=(
 
 forbidden='magnus|RubyRuntime|Ruby::|BoxValue|RArray|RHash|Value|funcall|eval|call_app'
 
-if rg -n "$forbidden" "${worker_sources[@]}"; then
+if grep -nE "$forbidden" "${worker_sources[@]}"; then
   echo "FAIL: Envoy worker source contains a Ruby VM reference" >&2
   exit 1
 fi
 
 for worker_source in "${worker_sources[@]}"; do
-  rg -q 'RuntimeClient' "$worker_source"
-  rg -q 'Request' "$worker_source"
-  rg -q 'scheduler\.commit' "$worker_source"
+  grep -qE 'RuntimeClient' "$worker_source"
+  grep -qE 'Request' "$worker_source"
+  grep -qE 'scheduler\.commit' "$worker_source"
 done
 
 echo "PASS: sync and Fiber worker sources use only owned bridge types and Envoy scheduler"

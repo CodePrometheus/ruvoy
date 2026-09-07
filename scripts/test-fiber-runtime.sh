@@ -36,12 +36,12 @@ if ! BUNDLE_GEMFILE="$repo_root/Gemfile" \
   exit 1
 fi
 
-rg -q '^result=PASS$' "$result_file"
-rg -q "^async_version=$("$repo_root/scripts/gem-version.sh" async)\$" "$result_file"
-rg -q '^scheduler_aware_unique_fibers=10$' "$result_file"
-rg -q '^scheduler_io_requests=10$' "$result_file"
-rg -q '^scheduler_io_unique_fibers=10$' "$result_file"
-rg -q '^shutdown=PASS$' "$result_file"
+grep -qE '^result=PASS$' "$result_file"
+grep -qE "^async_version=$("$repo_root/scripts/gem-version.sh" async)\$" "$result_file"
+grep -qE '^scheduler_aware_unique_fibers=10$' "$result_file"
+grep -qE '^scheduler_io_requests=10$' "$result_file"
+grep -qE '^scheduler_io_unique_fibers=10$' "$result_file"
+grep -qE '^shutdown=PASS$' "$result_file"
 
 echo "PASS: independent Fiber runtime ($profile)"
 echo "raw result: $result_file"

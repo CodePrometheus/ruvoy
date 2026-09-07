@@ -30,7 +30,7 @@ fail() {
   exit 1
 }
 
-for tool in awk cargo comm find ps rg ruby sort; do
+for tool in awk cargo comm find ps ruby sort; do
   command -v "$tool" >/dev/null || fail "$tool is required"
 done
 for value_name in waves requests_per_wave concurrency body_bytes host_threads; do
@@ -56,7 +56,7 @@ fi
   printf 'waves=%s\nrequests_per_wave=%s\nconcurrency=%s\n' \
     "$waves" "$requests_per_wave" "$concurrency"
   printf 'body_bytes=%s\nhost_threads=%s\n' "$body_bytes" "$host_threads"
-  cargo tree -p ruvoy | rg 'magnus|rb-sys'
+  cargo tree -p ruvoy | grep -E 'magnus|rb-sys'
   cargo build --release --example fiber_stability_probe
 } >"$preflight_log" 2>&1 || fail "probe release build failed"
 
@@ -105,7 +105,7 @@ max_rss_kib="$(awk -F '\t' 'NR > 1 && $3 > max { max = $3 } END { print max + 0 
 } >"$summary_file"
 
 [[ "$probe_status" -eq 0 ]] || fail "probe exited with status $probe_status"
-rg -Fq 'result=PASS' "$probe_log" || fail "probe did not report PASS"
+grep -Fq 'result=PASS' "$probe_log" || fail "probe did not report PASS"
 [[ ! -s "$new_crashes" ]] || fail "probe produced a new crash report"
 
 printf 'result=PASS\n' >>"$summary_file"

@@ -398,7 +398,7 @@ run_recovery() {
   probe_control "$prefix"
 }
 
-for tool in cargo curl dd jq lsof pgrep ps rg sed seq uvx; do
+for tool in cargo curl dd jq lsof pgrep ps sed seq uvx; do
   command -v "$tool" >/dev/null || fail "$tool is required"
 done
 [[ -x "$oha" ]] || fail "missing project-local oha"
@@ -549,7 +549,7 @@ sampler_pid=""
 stop_envoy || fail "Envoy did not stop after the bounded shutdown sequence"
 envoy_launcher_pid=""
 envoy_runtime_pid=""
-rg -Fq '[ruvoy] Fiber runtime stopped' "$envoy_log" || fail "Fiber runtime did not report clean shutdown"
+grep -Fq '[ruvoy] Fiber runtime stopped' "$envoy_log" || fail "Fiber runtime did not report clean shutdown"
 
 printf 'result=PASS\ncycles=%s\nheap_live_slots=%s->%s\nrss_kib=%s->%s\nfd_count=%s->%s\nraw_results=%s\n' \
   "$cycles" "$first_cycle_heap" "$last_cycle_heap" "$first_cycle_rss" "$last_cycle_rss" \

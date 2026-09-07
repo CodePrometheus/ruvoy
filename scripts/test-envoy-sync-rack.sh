@@ -237,7 +237,7 @@ error_status="$(curl_sync "$error_prefix" "http://127.0.0.1:$sync_port/raise")"
 assert_status "$error_status" 500 "GET /raise"
 [[ "$(header_value "$error_prefix.headers" "x-ruvoy-error")" == "true" ]] ||
   fail "Ruby exception response did not carry x-ruvoy-error"
-rg -q 'intentional envoy boom' "$error_prefix.body" ||
+grep -qE 'intentional envoy boom' "$error_prefix.body" ||
   fail "Ruby exception text did not cross the owned bridge"
 
 slow_prefix="$temporary_dir/slow"

@@ -107,7 +107,7 @@ header_value() {
   ' "$file" | tail -1
 }
 
-for tool in curl jq lsof pgrep ps rg uvx; do
+for tool in curl jq lsof pgrep ps uvx; do
   command -v "$tool" >/dev/null || fail "$tool is required"
 done
 for value_name in request_bytes requests_per_wave concurrency waves wave_timeout_seconds; do
@@ -242,7 +242,7 @@ awk -v first="$first_rss" -v last="$last_rss" '
 stop_envoy || fail "Envoy did not stop after the bounded shutdown sequence"
 envoy_launcher_pid=""
 envoy_runtime_pid=""
-rg -Fq '[ruvoy] Fiber runtime stopped' "$envoy_log" ||
+grep -Fq '[ruvoy] Fiber runtime stopped' "$envoy_log" ||
   fail "Fiber runtime did not report clean shutdown"
 
 printf 'result=PASS\nheap_live_slots=%s->%s\nrss_kib=%s->%s\nraw_results=%s\n' \

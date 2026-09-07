@@ -304,7 +304,7 @@ cmp "$temporary_dir/one-mib-f.bin" "$large_response_prefix.body" ||
 error_prefix="$temporary_dir/error"
 error_status="$(curl_fiber "$error_prefix" "http://127.0.0.1:$fiber_port/raise")"
 assert_status "$error_status" 500 "Fiber GET /raise"
-rg -q 'intentional fiber envoy boom' "$error_prefix.body" ||
+grep -qE 'intentional fiber envoy boom' "$error_prefix.body" ||
   fail "Fiber Ruby exception did not cross the owned bridge"
 
 for index in $(seq 1 5); do

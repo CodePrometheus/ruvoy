@@ -950,7 +950,7 @@ verify_contract() {
     "$current_scheme://$probe_address:$listener_port/benchmark?wait_ms=0&response_bytes=1024&expected_request_bytes=1024"
   [[ "$(wc -c <"$current_architecture_dir/contract.body" | tr -d ' ')" == 1024 ]] ||
     fail "$architecture contract returned the wrong response size"
-  rg -qi '^x-request-bytes: 1024' "$current_architecture_dir/contract.headers" ||
+  grep -qiE '^x-request-bytes: 1024' "$current_architecture_dir/contract.headers" ||
     fail "$architecture contract did not read the request body"
 
   if architecture_supports_protocol "$architecture" 2; then
@@ -1271,11 +1271,11 @@ run_measurement() {
   [[ "$stop_status" -eq 0 ]] || fail "$architecture did not stop cleanly"
   case "$architecture" in
     sync)
-      rg -Fq '[ruvoy] Ruby runtime stopped' "$current_envoy_log" ||
+      grep -Fq '[ruvoy] Ruby runtime stopped' "$current_envoy_log" ||
         fail "sync Ruby runtime did not report clean shutdown"
       ;;
     fiber)
-      rg -Fq '[ruvoy] Fiber runtime stopped' "$current_envoy_log" ||
+      grep -Fq '[ruvoy] Fiber runtime stopped' "$current_envoy_log" ||
         fail "Fiber runtime did not report clean shutdown"
       ;;
   esac
@@ -1288,7 +1288,7 @@ run_measurement() {
   return 0
 }
 
-for tool in cargo curl dd jq pgrep ps rg uvx; do
+for tool in cargo curl dd jq pgrep ps uvx; do
   command -v "$tool" >/dev/null || fail "$tool is required"
 done
 if [[ "$load_generator" == "local" ]]; then

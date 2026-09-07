@@ -132,7 +132,7 @@ stop_envoy() {
   fi
 }
 
-for tool in cargo curl lsof rg uvx; do
+for tool in cargo curl lsof uvx; do
   command -v "$tool" >/dev/null || fail "$tool is required"
 done
 for port in "$fiber_port" "$control_port"; do
@@ -172,7 +172,7 @@ request_overload_status="$(
 assert_status "$request_overload_status" 503 "request admission overload"
 [[ "$(header_value "$request_overload_prefix.headers" "x-ruvoy-error")" == "true" ]] ||
   fail "request admission overload response omitted x-ruvoy-error"
-rg -q 'Ruby runtime admission limit reached' "$request_overload_prefix.body" ||
+grep -qE 'Ruby runtime admission limit reached' "$request_overload_prefix.body" ||
   fail "request admission overload response returned the wrong reason"
 
 request_control_time="$(
@@ -230,7 +230,7 @@ body_overload_status="$(
 assert_status "$body_overload_status" 503 "body-byte admission overload"
 [[ "$(header_value "$body_overload_prefix.headers" "x-ruvoy-error")" == "true" ]] ||
   fail "body-byte overload response omitted x-ruvoy-error"
-rg -q 'request body admission limit reached' "$body_overload_prefix.body" ||
+grep -qE 'request body admission limit reached' "$body_overload_prefix.body" ||
   fail "body-byte overload response returned the wrong reason"
 
 body_control_time="$(
