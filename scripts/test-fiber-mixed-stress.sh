@@ -16,6 +16,7 @@ control_file="$result_dir/control.tsv"
 phase_file="$temporary_dir/phase"
 oha="$repo_root/.tools/oha/oha"
 ruby_version="$(tr -d '[:space:]' <"$repo_root/.ruby-version")"
+ruby_bin="${RUVOY_RUBY:-"$HOME/.rbenv/versions/$ruby_version/bin/ruby"}"
 fiber_port=18083
 control_port=18084
 max_inflight_requests=256
@@ -454,7 +455,7 @@ grep -Fq "value: $repo_root/test/fixtures/rack/config.ru" "$envoy_config" ||
   printf 'steady_duration=%s\noverload_duration=%s\nrecovery_duration=%s\ndisconnect_requests=%s\n' \
     "$steady_duration" "$overload_duration" "$recovery_duration" "$disconnect_requests"
   printf 'ruby=%s\nrustc=%s\noha=%s\n' \
-    "$("$HOME/.rbenv/versions/$ruby_version/bin/ruby" --version)" \
+    "$("$ruby_bin" --version)" \
     "$(rustc --version)" \
     "$("$oha" --version)"
   printf 'steady_noop_requests=%s\nsteady_wait_requests=%s\nsteady_body_requests=%s\n' \

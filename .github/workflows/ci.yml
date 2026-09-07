@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -65,3 +66,54 @@ jobs:
       - run: bundle exec rubocop
       - run: ruby -c ruby/*.rb crates/*/ruby/*.rb
       - run: bash -n scripts/*.sh
+
+  # The real proxy, on the only platform Ruvoy targets. Two suites were silently
+  # broken for weeks because nothing but a developer's machine ever ran them.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+      - uses: astral-sh/setup-uv@v6
+      - run: sudo apt-get update && sudo apt-get install --yes lsof
+      # The suites look for a developer's Ruby install unless told otherwise.
+      - run: echo "RUVOY_RUBY=$(command -v ruby)" >> "$GITHUB_ENV"
+      - run: scripts/install-oha.sh
+      - run: scripts/test-envoy-fiber-rack.sh
+      - run: scripts/test-fiber-backpressure.sh
+      - run: scripts/test-response-streaming.sh
+      - run: scripts/test-rack-compatibility.sh
+      - run: scripts/test-config-lifecycle.sh
+      - run: scripts/test-process-runtime.sh
+      - run: scripts/test-envoy-sync-rack.sh
+      - run: scripts/test-fiber-runtime.sh
+      - run: scripts/test-fiber-memory.sh
+      # What the suites measured, on the run's own page: a pass says nothing
+      # about how much slack the numbers had.
+      - if: always()
+        run: |
+          {
+            echo '## Measurements'
+            echo '```'
+            for file in .agents/results/*/summary.log .agents/results/*/waves.tsv; do
+              [ -e "$file" ] || continue
+              echo "# $(basename "$(dirname "$file")")/$(basename "$file")"
+              cat "$file"
+              echo
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: .agents/results/
+          retention-days: 7

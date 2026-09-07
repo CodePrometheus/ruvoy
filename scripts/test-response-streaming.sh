@@ -211,32 +211,36 @@ grep -Eqi 'panic|segmentation fault|SIGSEGV' "$result_dir/envoy.log" &&
   pass "no crash signature in the streaming run"
 
 # --- 6. A slow client applies backpressure instead of growing memory ---------
-# The producer may run ahead by at most the queue (1 MiB) plus Envoy's write
-# buffer (64 KiB). With a 4 MiB body that is well under half the chunks, so a
-# producer that ignored backpressure would be obvious.
+# The producer may run ahead of the client by everything that buffers between
+# them: the hand-off queue (1 MiB), Envoy's per-connection write buffer (4 MiB)
+# and the kernel socket buffers on both ends (a few MiB more on Linux). The body
+# is sized so that slack stays a small part of it, because a producer ignoring
+# backpressure reaches the last chunk within milliseconds.
+backpressure_chunks=512
 backpressure_before="$(curl --silent --max-time 5 "http://127.0.0.1:$port/paced-yielded")"
-curl --silent --limit-rate 2m --max-time 120 \
+curl --silent --limit-rate 4m --max-time 120 \
   --output "$temporary_dir/slow.body" \
-  "http://127.0.0.1:$port/paced?chunks=128&chunk_bytes=131072&gap_ms=0" &
+  "http://127.0.0.1:$port/paced?chunks=$backpressure_chunks&chunk_bytes=131072&gap_ms=0" &
 slow_curl=$!
 sleep 3
 mid_yielded="$(curl --silent --max-time 5 "http://127.0.0.1:$port/paced-yielded")"
 mid_produced=$((mid_yielded - backpressure_before))
-printf 'backpressure: produced %s of 128 chunks while the client was still reading\n' \
-  "$mid_produced"
+printf 'backpressure: produced %s of %s chunks while the client was still reading\n' \
+  "$mid_produced" "$backpressure_chunks"
 
 [[ -n "$mid_yielded" ]] &&
   pass "the runtime served another request while the producer was blocked" ||
   fail "the runtime stopped answering while the producer was blocked"
-[[ "$mid_produced" -lt 110 ]] &&
-  pass "the producer stayed behind the slow client ($mid_produced of 128 chunks)" ||
-  fail "the producer ran ahead ($mid_produced of 128 chunks): backpressure did not apply"
+[[ "$mid_produced" -lt $((backpressure_chunks * 5 / 8)) ]] &&
+  pass "the producer stayed behind the slow client ($mid_produced of $backpressure_chunks chunks)" ||
+  fail "the producer ran ahead ($mid_produced of $backpressure_chunks chunks): backpressure did not apply"
 
 wait "$slow_curl" 2>/dev/null || true
 slow_size="$(wc -c <"$temporary_dir/slow.body" | tr -d ' ')"
-[[ "$slow_size" == 16777216 ]] &&
-  pass "the slow client still received the whole 16 MiB body" ||
-  fail "the slow client received $slow_size of 16777216 bytes"
+slow_expected=$((backpressure_chunks * 131072))
+[[ "$slow_size" == "$slow_expected" ]] &&
+  pass "the slow client still received the whole body ($slow_expected bytes)" ||
+  fail "the slow client received $slow_size of $slow_expected bytes"
 
 printf '\nraw results: %s\n' "$result_dir"
 if [[ "$failures" -gt 0 ]]; then
