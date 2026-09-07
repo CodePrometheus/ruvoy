@@ -10,8 +10,11 @@ const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 type ResultSlot = Arc<Mutex<Option<Result<Response, BridgeError>>>>;
 
 impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for SyncRackConfig {
+    /// Wrapped so a panic answers with a status instead of dropping the
+    /// connection: the ABI already stops an unwind at its boundary, but the
+    /// filter it unwound out of would otherwise keep serving later callbacks.
     fn new_http_filter(&self, _envoy_filter: &mut EHF) -> Box<dyn HttpFilter<EHF>> {
-        Box::new(SyncRackFilter {
+        Box::new(CatchUnwind::new(SyncRackFilter {
             client: self.client(),
             diagnostics_enabled: self.diagnostics_enabled(),
             runtime_thread_id: self.runtime_thread_id().to_owned(),
@@ -19,7 +22,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for SyncRackConfig {
             request: None,
             result: Arc::new(Mutex::new(None)),
             state: FilterState::Collecting,
-        })
+        }))
     }
 }
 

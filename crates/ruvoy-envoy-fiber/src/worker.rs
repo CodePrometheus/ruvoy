@@ -35,8 +35,11 @@ enum BodySource {
 }
 
 impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FiberRackConfig {
+    /// Wrapped so a panic answers with a status instead of dropping the
+    /// connection: the ABI already stops an unwind at its boundary, but the
+    /// filter it unwound out of would otherwise keep serving later callbacks.
     fn new_http_filter(&self, _envoy_filter: &mut EHF) -> Box<dyn HttpFilter<EHF>> {
-        Box::new(FiberRackFilter {
+        Box::new(CatchUnwind::new(FiberRackFilter {
             client: self.client(),
             diagnostics_enabled: self.diagnostics_enabled(),
             runtime_thread_id: self.runtime_thread_id().to_owned(),
@@ -49,7 +52,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FiberRackConfig {
             state: FilterState::Collecting,
             metrics: self.metrics(),
             submitted_at: None,
-        })
+        }))
     }
 }
 
