@@ -724,7 +724,17 @@ type PreparedFiberRuntime = (
     RuntimeInfo,
 );
 
+/// Declares that file reads are UTF-8, which an embedded VM has no locale to
+/// infer from.
+fn set_source_encoding(ruby: &Ruby) -> Result<(), BridgeError> {
+    ruby.eval::<magnus::Value>("Encoding.default_external = Encoding::UTF_8")
+        .map(|_| ())
+        .map_err(|error| ruby_error("setting the default encoding", error))
+}
+
 fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRuntime, BridgeError> {
+    set_source_encoding(ruby)?;
+
     for feature in [
         "bundler/setup",
         "stringio",
