@@ -18,7 +18,7 @@ mkdir -p "$result_dir"
 
 cleanup() {
   if [[ -n "$envoy_pid" ]] && kill -0 "$envoy_pid" 2>/dev/null; then
-    kill -INT "$envoy_pid" 2>/dev/null || true
+    "$repo_root/scripts/stop-envoy.sh" "$envoy_pid" 10 || true
     wait "$envoy_pid" 2>/dev/null || true
   fi
   rm -rf -- "$temporary_dir"

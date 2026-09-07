@@ -47,12 +47,7 @@ process_is_alive() {
 
 cleanup() {
   if [[ -n "$envoy_pid" ]]; then
-    kill -INT "$envoy_pid" 2>/dev/null || true
-    for _ in $(seq 1 100); do
-      process_is_alive "$envoy_pid" || break
-      sleep 0.05
-    done
-    kill -KILL "$envoy_pid" 2>/dev/null || true
+    "$repo_root/scripts/stop-envoy.sh" "$envoy_pid" 5 || true
     wait "$envoy_pid" 2>/dev/null || true
   fi
   rm -rf "$temporary_dir"

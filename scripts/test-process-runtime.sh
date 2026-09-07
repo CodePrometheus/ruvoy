@@ -37,12 +37,7 @@ trap cleanup EXIT
 
 stop_envoy() {
   [[ -n "$envoy_pid" ]] || return 0
-  kill -INT "$envoy_pid" 2>/dev/null || true
-  for _ in $(seq 1 200); do
-    kill -0 "$envoy_pid" 2>/dev/null || break
-    sleep 0.05
-  done
-  kill -KILL "$envoy_pid" 2>/dev/null || true
+  "$repo_root/scripts/stop-envoy.sh" "$envoy_pid" 10 || true
   wait "$envoy_pid" 2>/dev/null || true
   envoy_pid=""
 }
@@ -433,7 +428,7 @@ if wait_for_port 18099; then
     pass "the original epoch exited after the hot restart"
   else
     fail "the original epoch did not exit after the hot restart"
-    kill -KILL "$epoch0_pid" 2>/dev/null || true
+    "$repo_root/scripts/stop-envoy.sh" "$epoch0_pid" 0 || true
   fi
   wait "$epoch0_pid" 2>/dev/null || true
   envoy_pid="$epoch1_pid"
