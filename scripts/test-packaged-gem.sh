@@ -16,9 +16,13 @@ work_dir="$(mktemp -d "${TMPDIR:-/tmp}/ruvoy-packaged.XXXXXX")"
 server_pid=""
 failures=0
 
+# `wait ""` fails, and a failure here would exit the script non-zero with every
+# assertion passing, so the whole teardown stays out of `set -e`'s way.
 cleanup() {
-  [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null
-  wait "$server_pid" 2>/dev/null
+  if [[ -n "$server_pid" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
   rm -rf "$work_dir"
 }
 trap cleanup EXIT
@@ -89,8 +93,8 @@ check 'eight one-second requests overlap instead of queueing' test "$elapsed" -l
 
 # Envoy ships separately and installing it is optional, so the command line has
 # to work against one the machine already has.
-kill "$server_pid" 2>/dev/null
-wait "$server_pid" 2>/dev/null
+kill "$server_pid" 2>/dev/null || true
+wait "$server_pid" 2>/dev/null || true
 server_pid=""
 alone="$work_dir/alone"
 gem install --no-document --install-dir "$alone" "$gem_file" >/dev/null
