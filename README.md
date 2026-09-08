@@ -7,7 +7,7 @@
 <p align="center">
   <img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white">
   <img alt="Ruby 4.0.5" src="https://img.shields.io/badge/Ruby-4.0.5-CC342D?logo=ruby&logoColor=white">
-  <img alt="Envoy 1.39.0" src="https://img.shields.io/badge/Envoy-1.39.0-AC6199?logo=envoyproxy&logoColor=white">
+  <img alt="Envoy 1.39.1" src="https://img.shields.io/badge/Envoy-1.39.1-AC6199?logo=envoyproxy&logoColor=white">
   <a href="LICENSE"><img alt="Apache License 2.0" src="https://img.shields.io/badge/License-Apache--2.0-blue.svg"></a>
 </p>
 
@@ -16,15 +16,52 @@
 Ruvoy is a Ruby application runtime inside Envoy. Envoy speaks HTTP, Ruby
 speaks Rack, and owned Rust messages bridge the two.
 
+## Install
+
+```console
+$ gem install ruvoy
+```
+
+The gem carries the dynamic module and the Envoy binary, so there is nothing
+else to install and no version to match by hand.
+
+| | |
+|---|---|
+| Ruby | 4.0.x. The module links against the Ruby it was built for, so the gem is published per ABI. |
+| Platform | Linux `x86_64` and `aarch64`, matching the platforms Envoy publishes binaries for. |
+| Envoy | Bundled (1.39.1, dynamic module ABI 0.1.0). Not installed separately. |
+
+## Quickstart
+
+```console
+$ ruvoy examples/hello/config.ru
+$ curl localhost:8080/
+hello from ruby 4.0.5
+```
+
+`ruvoy` takes a rackup and serves it. It generates the Envoy configuration and
+replaces itself with Envoy, so signals and exit status belong to the proxy and
+a container needs no process supervisor.
+
+```console
+$ ruvoy --help
+Usage: ruvoy [options] [config.ru]
+    -p, --port PORT                  Listen on PORT (default 8080)
+    -a, --address ADDRESS            Bind to ADDRESS (default 127.0.0.1)
+        --admin-port PORT            Expose Envoy's admin interface on PORT
+        --print-config               Print the generated Envoy configuration and exit
+```
+
+To run it under an Envoy you configure yourself, `--print-config` prints the
+listener Ruvoy would have used; the module is `ruvoy_fiber` and its filter
+config is the path to the rackup.
+
 ## Status
 
-Ruvoy is a proof of concept. The data path — request dispatch, streaming
-responses with backpressure, cancellation, and admission control — is
-implemented and covered by the test scripts, and the performance claim below
-was measured under a pre-registered protocol. It has not been proven in
-production: each process runs a single Ruby execution context, configuration
-reload inside a running Envoy has not been verified, and no long-duration
-soak has been run. Interfaces may change.
+The data path is implemented and covered by suites that run against a real
+Envoy in CI. Configuration reload has been driven through a running Envoy, and
+a one-hour soak of 1.8 million requests left the heap, file descriptors and
+threads flat. Interfaces may change.
 
 ## Features
 
@@ -198,7 +235,7 @@ Ruvoy holds `+146%` throughput with `−48%` p99 in plaintext and `+181%`
 with `−54%` under TLS — both past the pre-registered noise threshold.
 Against Envoy → Puma the margin is `+221%` and `+231%`.
 
-Three honest qualifications:
+Four honest qualifications:
 
 - The no-op scenario measures per-request framework overhead, so these are
   ceiling numbers. As real application time grows, the relative margin
@@ -208,10 +245,18 @@ Three honest qualifications:
   process (~1.9 cores versus Falcon's ~1.0). Per core the margin is roughly
   `+29%`; the rest comes from pairing the Ruby thread with a proxy-grade
   HTTP front end.
+- Every number here comes from an application that yields while it waits. A
+  driver written as a C extension releases the interpreter lock but not the
+  fiber, so a single such call stalls every other request on the thread. The
+  `wait50` and `block50` scenarios measure that difference directly; they are
+  not part of the campaign above.
 - A 1 MiB-response scenario was also run and produced no ranking: above
   ~1,000 such responses per second all four architectures converged on the
   network path's throughput limit with 59–96% variance, so that scenario
   measures the link, not the servers.
+
+Not measured: CPU-bound Rack, real database or HTTP-client drivers, and
+multi-process deployment.
 
 Measurements were produced by `scripts/run-benchmark.sh`, which enforces the
 protocol above — remote load generation, rotation, warm-up, per-round

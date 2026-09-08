@@ -183,7 +183,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for BaselineFilter {
             .as_mut()
             .expect("benchmark request is present");
         if request.request_body.len().saturating_add(received.len()) > MAX_BODY_BYTES {
-            self.send_bad_request(envoy_filter, b"request body exceeds 2 MiB PoC limit");
+            self.send_bad_request(envoy_filter, b"request body exceeds the 2 MiB limit");
             return envoy_dynamic_module_type_on_http_filter_request_body_status::StopIterationNoBuffer;
         }
         request.request_body.extend_from_slice(&received);
@@ -261,13 +261,13 @@ fn parse_benchmark_request(path: &str) -> Result<BenchmarkRequest, String> {
     }
 
     if wait_ms > 1_000 {
-        return Err("wait_ms exceeds 1000 ms PoC limit".to_owned());
+        return Err("wait_ms exceeds the 1000 ms limit".to_owned());
     }
     if response_bytes > MAX_BODY_BYTES {
-        return Err("response_bytes exceeds 2 MiB PoC limit".to_owned());
+        return Err("response_bytes exceeds the 2 MiB limit".to_owned());
     }
     if expected_request_bytes.is_some_and(|value| value > MAX_BODY_BYTES) {
-        return Err("expected_request_bytes exceeds 2 MiB PoC limit".to_owned());
+        return Err("expected_request_bytes exceeds the 2 MiB limit".to_owned());
     }
 
     Ok(BenchmarkRequest {
@@ -312,6 +312,6 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error, "expected_request_bytes exceeds 2 MiB PoC limit");
+        assert_eq!(error, "expected_request_bytes exceeds the 2 MiB limit");
     }
 }

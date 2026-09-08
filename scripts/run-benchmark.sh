@@ -263,7 +263,7 @@ manifest="$result_dir/manifest.tsv"
 control_manifest="$result_dir/control-manifest.tsv"
 campaign_manifest="$result_dir/campaign.tsv"
 skipped_manifest="$result_dir/skipped.tsv"
-printf 'sequence\tarchitecture\tscenario\ttls_mode\tround\tprotocol\tconcurrency\twait_ms\trequest_bytes\tresponse_bytes\tserved_requests\toha_json\tresources_csv\n' >"$manifest"
+printf 'sequence\tarchitecture\tscenario\ttls_mode\tround\tprotocol\tconcurrency\twait_ms\trequest_bytes\tresponse_bytes\tapp_params\tserved_requests\toha_json\tresources_csv\n' >"$manifest"
 printf 'architecture\tstate\trun\toha_json\n' >"$control_manifest"
 printf 'sequence\tscenario\ttls_mode\tround\tarchitecture\tprotocol\tstate\treason\n' >"$campaign_manifest"
 printf 'scenario\tround\tarchitecture\tprotocol\treason\n' >"$skipped_manifest"
@@ -1007,11 +1007,13 @@ run_oha() {
   local wait_ms="$7"
   local request_bytes="$8"
   local response_bytes="$9"
+  local app_params="${10}"
   local run_prefix="$result_dir/$architecture/${scenario}-round${round}-seq${sequence}"
   local json_file="$run_prefix.json"
   local resource_file="$run_prefix.resources.csv"
   local rss_sample_file="$run_prefix.rss.csv"
   local url="$current_scheme://$target_address:$current_listener_port/benchmark?wait_ms=$wait_ms&response_bytes=$response_bytes&expected_request_bytes=$request_bytes"
+  [[ -n "$app_params" ]] && url+="&$app_params"
   local args=(--no-tui --output-format json --wait-ongoing-requests-after-deadline -z "$bench_duration")
   while IFS= read -r tls_argument; do
     [[ -n "$tls_argument" ]] && args+=("$tls_argument")
@@ -1090,7 +1092,7 @@ run_oha() {
   printf 'sample,cpu_percent,rss_kib\n0,%s,%s\n' \
     "$cpu_percent" "$rss_max" >"$resource_file"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$sequence" \
     "$architecture" \
     "$scenario" \
@@ -1101,6 +1103,7 @@ run_oha() {
     "$wait_ms" \
     "$request_bytes" \
     "$response_bytes" \
+    "$app_params" \
     "$served_delta" \
     "${json_file#"$result_dir/"}" \
     "${resource_file#"$result_dir/"}" \
@@ -1203,7 +1206,12 @@ scenario_rows() {
     'wait10_h1_c10|1.1|10|10|0|0' \
     'wait200_h1_c1|1.1|1|200|0|0' \
     'wait200_h1_c10|1.1|10|200|0|0' \
-    'wait200_h1_c100|1.1|100|200|0|0'
+    'wait200_h1_c100|1.1|100|200|0|0' \
+    'cpu25k_h1_c100|1.1|100|0|0|0|cpu_iterations=25000' \
+    'cpu125k_h1_c100|1.1|100|0|0|0|cpu_iterations=125000' \
+    'wait50_h1_c100|1.1|100|50|0|0' \
+    'block50_h1_c100|1.1|100|0|0|0|block_ms=50' \
+    'block50_h1_c10|1.1|10|0|0|0|block_ms=50'
 }
 
 scenario_is_selected() {
@@ -1233,6 +1241,7 @@ run_measurement() {
   local wait_ms="$7"
   local request_bytes="$8"
   local response_bytes="$9"
+  local app_params="${10}"
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\tplanned\t\n' \
     "$sequence" "$scenario" "$current_tls_mode" "$round" "$architecture" "$protocol" \
@@ -1258,7 +1267,8 @@ run_measurement() {
     "$concurrency" \
     "$wait_ms" \
     "$request_bytes" \
-    "$response_bytes"
+    "$response_bytes" \
+    "$app_params"
 
   if [[ "$mode" == "full" ]] && ! control_has_run "$architecture"; then
     if control_port="$(control_port_for_architecture "$architecture")"; then
@@ -1429,7 +1439,7 @@ for current_tls_mode in "${tls_modes[@]}"; do
     current_scheme=http
   fi
   tls_negotiation_baseline=""
-while IFS='|' read -r scenario protocol concurrency wait_ms request_bytes response_bytes; do
+while IFS='|' read -r scenario protocol concurrency wait_ms request_bytes response_bytes app_params; do
   scenario_is_selected "$scenario" || continue
   for round in $(seq 1 "$measurement_rounds"); do
     architecture_count="${#architectures[@]}"
@@ -1472,7 +1482,8 @@ while IFS='|' read -r scenario protocol concurrency wait_ms request_bytes respon
         "$concurrency" \
         "$wait_ms" \
         "$request_bytes" \
-        "$response_bytes"
+        "$response_bytes" \
+        "$app_params"
       if architecture_supports_protocol "$architecture" "$protocol"; then
         measurement_count=$((measurement_count + 1))
       fi
@@ -1488,7 +1499,7 @@ done
 # report anything less.
 expected_measurements=0
 for expected_tls_mode in "${tls_modes[@]}"; do
-  while IFS='|' read -r expected_scenario expected_protocol _ _ _ _; do
+  while IFS='|' read -r expected_scenario expected_protocol _ _ _ _ _; do
     scenario_is_selected "$expected_scenario" || continue
     for expected_architecture in "${architectures[@]}"; do
       architecture_supports_protocol "$expected_architecture" "$expected_protocol" || continue

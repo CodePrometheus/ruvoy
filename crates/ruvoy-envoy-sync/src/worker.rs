@@ -210,7 +210,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for SyncRackFilter {
             self.send_bridge_error(
                 envoy_filter,
                 413,
-                b"request body exceeds 2 MiB PoC limit",
+                b"request body exceeds the 2 MiB limit",
                 "ruvoy_sync_body_too_large",
             );
             return envoy_dynamic_module_type_on_http_filter_request_body_status::StopIterationNoBuffer;

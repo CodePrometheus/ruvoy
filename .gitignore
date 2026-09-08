@@ -35,3 +35,9 @@
 *.pfx
 *.jks
 *.keystore
+
+# Release build artefacts: fetched or compiled, never committed.
+/exe/envoy
+/NOTICE
+/*.gem
+/lib/ruvoy/[0-9]*/

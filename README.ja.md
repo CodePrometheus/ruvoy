@@ -7,7 +7,7 @@
 <p align="center">
   <img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white">
   <img alt="Ruby 4.0.5" src="https://img.shields.io/badge/Ruby-4.0.5-CC342D?logo=ruby&logoColor=white">
-  <img alt="Envoy 1.39.0" src="https://img.shields.io/badge/Envoy-1.39.0-AC6199?logo=envoyproxy&logoColor=white">
+  <img alt="Envoy 1.39.1" src="https://img.shields.io/badge/Envoy-1.39.1-AC6199?logo=envoyproxy&logoColor=white">
   <a href="LICENSE"><img alt="Apache License 2.0" src="https://img.shields.io/badge/License-Apache--2.0-blue.svg"></a>
 </p>
 
@@ -17,14 +17,50 @@ Ruvoy は Envoy の内部で動く Ruby アプリケーションランタイム�
 HTTP を担い、Ruby が Rack を担い、その間を Rust の owned メッセージが橋渡し
 します。
 
+## インストール
+
+```console
+$ gem install ruvoy
+```
+
+gem には動的モジュールと Envoy バイナリが同梱されているため、他に入れるものは
+なく、バージョンを手で合わせる必要もありません。
+
+| | |
+|---|---|
+| Ruby | 4.0.x。モジュールはビルド時の Ruby にリンクするため、gem は ABI ごとに公開されます。 |
+| プラットフォーム | Linux `x86_64` と `aarch64`。Envoy が公式バイナリを公開しているものに揃えています。 |
+| Envoy | 同梱（1.39.1、動的モジュール ABI 0.1.0）。個別インストールは不要です。 |
+
+## クイックスタート
+
+```console
+$ ruvoy examples/hello/config.ru
+$ curl localhost:8080/
+hello from ruby 4.0.5
+```
+
+`ruvoy` は rackup を受け取ってそれを配信します。Envoy の設定を生成し、自身を
+Envoy に置き換えるため、シグナルと終了ステータスは Envoy のものになり、
+コンテナにプロセススーパーバイザーは要りません。
+
+```console
+$ ruvoy --help
+Usage: ruvoy [options] [config.ru]
+    -p, --port PORT                  Listen on PORT (default 8080)
+    -a, --address ADDRESS            Bind to ADDRESS (default 127.0.0.1)
+        --admin-port PORT            Expose Envoy's admin interface on PORT
+        --print-config               Print the generated Envoy configuration and exit
+```
+
+自分で構成した Envoy の下で動かす場合、`--print-config` が Ruvoy の使う listener を
+出力します。モジュール名は `ruvoy_fiber`、その filter config は rackup のパスです。
+
 ## ステータス
 
-Ruvoy は現在 proof of concept です。データパス——リクエストのディスパッチ、
-バックプレッシャー付きストリーミングレスポンス、キャンセル、アドミッション
-制御——は実装済みでテストスクリプトに覆われており、下記の性能主張も事前
-登録したプロトコルの下で測定したものです。ただし本番運用での実証はまだ
-ありません。各プロセスは単一の Ruby 実行コンテキストのみを持ち、稼働中の
-Envoy 内での設定リロードは未検証、長時間の soak テストも未実施です。
+データパスは実装済みで、CI 上で実際の Envoy に対して走るスイートが覆っています。
+設定リロードは稼働中の Envoy を通して検証済みで、1 時間・180 万リクエストの soak
+の後もヒープ、ファイルディスクリプタ、スレッド数は横ばいでした。
 インターフェースは変更される可能性があります。
 
 ## 特徴
@@ -200,7 +236,7 @@ fiber-per-request であり、違いはリクエストを loopback の HTTP ホ�
 `−54%` を維持し、いずれも事前登録したノイズ閾値を超えています。
 Envoy → Puma に対する差は `+221%` と `+231%` です。
 
-正直に述べるべき 3 つの限定条件：
+正直に述べるべき 4 つの限定条件：
 
 - No-op シナリオはリクエストあたりのフレームワークオーバーヘッドを測る
   ものであり、これらは上限値です。実アプリケーションの処理時間が長くなる
@@ -210,10 +246,18 @@ Envoy → Puma に対する差は `+221%` と `+231%` です。
   含まれます（約 1.9 コア、Falcon は約 1.0 コア）。コアあたりでは差は約
   `+29%` で、残りは Ruby スレッドにプロキシ級の HTTP フロントエンドを
   組み合わせたことによるものです。
+- ここに載る数字はすべて、待機中に譲るアプリケーションから得たものです。
+  C 拡張で書かれたドライバーはインタプリタロックは解放しますが fiber は譲らない
+  ため、そうした呼び出しが 1 つあるだけで同じスレッド上の他のリクエストがすべて
+  止まります。`wait50` と `block50` のシナリオはこの差を直接測るもので、上記の
+  campaign には含まれていません。
 - 1 MiB レスポンスのシナリオも実行しましたが、順位付けは成立しません
   でした。毎秒約 1,000 レスポンスを超えると 4 アーキテクチャすべてが
   ネットワーク経路のスループット上限に収束し、変動は 59–96% に達した
   ため、このシナリオが測っているのはリンクでありサーバーではありません。
+
+未測定：CPU バウンドな Rack、実際のデータベースや HTTP クライアントの
+ドライバー、マルチプロセス構成。
 
 測定は `scripts/run-benchmark.sh` によって生成されました。このスクリプトは
 上記のプロトコル——リモート負荷生成、ローテーション、ウォームアップ、

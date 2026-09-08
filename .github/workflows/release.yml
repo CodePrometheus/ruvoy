@@ -1,0 +1,108 @@
+name: Release
+
+# Two gems with separate reasons to change, so two tag namespaces:
+#   v0.1.0        publishes ruvoy
+#   envoy/v1.39.1 publishes ruvoy-envoy
+# Both are always built, because the acceptance test needs an Envoy to run
+# against; only the one the tag names is published.
+on:
+  push:
+    tags:
+      - "v*"
+      - "envoy/v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install --yes lsof
+
+      - name: Build both gems
+        run: ./scripts/build-gem.sh
+
+      # A gem that installs and cannot serve a request is the failure this
+      # whole packaging exists to prevent, so nothing is published until an
+      # installed copy has answered one.
+      - name: Install the gems and serve a request through them
+        run: ./scripts/test-packaged-gem.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gems-${{ matrix.arch }}
+          path: "*.gem"
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gems-*
+          merge-multiple: true
+          path: gems
+
+      # The tag decides which gem is released; the other was built only so the
+      # acceptance test had something to run against.
+      - name: Select the gems this tag releases
+        id: select
+        run: |
+          if [[ "$GITHUB_REF_NAME" == envoy/v* ]]; then
+            echo "glob=gems/ruvoy-envoy-*.gem" >>"$GITHUB_OUTPUT"
+          else
+            echo "glob=gems/ruvoy-[0-9]*.gem" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Refuse a tag that does not match what was built
+        run: |
+          shopt -s nullglob
+          files=(${{ steps.select.outputs.glob }})
+          [[ ${#files[@]} -gt 0 ]] || { echo "no gem matches $GITHUB_REF_NAME"; exit 1; }
+          expected="${GITHUB_REF_NAME#envoy/}"
+          expected="${expected#v}"
+          for file in "${files[@]}"; do
+            [[ "$file" == *"-$expected-"* ]] ||
+              { echo "$file does not carry version $expected"; exit 1; }
+          done
+          printf 'releasing:\n'; printf '  %s\n' "${files[@]}"
+
+      - uses: rubygems/configure-rubygems-credentials@v1
+
+      - name: Push to RubyGems
+        run: |
+          shopt -s nullglob
+          for file in ${{ steps.select.outputs.glob }}; do
+            gem push "$file"
+          done
+
+      - name: Attach the gems to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes ${{ steps.select.outputs.glob }}

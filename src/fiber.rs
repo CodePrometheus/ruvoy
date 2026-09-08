@@ -735,14 +735,19 @@ fn set_source_encoding(ruby: &Ruby) -> Result<(), BridgeError> {
 fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRuntime, BridgeError> {
     set_source_encoding(ruby)?;
 
+    // RubyGems activates a gem from inside its own `Kernel#require`, which the
+    // C entry point bypasses, so a feature outside $LOAD_PATH has to be asked
+    // for through Ruby. An embedded VM also never runs Ruby's own startup, so
+    // RubyGems itself is only present once required.
     for feature in [
+        "rubygems",
         "bundler/setup",
         "stringio",
         "io/wait",
         "async",
         "async/variable",
     ] {
-        ruby.require(feature)
+        ruby.eval::<magnus::Value>(&format!("require {feature:?}"))
             .map_err(|error| ruby_error(&format!("loading {feature}"), error))?;
     }
 
@@ -840,7 +845,7 @@ fn load_fiber_app(ruby: &Ruby, app: FiberApp) -> Result<Value, BridgeError> {
             .eval(&source)
             .map_err(|error| ruby_error("evaluating fiber app source", error)),
         FiberApp::Rackup(path) => {
-            ruby.require("rack")
+            ruby.eval::<magnus::Value>("require \"rack\"")
                 .map_err(|error| ruby_error("loading Rack", error))?;
             let path = path.to_str().ok_or_else(|| {
                 BridgeError::Startup(format!(

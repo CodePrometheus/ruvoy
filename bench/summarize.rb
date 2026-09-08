@@ -102,6 +102,7 @@ summary_rows = groups.map do |(architecture, scenario, tls_mode), rows|
     "wait_ms" => Integer(rows.first.fetch("wait_ms")),
     "request_bytes" => Integer(rows.first.fetch("request_bytes")),
     "response_bytes" => Integer(rows.first.fetch("response_bytes")),
+    "app_params" => rows.first.fetch("app_params"),
     "requests_total" => request_counts.sum,
     "requests_per_round_median" => median(request_counts),
     "elapsed_seconds_total" => elapsed.sum,
@@ -244,6 +245,35 @@ fiber_wait_scaling =
     fiber_wait_c100.fetch("rps_median") / fiber_wait_c10.fetch("rps_median")
   end
 
+# The same 50 ms of latency, once through a scheduler-aware wait and once
+# through a native call that does not yield. Every claim in this project rests
+# on the application yielding while it waits; a driver written as a C extension
+# does not, so this ratio is what such an application actually keeps.
+yield_sensitivity = {}
+architectures_present = summary_rows.map { |row| row.fetch("architecture") }.uniq
+architectures_present.each do |architecture|
+  yielding = row_for(summary_rows, architecture, "wait50_h1_c100", primary_tls_mode)
+  blocking = row_for(summary_rows, architecture, "block50_h1_c100", primary_tls_mode)
+  next unless yielding && blocking
+
+  yield_sensitivity[architecture] = {
+    "wait50_rps_median" => yielding.fetch("rps_median"),
+    "block50_rps_median" => blocking.fetch("rps_median"),
+    "retained_fraction" => blocking.fetch("rps_median") / yielding.fetch("rps_median")
+  }
+end
+
+# Whether the advantage survives once the request needs the CPU rather than
+# waiting. Compared against Falcon, the architecture that isolates the variable.
+cpu_bound_decision = {}
+%w[cpu25k_h1_c100 cpu125k_h1_c100].each do |scenario|
+  candidate = row_for(summary_rows, "fiber", scenario, primary_tls_mode)
+  control = row_for(summary_rows, "falcon_direct", scenario, primary_tls_mode)
+  next unless candidate && control
+
+  cpu_bound_decision[scenario] = performance_comparison(candidate, control)
+end
+
 campaign_path = File.join(result_dir, "campaign.tsv")
 campaign_rows = CSV.read(campaign_path, headers: true, col_sep: "\t").map(&:to_h)
 skipped_path = File.join(result_dir, "skipped.tsv")
@@ -275,27 +305,29 @@ summary = {
   "performance_decision" => performance_decision,
   "fiber_over_falcon_direct" => same_model_decision,
   "envoy_puma_over_direct_puma" => topology_comparison,
-  "fiber_wait_c100_over_c10_rps_ratio" => fiber_wait_scaling
+  "fiber_wait_c100_over_c10_rps_ratio" => fiber_wait_scaling,
+  "yield_sensitivity" => yield_sensitivity,
+  "fiber_over_falcon_direct_cpu_bound" => cpu_bound_decision
 }
 File.write(File.join(result_dir, "summary.json"), JSON.pretty_generate(summary) << "\n")
 
 markdown = []
-markdown << "# ruvoy 性能基准"
+markdown << "# ruvoy performance benchmark"
 markdown << ""
-markdown << "- 模式：`#{mode}`"
-markdown << "- 架构顺序：`#{preflight.fetch("architectures", "unknown")}`（`#{preflight.fetch("architecture_order_mode", "unknown")}`）"
-markdown << "- 原始目录：`#{result_dir}`"
-markdown << "- 所有纳入汇总的轮次均要求：100% success、仅 HTTP 200、无 transport error。"
+markdown << "- Mode: `#{mode}`"
+markdown << "- Architecture order: `#{preflight.fetch("architectures", "unknown")}` (`#{preflight.fetch("architecture_order_mode", "unknown")}`)"
+markdown << "- Raw results: `#{result_dir}`"
+markdown << "- Every round included here required 100% success, HTTP 200 only, and no transport error."
 if mode != "full"
-  markdown << "- 这是低强度 smoke 校准结果，不能用于最终性能结论。"
+  markdown << "- A low-intensity smoke calibration. Not usable as a performance conclusion."
 end
 unless unstable_measurements.empty?
   markdown << ""
-  markdown << "## 不稳定场景（RPS RSD > 15%，数据作废需重跑）"
+  markdown << "## Unstable scenarios (RPS RSD > 15%; the data is void and must be re-run)"
   markdown << ""
   unstable_measurements.each do |row|
     markdown << format(
-      "- %s / %s / %s：RPS RSD `%.2f%%`。",
+      "- %s / %s / %s: RPS RSD `%.2f%%`.",
       row.fetch("architecture"),
       row.fetch("scenario"),
       row.fetch("tls_mode"),
@@ -304,7 +336,7 @@ unless unstable_measurements.empty?
   end
 end
 markdown << ""
-markdown << "## 网络结果"
+markdown << "## Network results"
 markdown << ""
 markdown << "| architecture | scenario | tls | rounds | requests | RPS median (RSD) | p50 ms (RSD) | p95 ms (RSD) | p99 ms (RSD) | CPU % (RSD) | RSS MiB median/max |"
 markdown << "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
@@ -333,10 +365,10 @@ end
 
 unless skipped_rows.empty?
   markdown << ""
-  markdown << "## 明确跳过"
+  markdown << "## Explicitly skipped"
   markdown << ""
   skipped_rows.each do |row|
-    markdown << "- #{row.fetch("architecture")} / #{row.fetch("scenario")} / round #{row.fetch("round")}：#{row.fetch("reason")}。"
+    markdown << "- #{row.fetch("architecture")} / #{row.fetch("scenario")} / round #{row.fetch("round")}: #{row.fetch("reason")}."
   end
 end
 
@@ -373,19 +405,20 @@ markdown << format(
 )
 if fiber_wait_scaling
   markdown << format(
-    "- Fiber 200 ms wait，c100/c10 吞吐比：`%.2fx`。",
+    "- Fiber 200 ms wait, c100/c10 throughput ratio: `%.2fx`.",
     fiber_wait_scaling
   )
 end
 
 if mode == "full"
   markdown << ""
-  markdown << "## 预注册性能判定"
+  markdown << "## Pre-registered performance decision"
   markdown << ""
   performance_decision.each do |architecture, decision|
     markdown << format(
-      "- %s vs Envoy→Puma（H1 no-op c100）：吞吐 `%+.2f%%`（阈值 `%.2f%%`，稳定优势 `%s`），" \
-      "延迟 p99 `%+.2f%%`（阈值 `%.2f%%`，稳定优势 `%s`）；两项同时成立才算总体优势：`%s`。",
+      "- %s vs Envoy->Puma (H1 no-op c100): throughput `%+.2f%%` (threshold `%.2f%%`, " \
+      "stable advantage `%s`), p99 latency `%+.2f%%` (threshold `%.2f%%`, stable advantage " \
+      "`%s`). Both must hold to count as an overall advantage: `%s`.",
       architecture,
       decision.fetch("rps_improvement_percent"),
       decision.fetch("rps_noise_threshold_percent"),
@@ -398,8 +431,8 @@ if mode == "full"
   end
   topology_comparison.each do |tls_mode, comparison|
     markdown << format(
-      "- Envoy→Puma vs direct Puma（H1 no-op c100，%s）：RPS `%+.2f%%`，p99 `%+.2f%%`；" \
-      "这是拓扑开销对照，不是 Ruvoy 性能结论。",
+      "- Envoy->Puma vs direct Puma (H1 no-op c100, %s): RPS `%+.2f%%`, p99 `%+.2f%%`. " \
+      "This measures topology overhead, not a ruvoy performance result.",
       tls_mode,
       comparison.fetch("rps_improvement_percent"),
       comparison.fetch("p99_improvement_percent")
@@ -407,18 +440,20 @@ if mode == "full"
   end
 
   markdown << ""
-  markdown << "### 同并发模型对照（Ruvoy vs Falcon）"
+  markdown << "### Same concurrency model (ruvoy vs Falcon)"
   markdown << ""
-  markdown << "Falcon 同为 fiber-per-request，因此这一项的差值才是「嵌入 Envoy 同进程、" \
-              "省去进程外 HTTP hop」的收益；赢 Puma 只能说明 Fiber 比线程更适合等待。"
+  markdown << "Falcon is fiber-per-request too, so this difference is what running inside " \
+              "the Envoy process buys by removing the out-of-process HTTP hop. Beating Puma " \
+              "only shows that fibers suit waiting better than threads."
   markdown << ""
   if same_model_decision.empty?
-    markdown << "- 当前结果不含 H1 no-op c100 的 fiber/falcon_direct 对照，该判定不适用。"
+    markdown << "- These results carry no fiber/falcon_direct pair for H1 no-op c100, so the decision does not apply."
   else
     same_model_decision.each do |tls_mode, decision|
       markdown << format(
-        "- Ruvoy vs direct Falcon（H1 no-op c100，%s）：吞吐 `%+.2f%%`（阈值 `%.2f%%`，" \
-        "稳定优势 `%s`），延迟 p99 `%+.2f%%`（阈值 `%.2f%%`，稳定优势 `%s`）；总体优势：`%s`。",
+        "- ruvoy vs direct Falcon (H1 no-op c100, %s): throughput `%+.2f%%` (threshold " \
+        "`%.2f%%`, stable advantage `%s`), p99 latency `%+.2f%%` (threshold `%.2f%%`, " \
+        "stable advantage `%s`). Overall advantage: `%s`.",
         tls_mode,
         decision.fetch("rps_improvement_percent"),
         decision.fetch("rps_noise_threshold_percent"),
@@ -431,17 +466,61 @@ if mode == "full"
     end
     unless same_model_decision.values.any? { |decision| decision.fetch("has_stable_advantage") }
       markdown << ""
-      markdown << "**相对同并发模型的 Falcon 没有稳定优势：Ruvoy 的性能主张不成立，" \
-                  "仅剩运维形态收益（单进程部署、Envoy 原生 HTTP/TLS、无 upstream hop）。**"
+      markdown << "**No stable advantage over Falcon, which shares the concurrency model: " \
+                  "the performance claim does not hold, and only the deployment-shape " \
+                  "benefits remain (single process, Envoy-native HTTP/TLS, no upstream hop).**"
+    end
+  end
+
+  unless yield_sensitivity.empty?
+    markdown << ""
+    markdown << "### Yield sensitivity (the same 50 ms, yielding or not)"
+    markdown << ""
+    markdown << "`wait50` hands the 50 ms to the scheduler; `block50` spends it inside a " \
+                "native call that does not yield, which is how a driver written as a C " \
+                "extension behaves. Every throughput claim above assumes the application " \
+                "yields while it waits, so this is what an application keeps when it does not."
+    markdown << ""
+    yield_sensitivity.each do |architecture, entry|
+      markdown << format(
+        "- %s: `%.2f` RPS yielding vs `%.2f` RPS blocking, retaining `%.1f%%`.",
+        architecture,
+        entry.fetch("wait50_rps_median"),
+        entry.fetch("block50_rps_median"),
+        entry.fetch("retained_fraction") * 100
+      )
+    end
+  end
+
+  unless cpu_bound_decision.empty?
+    markdown << ""
+    markdown << "### CPU-bound work (ruvoy vs Falcon)"
+    markdown << ""
+    markdown << "The headline numbers come from a no-op application, which measures " \
+                "framework overhead. These scenarios spend the request on the CPU instead."
+    markdown << ""
+    cpu_bound_decision.each do |scenario, decision|
+      markdown << format(
+        "- %s: throughput `%+.2f%%` (threshold `%.2f%%`, stable advantage `%s`), " \
+        "p99 latency `%+.2f%%` (threshold `%.2f%%`, stable advantage `%s`). Overall: `%s`.",
+        scenario,
+        decision.fetch("rps_improvement_percent"),
+        decision.fetch("rps_noise_threshold_percent"),
+        decision.fetch("rps_stable_advantage"),
+        decision.fetch("p99_improvement_percent"),
+        decision.fetch("p99_noise_threshold_percent"),
+        decision.fetch("p99_stable_advantage"),
+        decision.fetch("has_stable_advantage")
+      )
     end
   end
 
   if performance_decision.empty?
     markdown << ""
-    markdown << "- 当前结果不含 H1 no-op c100 的完整候选/Envoy→Puma 对照，预注册总判定不适用。"
+    markdown << "- These results carry no complete candidate/Envoy->Puma pair for H1 no-op c100, so the pre-registered decision does not apply."
   elsif !performance_decision.values.any? { |decision| decision.fetch("has_stable_advantage") }
     markdown << ""
-    markdown << "**同进程设计相对 Envoy→Puma 未兑现性能价值。**"
+    markdown << "**The in-process design did not deliver a performance benefit over Envoy->Puma.**"
   end
 end
 

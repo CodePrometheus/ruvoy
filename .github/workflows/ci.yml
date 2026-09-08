@@ -66,6 +66,10 @@ jobs:
       - run: bundle exec rubocop
       - run: ruby -c ruby/*.rb crates/*/ruby/*.rb
       - run: bash -n scripts/*.sh
+      # Turns raw measurements into every number this project publishes.
+      - run: ./scripts/test-summarize.sh
+      # The whole installed interface.
+      - run: ./scripts/test-cli.sh
 
   # The real proxy, on the only platform Ruvoy targets. Two suites were silently
   # broken for weeks because nothing but a developer's machine ever ran them.

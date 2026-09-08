@@ -7,7 +7,7 @@
 <p align="center">
   <img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white">
   <img alt="Ruby 4.0.5" src="https://img.shields.io/badge/Ruby-4.0.5-CC342D?logo=ruby&logoColor=white">
-  <img alt="Envoy 1.39.0" src="https://img.shields.io/badge/Envoy-1.39.0-AC6199?logo=envoyproxy&logoColor=white">
+  <img alt="Envoy 1.39.1" src="https://img.shields.io/badge/Envoy-1.39.1-AC6199?logo=envoyproxy&logoColor=white">
   <a href="LICENSE"><img alt="Apache License 2.0" src="https://img.shields.io/badge/License-Apache--2.0-blue.svg"></a>
 </p>
 
@@ -16,13 +16,48 @@
 Ruvoy 是运行在 Envoy 内部的 Ruby 应用运行时。Envoy 负责 HTTP，Ruby 负责
 Rack，两者之间由 Rust owned 消息桥接。
 
+## 安装
+
+```console
+$ gem install ruvoy
+```
+
+gem 内含动态模块与 Envoy 二进制，不需要再装别的，也不需要手工对齐版本。
+
+| | |
+|---|---|
+| Ruby | 4.0.x。模块链接到构建时的那个 Ruby，因此 gem 按 ABI 分别发布。 |
+| 平台 | Linux `x86_64` 与 `aarch64`，与 Envoy 官方发布二进制的平台一致。 |
+| Envoy | 已内置（1.39.1，动态模块 ABI 0.1.0），不单独安装。 |
+
+## 快速开始
+
+```console
+$ ruvoy examples/hello/config.ru
+$ curl localhost:8080/
+hello from ruby 4.0.5
+```
+
+`ruvoy` 接收一个 rackup 并把它跑起来：生成 Envoy 配置，然后用 Envoy 替换自身，
+因此信号与退出码都归 Envoy，容器里不需要额外的进程管理。
+
+```console
+$ ruvoy --help
+Usage: ruvoy [options] [config.ru]
+    -p, --port PORT                  Listen on PORT (default 8080)
+    -a, --address ADDRESS            Bind to ADDRESS (default 127.0.0.1)
+        --admin-port PORT            Expose Envoy's admin interface on PORT
+        --print-config               Print the generated Envoy configuration and exit
+```
+
+要在自己配置的 Envoy 里运行，`--print-config` 会打印 Ruvoy 本来会用的 listener；
+模块名是 `ruvoy_fiber`，它的 filter config 就是 rackup 的路径。
+
 ## 状态
 
-Ruvoy 目前是一个概念验证（proof of concept）。数据面——请求分发、带背压的
-流式响应、取消、准入控制——均已实现并被测试脚本覆盖，下文的性能主张也是按
-预注册协议测得的。但它尚未经过生产验证：每个进程只运行一个 Ruby 执行上下
-文，运行中的 Envoy 内配置热更新尚未验证，也没有做过长时间 soak 测试。接口
-可能变更。
+数据面已实现，并由 CI 中针对真实 Envoy 运行的套件覆盖。配置热更新已在运行中的
+Envoy 上驱动验证，1 小时 180 万请求的 soak 之后堆、文件描述符与线程数均持平。
+接口可能变更。
 
 ## 特性
 
@@ -178,7 +213,7 @@ Falcon 是隔离架构变量的对照：两者同为 fiber-per-request，差异�
 Falcon，Ruvoy 明文下吞吐 `+146%`、p99 `−48%`，TLS 下 `+181%`、`−54%`，
 均超过预注册的噪声阈值。相对 Envoy → Puma 的幅度为 `+221%` 和 `+231%`。
 
-三条如实限定：
+四条如实限定：
 
 - No-op 场景测量的是每请求框架开销，因此这些是上限值。真实应用耗时越长，
   相对幅度越小：在 100 连接、模拟 200 ms 等待下，四个服务器全部停在同一
@@ -186,9 +221,14 @@ Falcon，Ruvoy 明文下吞吐 `+146%`、p99 `−48%`，TLS 下 `+181%`、`−54
 - Ruvoy 的 CPU 列包含了同进程内处理 HTTP 的 Envoy worker（约 1.9 核，
   Falcon 约 1.0 核）。按每核计幅度约为 `+29%`，其余来自 Ruby 线程搭配了
   代理级 HTTP 前端。
+- 这里的每个数字都来自「等待时会让出」的应用。用 C 扩展写的驱动会释放解释器锁，
+  却不会让出 fiber，因此一次这样的调用会卡住同一线程上的其它全部请求。
+  `wait50` 与 `block50` 两个场景直接测量这个差异，它们不属于上面这轮 campaign。
 - 另跑过一个 1 MiB 响应场景，但不产生排名：在每秒约 1,000 个该响应以上
   时，四个架构全部收敛到网络路径的吞吐上限，波动达 59–96%，该场景测的是
   链路而不是服务器。
+
+未测量：CPU 密集的 Rack、真实的数据库或 HTTP 客户端驱动、多进程部署。
 
 测量由 `scripts/run-benchmark.sh` 产出，脚本强制执行上述协议——远端发压、
 轮转、预热、逐轮校验和预注册判定——并为每次运行保留原始 oha 输出、CPU 和

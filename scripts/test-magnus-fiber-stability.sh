@@ -41,7 +41,7 @@ done
 [[ "$requests_per_wave" -gt 0 ]] || fail "requests_per_wave must be positive"
 [[ "$concurrency" -gt 0 ]] || fail "concurrency must be positive"
 [[ "$concurrency" -le 1024 ]] || fail "concurrency exceeds runtime limit 1024"
-[[ "$body_bytes" -le 2097152 ]] || fail "body_bytes exceeds the 2 MiB PoC limit"
+[[ "$body_bytes" -le 2097152 ]] || fail "body_bytes exceeds the 2 MiB limit"
 
 if [[ -d "$diagnostic_dir" ]]; then
   find "$diagnostic_dir" -maxdepth 1 -type f \
