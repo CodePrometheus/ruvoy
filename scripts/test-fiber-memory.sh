@@ -369,13 +369,20 @@ read -r -a rss_growth_per_wave <<<"$rss_growth"
 measured_waves="${#rss_growth_per_wave[@]}"
 (( measured_waves > 0 )) || fail "resident memory was never sampled"
 settled_growth="${rss_growth_per_wave[$((measured_waves - 1))]}"
-if (( measured_waves > 1 )); then
-  previous_growth="${rss_growth_per_wave[$((measured_waves - 2))]}"
-else
-  previous_growth="$settled_growth"
-fi
-(( settled_growth <= previous_growth || settled_growth <= 4096 )) ||
-  fail "resident memory grew by ${settled_growth} KiB in the last wave after ${previous_growth} KiB in the one before: that is a leak, not a high-water mark"
+first_growth="${rss_growth_per_wave[0]}"
+
+# Measured against the first wave rather than the wave before it. Two adjacent
+# waves of a curve that has already flattened differ by noise, so comparing
+# them decides on the noise: the same commit produced 11324 then 11608 on one
+# machine and 16148 then 11316 on another, with the same settled value.
+#
+# The first wave is where a high-water mark is paid, so what separates it from
+# a leak is that later waves add a fraction of it while a leak keeps adding the
+# same amount. This bounds a leak larger than a quarter of the startup cost;
+# anything finer is caught by the live-slot assertion above, which counts Ruby
+# objects rather than pages the allocator never returns.
+(( settled_growth <= 4096 || (first_growth > 0 && settled_growth * 4 <= first_growth) )) ||
+  fail "resident memory grew by ${settled_growth} KiB in the last wave against ${first_growth} KiB in the first (per wave: ${rss_growth_per_wave[*]}): that is a leak, not a high-water mark"
 
 stop_envoy || fail "Envoy did not stop after the bounded shutdown sequence"
 envoy_launcher_pid=""
