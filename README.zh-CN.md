@@ -51,7 +51,8 @@ Usage: ruvoy [options] [config.ru]
 ```
 
 要在自己配置的 Envoy 里运行，`--print-config` 会打印 Ruvoy 本来会用的 listener；
-模块名是 `ruvoy_fiber`，它的 filter config 就是 rackup 的路径。
+模块名是 `ruvoy_fiber`，它的 filter config 是 rackup 的路径，或一个包含它的
+JSON 对象（见 [Envoy context 与上游调用](#envoy-context-与上游调用)）。
 
 ## 状态
 
@@ -76,6 +77,8 @@ Envoy 上驱动验证，1 小时 180 万请求的 soak 之后堆、文件描述�
 - **有界准入** — 请求数预算在工作进入 Ruby 之前就拒绝超额部分。
 - **无上游 HTTP hop** — Rack 调用不需要经 loopback 连接到独立的 Ruby 应用
   服务器。
+- **Envoy context 与上游调用** — 可选：应用能看到 Envoy 对请求掌握的路由、
+  连接、TLS 与 metadata，并能在请求内调用 Envoy 的 cluster。
 
 ## 用与不用 Ruvoy
 
@@ -124,6 +127,74 @@ Envoy。
 响应体在响应头已经发出之后才失败时，只能停止：dynamic module 无法重置一个已经
 开始应答的流，因此客户端收到的是一个短响应而不是错误。可能中途失败的应用应当
 自己带上长度或校验值。
+
+## Envoy context 与上游调用
+
+两项可选能力让应用拿到比 Rack 请求更多的 Envoy 信息。两者默认关闭，只有
+filter config 要求时才开启，且只在 fiber 运行时提供。此时配置是一个 JSON 对象：
+
+```json
+{
+  "rackup": "/srv/app/config.ru",
+  "context": { "metadata_namespaces": ["acme.tenant"] },
+  "upstream": { "clusters": ["users"], "timeout_ms": 15000, "max_response_bytes": 1048576 }
+}
+```
+
+### `ruvoy.context`
+
+Envoy 对这个请求的视图，在请求头到达时由 worker 拷贝出来；Ruby 对象只在应用
+读取时才构造。
+
+```ruby
+context = env["ruvoy.context"]
+context.route_name        # => "api", or nil for an unnamed route
+context.connection        # => {"id"=>7, "source_address"=>"10.0.0.7", "source_port"=>51234, ...}
+context.tls               # => nil on plaintext, else {"version"=>"TLSv1.3", "server_name"=>..., "peer_certificate"=>...}
+context.dynamic_metadata  # => {"acme.tenant"=>{"id"=>"t-42"}}, from filters ahead of Ruvoy
+context.route_metadata    # => the same namespaces, from the matched route
+context.to_h              # => all of the above
+```
+
+Envoy 模块接口能报告的内容决定了几条限制：
+
+- 只有路由配置给 route 起了名字，route 才有名字。terminal filter 也需要一个
+  route 条目才能被命名：给它加上 `non_forwarding_action: {}`。
+- `server_name` 是客户端发送的 SNI，只有 listener 配置了 TLS inspector
+  listener filter，Envoy 才会记录它。
+- `peer_certificate` 表示客户端出示了证书。只有在要求客户端证书、且证书须由
+  受信任 CA 签发的 listener 上，它才能作为客户端身份。
+- 只报告第一个 URI 和第一个 DNS subject alternative name。
+- metadata 的值是字符串、数字（一律为 Float）、布尔值及它们组成的列表。嵌套
+  结构会被略过。
+
+### `ruvoy.upstream`
+
+调用 Envoy 配置里的某个 cluster，返回 Rack 风格的三元组：
+
+```ruby
+status, headers, body = env["ruvoy.upstream"].call(
+  "users", "GET", "/users/42",
+  headers: { "accept" => "application/json" }, timeout: 2
+)
+```
+
+调用由该请求所在的 worker 经 cluster 发出，所以 cluster 的连接池、TLS 设置和
+熔断器都会生效，`x-envoy-retry-on` 这类请求头可以让 Envoy 重试。发起调用的
+fiber 等待时不占用运行时线程，其他请求照常服务，同一请求里的多个调用可以重叠。
+重复的响应头以 Array 返回。
+
+- 只能调用 `upstream.clusters` 里列出的 cluster，其他 cluster 会抛
+  `ArgumentError`。
+- 调用进行中由 Envoy 自己生成的回复按普通响应返回：超时为 504，上游连不上
+  或中途断开为 503。
+- 调用发不出去时抛 `Ruvoy::UpstreamError`：cluster 不存在，或者 cluster 当场
+  拒绝了调用，例如没有健康主机、熔断器已打开。响应体超过
+  `max_response_bytes`、请求在调用完成前已经结束时也会抛出。
+- 响应整体缓冲，所以 `max_response_bytes` 限定了单次调用在内存里能占用的大小。
+
+[`examples/extensions`](examples/extensions) 用一个替身服务把两项能力都跑一遍，
+包括同一请求里两次调用的重叠。
 
 ## 扩展
 

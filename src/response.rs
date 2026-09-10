@@ -29,7 +29,8 @@ pub struct ResponseHead {
     pub status: u16,
     /// Response headers, repeated names preserved.
     pub headers: Vec<(String, String)>,
-    /// `object_id` of the Ruby thread that ran the application.
+    /// `object_id` of the Ruby thread that ran the application; zero for a
+    /// response Envoy brought back from an upstream call.
     pub ruby_thread_object_id: u64,
 }
 

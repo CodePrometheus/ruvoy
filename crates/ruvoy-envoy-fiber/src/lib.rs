@@ -2,8 +2,10 @@
 
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 
+mod context;
 mod metrics;
 mod runtime;
+mod upstream;
 mod worker;
 
 declare_init_functions!(init, new_http_filter_config_fn);

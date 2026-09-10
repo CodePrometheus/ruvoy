@@ -15,6 +15,10 @@ pub struct Request {
     pub headers: Vec<(String, Vec<u8>)>,
     /// Connection facts the Rack environment needs.
     pub metadata: RequestMetadata,
+    /// Envoy's view of the request, when the filter exposes it.
+    pub context: Option<crate::Context>,
+    /// The way to call upstream clusters, when the filter allows it.
+    pub upstreams: Option<crate::Upstreams>,
     /// Runs a collection before the application is called.
     pub force_gc: bool,
     /// Stage timings, collected only when diagnostics are enabled.
@@ -35,6 +39,8 @@ impl Request {
             body_stream: None,
             headers: Vec::new(),
             metadata: RequestMetadata::default(),
+            context: None,
+            upstreams: None,
             force_gc: false,
             diagnostics: None,
         }

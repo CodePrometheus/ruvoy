@@ -284,6 +284,7 @@ impl Prepared {
             body_reader: *self.body_reader,
             ruby_thread_object_id: self.info.ruby_thread_object_id,
             concurrency: Concurrency::Serial,
+            extensions: false,
         }
     }
 }

@@ -1,20 +1,23 @@
 use crate::{
+    context,
     metrics::{
         Metrics, OUTCOME_CANCELLED, OUTCOME_COMPLETED, OUTCOME_FAILED, REJECTED_ADMISSION,
         REJECTED_INTERNAL, REJECTED_INVALID_REQUEST,
     },
-    runtime::FiberRackConfig,
+    runtime::{ContextConfig, FiberRackConfig},
+    upstream::{self, InFlight},
 };
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use ruvoy::{
-    Request, RequestDiagnostics, RequestMetadata, ResponseHead, ResponseStream, StreamHandle,
-    StreamItem, StreamWaker, fiber::FiberRuntimeClient,
+    BridgeError, Request, RequestDiagnostics, RequestMetadata, ResponseHead, ResponseStream,
+    StreamHandle, StreamItem, StreamWaker, UpstreamSettings, Upstreams, fiber::FiberRuntimeClient,
 };
 use std::{sync::Arc, time::Instant};
 
 const RESPONSE_EVENT_ID: u64 = 1;
 const REQUEST_EVENT_ID: u64 = 2;
+const UPSTREAM_EVENT_ID: u64 = 3;
 
 /// Caps what one body may hold in memory between Envoy and Ruby, in either
 /// direction. Beyond this the producing side is asked to wait, so a body of any
@@ -52,6 +55,10 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FiberRackConfig {
             state: FilterState::Collecting,
             metrics: self.metrics(),
             submitted_at: None,
+            context: self.context(),
+            upstream_settings: self.upstream(),
+            upstreams: None,
+            upstream_calls: InFlight::default(),
         }))
     }
 }
@@ -80,6 +87,14 @@ struct FiberRackFilter {
     state: FilterState,
     metrics: Option<Metrics>,
     submitted_at: Option<Instant>,
+    /// What to copy into `ruvoy.context`, when the filter exposes it.
+    context: Option<Arc<ContextConfig>>,
+    /// Which clusters the application may call, when the filter allows any.
+    upstream_settings: Option<Arc<UpstreamSettings>>,
+    /// Where the application queues its calls, once the request is submitted.
+    upstreams: Option<Upstreams>,
+    /// Calls sent to Envoy and not yet answered.
+    upstream_calls: InFlight,
 }
 
 impl Drop for FiberRackFilter {
@@ -87,6 +102,23 @@ impl Drop for FiberRackFilter {
         // The downstream is gone, so tell Ruby to stop enumerating the body.
         if let Some(stream) = self.stream.take() {
             stream.cancel();
+        }
+        // Envoy cancels what it sent without reporting back, so every fiber
+        // still waiting on a call hears it from here.
+        let unsent = self
+            .upstreams
+            .take()
+            .map(|upstreams| upstreams.close())
+            .unwrap_or_default();
+        let waiting = unsent
+            .into_iter()
+            .map(|request| request.response)
+            .chain(self.upstream_calls.drain().map(|(_, response)| response));
+        for response in waiting {
+            response.push_failure(BridgeError::Upstream(
+                "the request finished before the call did".to_owned(),
+            ));
+            self.client.wake_body(response);
         }
     }
 }
@@ -129,6 +161,11 @@ impl FiberRackFilter {
             body_stream: None,
             headers,
             metadata,
+            context: self
+                .context
+                .as_deref()
+                .map(|config| context::copy(envoy_filter, config)),
+            upstreams: None,
             force_gc: false,
             diagnostics: stage_timing_requested.then(|| RequestDiagnostics::new(received_at)),
         })
@@ -215,6 +252,15 @@ impl FiberRackFilter {
         );
         self.request_body = Some(request_handle.clone());
         request.body_stream = Some(request_handle);
+        if let Some(settings) = self.upstream_settings.clone() {
+            let upstream_scheduler = envoy_filter.new_scheduler();
+            let upstreams = Upstreams::new(
+                settings,
+                Arc::new(move || upstream_scheduler.commit(UPSTREAM_EVENT_ID)),
+            );
+            self.upstreams = Some(upstreams.clone());
+            request.upstreams = Some(upstreams);
+        }
         let stream = Arc::new(ResponseStream::new(MAX_BUFFERED_BODY_BYTES));
         // The waker only signals; the worker thread does every Envoy call when
         // the scheduled event arrives.
@@ -403,6 +449,18 @@ impl FiberRackFilter {
             }
         }
     }
+
+    /// Sends the calls the application queued since the last event.
+    fn send_upstream_calls<EHF: EnvoyHttpFilter>(&mut self, envoy_filter: &mut EHF) {
+        let Some(upstreams) = self.upstreams.as_ref() else {
+            return;
+        };
+        for request in upstreams.take_queued() {
+            if let Some(refused) = upstream::send(envoy_filter, request, &mut self.upstream_calls) {
+                self.client.wake_body(refused);
+            }
+        }
+    }
 }
 
 impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
@@ -452,6 +510,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
             // The runtime took bytes out of the request queue, so there is room
             // for more of what Envoy has been holding back.
             REQUEST_EVENT_ID => self.forward_request_body(envoy_filter),
+            UPSTREAM_EVENT_ID => self.send_upstream_calls(envoy_filter),
             RESPONSE_EVENT_ID
                 if matches!(self.state, FilterState::Waiting | FilterState::Streaming) =>
             {
@@ -459,6 +518,25 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
             }
             _ => {}
         }
+    }
+
+    fn on_http_callout_done(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        callout_id: u64,
+        result: envoy_dynamic_module_type_http_callout_result,
+        response_headers: Option<&[(EnvoyBuffer<'_>, EnvoyBuffer<'_>)]>,
+        response_body: Option<&[EnvoyBuffer<'_>]>,
+    ) {
+        let Some(response) = self.upstream_calls.remove(&callout_id) else {
+            return;
+        };
+        let limit = self
+            .upstream_settings
+            .as_ref()
+            .map_or(0, |settings| settings.max_response_bytes);
+        upstream::deliver(&response, result, response_headers, response_body, limit);
+        self.client.wake_body(response);
     }
 
     /// Envoy is done with this stream, however it ended.
@@ -581,7 +659,7 @@ fn copy_body<EHF: EnvoyHttpFilter>(
     copied
 }
 
-fn attribute_string<EHF: EnvoyHttpFilter>(
+pub(crate) fn attribute_string<EHF: EnvoyHttpFilter>(
     envoy_filter: &EHF,
     attribute: envoy_dynamic_module_type_attribute_id,
 ) -> Option<String> {
@@ -591,7 +669,7 @@ fn attribute_string<EHF: EnvoyHttpFilter>(
         .filter(|value| !value.is_empty())
 }
 
-fn authority_host(authority: &str) -> Option<&str> {
+pub(crate) fn authority_host(authority: &str) -> Option<&str> {
     if let Some(rest) = authority.strip_prefix('[') {
         let closing = rest.find(']')?;
         return Some(&authority[..closing + 2]);

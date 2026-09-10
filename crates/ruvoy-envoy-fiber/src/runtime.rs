@@ -1,18 +1,24 @@
 use crate::metrics::Metrics;
 use envoy_proxy_dynamic_modules_rust_sdk::envoy_log_info;
 use ruvoy::{
-    BridgeError,
+    BridgeError, UpstreamSettings,
     fiber::{DEFAULT_MAX_INFLIGHT_REQUESTS, FiberRuntime, FiberRuntimeClient},
 };
 use serde::Deserialize;
 use std::{
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: usize = 10_000;
+
+/// Envoy's own default route timeout.
+const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 15_000;
+
+/// The same bound as every other body Ruvoy holds in memory.
+const DEFAULT_MAX_UPSTREAM_RESPONSE_BYTES: usize = 1024 * 1024;
 
 static PROCESS_RUNTIME: OnceLock<Result<ProcessRuntime, BridgeError>> = OnceLock::new();
 static PROCESS_SHUTDOWN_HOOK: OnceLock<Result<(), BridgeError>> = OnceLock::new();
@@ -22,6 +28,8 @@ pub(crate) struct FiberRackConfig {
     diagnostics_enabled: bool,
     runtime_thread_id: String,
     metrics: Option<Metrics>,
+    context: Option<Arc<ContextConfig>>,
+    upstream: Option<Arc<UpstreamSettings>>,
 }
 
 impl FiberRackConfig {
@@ -29,7 +37,13 @@ impl FiberRackConfig {
         filter_config: &[u8],
         metrics: Option<Metrics>,
     ) -> Result<Self, BridgeError> {
-        let requested = ProcessRuntimeConfig::from_filter_config(filter_config)?;
+        let FilterConfig {
+            rackup,
+            context,
+            upstream,
+        } = FilterConfig::parse(filter_config)?;
+        let upstream = upstream.map(UpstreamConfig::into_settings).transpose()?;
+        let requested = ProcessRuntimeConfig::new(&rackup)?;
         let runtime = process_runtime(requested)?;
         let ready = runtime.ready()?;
 
@@ -38,6 +52,8 @@ impl FiberRackConfig {
             diagnostics_enabled: runtime.config.diagnostics_enabled,
             runtime_thread_id: ready.runtime_thread_id.clone(),
             metrics,
+            context: context.map(Arc::new),
+            upstream: upstream.map(Arc::new),
         })
     }
 
@@ -56,6 +72,14 @@ impl FiberRackConfig {
     pub(crate) fn metrics(&self) -> Option<Metrics> {
         self.metrics
     }
+
+    pub(crate) fn context(&self) -> Option<Arc<ContextConfig>> {
+        self.context.clone()
+    }
+
+    pub(crate) fn upstream(&self) -> Option<Arc<UpstreamSettings>> {
+        self.upstream.clone()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,42 +91,110 @@ struct ProcessRuntimeConfig {
 }
 
 /// The filter configuration as a control plane serializes it.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct FilterConfig {
     rackup: String,
+    /// Exposes `ruvoy.context` when present.
+    #[serde(default)]
+    context: Option<ContextConfig>,
+    /// Exposes `ruvoy.upstream` when present.
+    #[serde(default)]
+    upstream: Option<UpstreamConfig>,
 }
 
-/// Reads the rackup path out of the filter configuration.
-///
-/// Control planes deliver the configuration as JSON — either the path on its
-/// own or an object naming it — while a static Envoy configuration may pass the
-/// path unquoted.
-fn rackup_from_filter_config(filter_config: &[u8]) -> Result<String, BridgeError> {
-    let text = std::str::from_utf8(filter_config)
-        .map_err(|_| {
-            BridgeError::Startup("filter configuration must contain valid UTF-8".to_owned())
-        })?
-        .trim();
-    if text.is_empty() {
-        return Err(BridgeError::Startup(
-            "filter configuration must name a rackup file".to_owned(),
-        ));
+/// What `ruvoy.context` carries beyond its fixed fields.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContextConfig {
+    /// Namespaces copied from both dynamic and route metadata.
+    #[serde(default)]
+    pub(crate) metadata_namespaces: Vec<String>,
+}
+
+/// Which clusters `ruvoy.upstream` may call, and on what terms.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct UpstreamConfig {
+    clusters: Vec<String>,
+    #[serde(default = "UpstreamConfig::default_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "UpstreamConfig::default_max_response_bytes")]
+    max_response_bytes: usize,
+}
+
+impl FilterConfig {
+    /// Reads the filter configuration.
+    ///
+    /// Control planes deliver it as JSON — either the rackup path on its own or
+    /// an object naming it — while a static Envoy configuration may pass the
+    /// path unquoted.
+    fn parse(filter_config: &[u8]) -> Result<Self, BridgeError> {
+        let text = std::str::from_utf8(filter_config)
+            .map_err(|_| {
+                BridgeError::Startup("filter configuration must contain valid UTF-8".to_owned())
+            })?
+            .trim();
+        if text.is_empty() {
+            return Err(BridgeError::Startup(
+                "filter configuration must name a rackup file".to_owned(),
+            ));
+        }
+        let rackup_only = |rackup: String| Self {
+            rackup,
+            context: None,
+            upstream: None,
+        };
+        if !text.starts_with(['{', '"']) {
+            return Ok(rackup_only(text.to_owned()));
+        }
+        if let Ok(rackup) = serde_json::from_str::<String>(text) {
+            return Ok(rackup_only(rackup));
+        }
+        serde_json::from_str::<Self>(text)
+            .map_err(|error| BridgeError::Startup(format!("invalid filter configuration: {error}")))
     }
-    if !text.starts_with(['{', '"']) {
-        return Ok(text.to_owned());
+}
+
+impl UpstreamConfig {
+    fn default_timeout_ms() -> u64 {
+        DEFAULT_UPSTREAM_TIMEOUT_MS
     }
-    if let Ok(rackup) = serde_json::from_str::<String>(text) {
-        return Ok(rackup);
+
+    fn default_max_response_bytes() -> usize {
+        DEFAULT_MAX_UPSTREAM_RESPONSE_BYTES
     }
-    serde_json::from_str::<FilterConfig>(text)
-        .map(|config| config.rackup)
-        .map_err(|error| BridgeError::Startup(format!("invalid filter configuration: {error}")))
+
+    /// Refuses settings under which no call could ever succeed.
+    fn into_settings(self) -> Result<UpstreamSettings, BridgeError> {
+        let invalid = |message: &str| {
+            Err(BridgeError::Startup(format!(
+                "invalid filter configuration: {message}"
+            )))
+        };
+        if self.clusters.is_empty() {
+            return invalid("upstream.clusters must name at least one cluster");
+        }
+        if self.clusters.iter().any(String::is_empty) {
+            return invalid("upstream.clusters must not contain an empty name");
+        }
+        if self.timeout_ms == 0 {
+            return invalid("upstream.timeout_ms must be positive");
+        }
+        if self.max_response_bytes == 0 {
+            return invalid("upstream.max_response_bytes must be positive");
+        }
+        Ok(UpstreamSettings {
+            clusters: self.clusters,
+            timeout: Duration::from_millis(self.timeout_ms),
+            max_response_bytes: self.max_response_bytes,
+        })
+    }
 }
 
 impl ProcessRuntimeConfig {
-    fn from_filter_config(filter_config: &[u8]) -> Result<Self, BridgeError> {
-        let rackup = canonical_rackup(rackup_from_filter_config(filter_config)?)?;
+    fn new(rackup: &str) -> Result<Self, BridgeError> {
+        let rackup = canonical_rackup(rackup)?;
         let max_inflight_requests =
             positive_env_usize("RUVOY_MAX_INFLIGHT_REQUESTS", DEFAULT_MAX_INFLIGHT_REQUESTS)?;
         let shutdown_timeout_ms =
@@ -315,6 +407,10 @@ fn positive_env_usize(name: &str, default: usize) -> Result<usize, BridgeError> 
 mod tests {
     use super::*;
 
+    fn rackup(encoding: &str) -> Result<String, BridgeError> {
+        FilterConfig::parse(encoding.as_bytes()).map(|config| config.rackup)
+    }
+
     #[test]
     fn filter_config_accepts_json_and_plain_paths() {
         let expected = "/srv/app/config.ru";
@@ -325,7 +421,7 @@ mod tests {
             "  /srv/app/config.ru  ",
         ] {
             assert_eq!(
-                rackup_from_filter_config(encoding.as_bytes()).as_deref(),
+                rackup(encoding).as_deref(),
                 Ok(expected),
                 "failed to read {encoding}"
             );
@@ -334,10 +430,70 @@ mod tests {
 
     #[test]
     fn filter_config_rejects_empty_and_malformed_json() {
-        assert!(rackup_from_filter_config(b"").is_err());
-        assert!(rackup_from_filter_config(b"   ").is_err());
-        assert!(rackup_from_filter_config(br#"{"rackup": 7}"#).is_err());
-        assert!(rackup_from_filter_config(br#"{"rack_up": "/a"}"#).is_err());
+        assert!(rackup("").is_err());
+        assert!(rackup("   ").is_err());
+        assert!(rackup(r#"{"rackup": 7}"#).is_err());
+        assert!(rackup(r#"{"rack_up": "/a"}"#).is_err());
+    }
+
+    #[test]
+    fn extensions_stay_off_unless_configured() {
+        for encoding in [r#"/a"#, r#"{"rackup": "/a"}"#] {
+            let config = FilterConfig::parse(encoding.as_bytes()).expect("a valid configuration");
+            assert_eq!(config.context, None, "{encoding}");
+            assert_eq!(config.upstream, None, "{encoding}");
+        }
+    }
+
+    #[test]
+    fn extension_settings_take_their_documented_defaults() {
+        let config = FilterConfig::parse(
+            br#"{"rackup": "/a", "context": {}, "upstream": {"clusters": ["users"]}}"#,
+        )
+        .expect("a valid configuration");
+
+        assert_eq!(config.context, Some(ContextConfig::default()));
+        assert_eq!(
+            config.upstream.map(UpstreamConfig::into_settings),
+            Some(Ok(UpstreamSettings {
+                clusters: vec!["users".to_owned()],
+                timeout: Duration::from_secs(15),
+                max_response_bytes: 1024 * 1024,
+            }))
+        );
+    }
+
+    #[test]
+    fn upstream_settings_no_call_could_use_are_refused() {
+        for encoding in [
+            r#"{"rackup": "/a", "upstream": {"clusters": []}}"#,
+            r#"{"rackup": "/a", "upstream": {"clusters": [""]}}"#,
+            r#"{"rackup": "/a", "upstream": {"clusters": ["users"], "timeout_ms": 0}}"#,
+            r#"{"rackup": "/a", "upstream": {"clusters": ["users"], "max_response_bytes": 0}}"#,
+        ] {
+            let config = FilterConfig::parse(encoding.as_bytes()).expect("well-formed JSON");
+            assert!(
+                config
+                    .upstream
+                    .map(UpstreamConfig::into_settings)
+                    .is_some_and(|settings| settings.is_err()),
+                "{encoding} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn misspelled_extension_fields_are_rejected() {
+        for encoding in [
+            r#"{"rackup": "/a", "context": {"metadata_namespace": []}}"#,
+            r#"{"rackup": "/a", "upstream": {"cluster": ["users"]}}"#,
+            r#"{"rackup": "/a", "upstreams": {"clusters": ["users"]}}"#,
+        ] {
+            assert!(
+                FilterConfig::parse(encoding.as_bytes()).is_err(),
+                "{encoding}"
+            );
+        }
     }
 
     #[test]

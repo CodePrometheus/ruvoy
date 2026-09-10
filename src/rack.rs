@@ -3,6 +3,7 @@
 use crate::{
     BridgeError, Request, RequestDiagnostics, Response, ResponseHead, StreamHandle, StreamItem,
     error::ruby_error,
+    extensions::{ContextObject, UpstreamObject},
 };
 use magnus::{IntoValue, RArray, RClass, RHash, RString, Ruby, Value, prelude::*, r_hash::ForEach};
 use std::time::{Duration, Instant};
@@ -82,6 +83,9 @@ pub(crate) struct CallContext {
     pub(crate) body_reader: Value,
     pub(crate) ruby_thread_object_id: u64,
     pub(crate) concurrency: Concurrency,
+    /// Whether the runtime defines the Ruby side of `ruvoy.context` and
+    /// `ruvoy.upstream`; the serial runtime, a diagnostic control, does not.
+    pub(crate) extensions: bool,
 }
 
 /// Runs the application and collects its body into one response.
@@ -195,6 +199,7 @@ fn build_env(
         string_io_class,
         rack_errors,
         concurrency,
+        extensions,
         ..
     } = context;
     let runtime_started_at = Instant::now();
@@ -206,6 +211,8 @@ fn build_env(
         body_stream,
         headers,
         metadata,
+        context: envoy_context,
+        upstreams,
         force_gc,
         diagnostics,
     } = request;
@@ -233,6 +240,20 @@ fn build_env(
     set(env, "rack.multiprocess", false)?;
     set(env, "rack.run_once", false)?;
     set(env, "ruvoy.force_gc", force_gc)?;
+    if let Some(envoy_context) = envoy_context.filter(|_| extensions) {
+        set(
+            env,
+            "ruvoy.context",
+            ruby.obj_wrap(ContextObject(envoy_context)),
+        )?;
+    }
+    if let Some(upstreams) = upstreams.filter(|_| extensions) {
+        set(
+            env,
+            "ruvoy.upstream",
+            ruby.obj_wrap(UpstreamObject(upstreams)),
+        )?;
+    }
 
     for (name, value) in headers {
         if let Some(key) = env_header_name(&name) {

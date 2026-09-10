@@ -211,6 +211,7 @@ impl FiberBridge {
             body_reader,
             ruby_thread_object_id: bridge.ruby_thread_object_id,
             concurrency: Concurrency::Interleaved,
+            extensions: true,
         };
         let sink = ruby.obj_wrap(StreamSink {
             handle: call.handle.clone(),
@@ -793,6 +794,7 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
         .and_then(|_| sink_class.define_method("writable?", method!(StreamSink::writable, 0)))
         .and_then(|_| sink_class.define_method("cancelled?", method!(StreamSink::cancelled, 0)))
         .map_err(|error| ruby_error("defining StreamSink methods", error))?;
+    crate::extensions::define(ruby, ruvoy_module)?;
 
     let app = BoxValue::new(load_fiber_app(ruby, app)?);
     let rack_errors = BoxValue::new(

@@ -12,14 +12,18 @@
 
 mod budget;
 mod concurrency;
+mod context;
 mod error;
 pub mod host;
 mod request;
 mod response;
 mod stream;
+mod upstream;
 
 // A loom build models the concurrent primitives on their own; the runtimes
 // drive a Ruby VM, which loom cannot schedule.
+#[cfg(not(loom))]
+mod extensions;
 #[cfg(not(loom))]
 pub mod fiber;
 #[cfg(not(loom))]
@@ -33,10 +37,12 @@ mod wake;
 
 pub use crate::{
     budget::{Budget, Lease},
+    context::{Connection, Context, MetadataValue, Namespace, PeerCertificate, Tls},
     error::BridgeError,
     request::{Request, RequestDiagnostics, RequestMetadata},
     response::{Response, ResponseHead},
     stream::{ResponseStream, StreamHandle, StreamItem, StreamWaker, Wakeups},
+    upstream::{UpstreamRequest, UpstreamSettings, Upstreams},
 };
 
 #[cfg(not(loom))]

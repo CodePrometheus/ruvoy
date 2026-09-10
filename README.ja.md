@@ -54,7 +54,8 @@ Usage: ruvoy [options] [config.ru]
 ```
 
 自分で構成した Envoy の下で動かす場合、`--print-config` が Ruvoy の使う listener を
-出力します。モジュール名は `ruvoy_fiber`、その filter config は rackup のパスです。
+出力します。モジュール名は `ruvoy_fiber`、その filter config は rackup のパス、またはそれを
+含む JSON オブジェクトです（[Envoy コンテキストと上流呼び出し](#envoy-コンテキストと上流呼び出し) を参照）。
 
 ## ステータス
 
@@ -83,6 +84,9 @@ Usage: ruvoy [options] [config.ru]
   到達する前に拒否されます。
 - **上流 HTTP ホップなし** — Rack 呼び出しに、別プロセスの Ruby アプリ
   ケーションサーバーへの loopback 接続は不要です。
+- **Envoy コンテキストと上流呼び出し** — オプションで、Envoy がリクエストに
+  ついて持つ route、コネクション、TLS、metadata をアプリケーションから参照でき、
+  リクエストの中から Envoy の cluster を呼び出せます。
 
 ## Ruvoy を使う場合と使わない場合
 
@@ -138,6 +142,83 @@ Envoy に属します。
 だけです。dynamic module は応答を開始したストリームをリセットできないため、
 クライアントにはエラーではなく短いボディが届きます。途中で失敗しうるアプリケー
 ションは、自前で長さやチェックサムを添えてください。
+
+## Envoy コンテキストと上流呼び出し
+
+Rack リクエストが運ぶ以上の Envoy の情報をアプリケーションに渡す、2 つの
+オプション機能です。どちらも filter config で求めない限り無効で、fiber
+ランタイムでのみ使えます。その場合、設定は JSON オブジェクトになります。
+
+```json
+{
+  "rackup": "/srv/app/config.ru",
+  "context": { "metadata_namespaces": ["acme.tenant"] },
+  "upstream": { "clusters": ["users"], "timeout_ms": 15000, "max_response_bytes": 1048576 }
+}
+```
+
+### `ruvoy.context`
+
+リクエストに対する Envoy の見え方です。ヘッダーが届いた時点で worker が
+コピーし、Ruby の値はアプリケーションが読んだときにだけ作られます。
+
+```ruby
+context = env["ruvoy.context"]
+context.route_name        # => "api", or nil for an unnamed route
+context.connection        # => {"id"=>7, "source_address"=>"10.0.0.7", "source_port"=>51234, ...}
+context.tls               # => nil on plaintext, else {"version"=>"TLSv1.3", "server_name"=>..., "peer_certificate"=>...}
+context.dynamic_metadata  # => {"acme.tenant"=>{"id"=>"t-42"}}, from filters ahead of Ruvoy
+context.route_metadata    # => the same namespaces, from the matched route
+context.to_h              # => all of the above
+```
+
+Envoy のモジュールインターフェースが報告できる範囲から、いくつかの制約が
+あります。
+
+- route に名前が付くのは、route 設定で名前を与えた場合だけです。terminal
+  filter でも名前を付けるには route エントリが必要です。
+  `non_forwarding_action: {}` を指定してください。
+- `server_name` はクライアントが送った SNI で、listener に TLS inspector の
+  listener filter を設定したときにだけ Envoy が記録します。
+- `peer_certificate` はクライアントが証明書を提示したことを示します。クライ
+  アント証明書を必須とし、信頼できる CA による署名を要求する listener で
+  のみ、クライアントの身元として扱えます。
+- 報告されるのは最初の URI と最初の DNS の subject alternative name だけです。
+- metadata の値は文字列、数値（常に Float）、真偽値、およびそれらのリスト
+  です。入れ子の構造は含まれません。
+
+### `ruvoy.upstream`
+
+Envoy に設定された cluster を呼び出し、Rack 形式の 3 要素配列を返します。
+
+```ruby
+status, headers, body = env["ruvoy.upstream"].call(
+  "users", "GET", "/users/42",
+  headers: { "accept" => "application/json" }, timeout: 2
+)
+```
+
+呼び出しはリクエストの worker が cluster 経由で送るため、cluster のコネク
+ションプール、TLS 設定、サーキットブレーカーが適用され、`x-envoy-retry-on`
+などのヘッダーで Envoy にリトライさせられます。呼び出し中の fiber はランタ
+イムスレッドを占有せずに待つので、他のリクエストは処理され続け、1 つの
+リクエストからの複数の呼び出しは並行します。重複したレスポンスヘッダーは
+Array で返ります。
+
+- 呼び出せるのは `upstream.clusters` に列挙した cluster だけで、それ以外は
+  `ArgumentError` になります。
+- 呼び出しの途中で Envoy 自身が返す応答は通常のレスポンスとして返ります。
+  タイムアウトは 504、上流に接続できないか途中で切断された場合は 503 です。
+- 呼び出しを送れなかったときは `Ruvoy::UpstreamError` が発生します。cluster
+  が存在しない場合や、健全なホストがない・サーキットブレーカーが開いている
+  などで cluster がその場で拒否した場合です。レスポンスボディが
+  `max_response_bytes` を超えたとき、呼び出しより先にリクエストが終わった
+  ときも発生します。
+- レスポンスは丸ごとバッファされるので、`max_response_bytes` が 1 回の呼び
+  出しが占有できるメモリの上限になります。
+
+[`examples/extensions`](examples/extensions) では、代わりのサービスを相手に両方
+の機能を動かし、1 つのリクエストからの 2 つの呼び出しが並行する様子も確認できます。
 
 ## スケーリング
 

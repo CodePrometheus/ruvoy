@@ -72,6 +72,8 @@ impl SyncRackFilter {
             body_stream: None,
             headers,
             metadata: Default::default(),
+            context: None,
+            upstreams: None,
             force_gc: false,
             diagnostics: None,
         }

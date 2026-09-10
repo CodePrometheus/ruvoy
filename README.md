@@ -54,7 +54,8 @@ Usage: ruvoy [options] [config.ru]
 
 To run it under an Envoy you configure yourself, `--print-config` prints the
 listener Ruvoy would have used; the module is `ruvoy_fiber` and its filter
-config is the path to the rackup.
+config is the path to the rackup, or a JSON object naming it (see
+[Envoy context and upstream calls](#envoy-context-and-upstream-calls)).
 
 ## Status
 
@@ -83,6 +84,9 @@ threads flat. Interfaces may change.
   reaches Ruby.
 - **No upstream HTTP hop** — Rack calls do not require a loopback connection to
   a separate Ruby application server.
+- **Envoy context and upstream calls** — optionally, the application sees the
+  route, connection, TLS and metadata Envoy has for the request, and calls
+  Envoy's clusters from inside it.
 
 ## With and without Ruvoy
 
@@ -137,6 +141,82 @@ A response body that fails after its headers are already on the wire can only
 stop: a dynamic module cannot reset a stream it has started answering, so the
 client receives a short body rather than an error. Applications that can fail
 partway through should send their own length or checksum.
+
+## Envoy context and upstream calls
+
+Two optional capabilities give the application more of Envoy than a Rack
+request carries. Both stay off unless the filter configuration asks for them,
+and both are available on the fiber runtime only. The configuration is then a
+JSON object:
+
+```json
+{
+  "rackup": "/srv/app/config.ru",
+  "context": { "metadata_namespaces": ["acme.tenant"] },
+  "upstream": { "clusters": ["users"], "timeout_ms": 15000, "max_response_bytes": 1048576 }
+}
+```
+
+### `ruvoy.context`
+
+Envoy's view of the request, copied on the worker when the headers arrive.
+Ruby values are only built when the application reads them.
+
+```ruby
+context = env["ruvoy.context"]
+context.route_name        # => "api", or nil for an unnamed route
+context.connection        # => {"id"=>7, "source_address"=>"10.0.0.7", "source_port"=>51234, ...}
+context.tls               # => nil on plaintext, else {"version"=>"TLSv1.3", "server_name"=>..., "peer_certificate"=>...}
+context.dynamic_metadata  # => {"acme.tenant"=>{"id"=>"t-42"}}, from filters ahead of Ruvoy
+context.route_metadata    # => the same namespaces, from the matched route
+context.to_h              # => all of the above
+```
+
+What Envoy's module interface can report sets some limits:
+
+- A route has a name only if the route configuration gives it one. A terminal
+  filter still needs a route entry to be named: give it
+  `non_forwarding_action: {}`.
+- `server_name` is the SNI the client sent, which Envoy records only when the
+  listener has the TLS inspector listener filter.
+- `peer_certificate` means the client presented a certificate. It identifies
+  the client only on a listener that requires client certificates signed by a
+  trusted CA.
+- Only the first URI and the first DNS subject alternative name are reported.
+- Metadata values are strings, numbers (always Float), booleans and lists of
+  those. Nested structures are left out.
+
+### `ruvoy.upstream`
+
+Calls a cluster Envoy was configured with and returns a Rack-style triple:
+
+```ruby
+status, headers, body = env["ruvoy.upstream"].call(
+  "users", "GET", "/users/42",
+  headers: { "accept" => "application/json" }, timeout: 2
+)
+```
+
+The request's worker sends the call through the cluster, so the cluster's
+connection pool, TLS settings and circuit breakers apply, and headers such as
+`x-envoy-retry-on` ask Envoy to retry. The calling fiber waits without holding
+the runtime thread, so other requests keep being served and calls made from
+one request overlap. A repeated response header arrives as an Array.
+
+- Only the clusters in `upstream.clusters` can be called; any other raises
+  `ArgumentError`.
+- Answers Envoy produces while the call is under way arrive as ordinary
+  responses: 504 when it timed out, 503 when the upstream could not be reached
+  or hung up.
+- `Ruvoy::UpstreamError` is raised when the call could not be sent: the cluster
+  does not exist, or turned the call away at once because it has no healthy
+  host or a circuit breaker is open. It is also raised when the response body is
+  over `max_response_bytes`, and when the request finished before the call did.
+- Responses are buffered whole, so `max_response_bytes` bounds what one call
+  can hold in memory.
+
+[`examples/extensions`](examples/extensions) runs both against a stand-in
+service, including two calls from one request overlapping.
 
 ## Scaling
 
