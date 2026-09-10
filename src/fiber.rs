@@ -776,11 +776,13 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
         .map_err(|error| ruby_error("defining RequestChunks", error))?;
     chunks_class
         .define_method("next_chunk", method!(rack::RequestChunks::next_chunk, 0))
-        .and_then(|()| chunks_class.define_method("ready?", method!(rack::RequestChunks::ready, 0)))
         .and_then(|()| {
             chunks_class.define_method("finished?", method!(rack::RequestChunks::finished, 0))
         })
         .and_then(|()| chunks_class.define_method("park", method!(rack::RequestChunks::park, 1)))
+        .and_then(|()| {
+            chunks_class.define_method("unpark", method!(rack::RequestChunks::unpark, 0))
+        })
         .map_err(|error| ruby_error("defining RequestChunks methods", error))?;
 
     let sink_class = ruvoy_module

@@ -16,8 +16,8 @@ pub(crate) const STREAMING_BODY_READER_SOURCE: &str =
 
 /// The Ruby-facing half of a request body still arriving from the client.
 ///
-/// Chunks are handed over as owned bytes; `park` returns the `Async::Variable`
-/// the reactor resolves once more of them land.
+/// Chunks are handed over as owned bytes; `park` registers the
+/// `Async::Variable` the reactor resolves once more of them land.
 #[magnus::wrap(class = "Ruvoy::RequestChunks", free_immediately)]
 pub(crate) struct RequestChunks {
     handle: StreamHandle,
@@ -37,21 +37,21 @@ impl RequestChunks {
         }
     }
 
-    /// True when a read would not have to wait: bytes are buffered, or the
-    /// client will send nothing more.
-    pub(crate) fn ready(&self) -> bool {
-        let stream = &self.handle.stream;
-        stream.buffered_bytes() > 0 || stream.is_finished()
-    }
-
     /// True once the client will send nothing more.
     pub(crate) fn finished(&self) -> bool {
         self.handle.stream.is_finished()
     }
 
-    /// Parks the calling fiber on `waiter` until more of the body arrives.
-    pub(crate) fn park(&self, waiter: Value) {
-        self.handle.stream.park(waiter.into());
+    /// Parks the calling fiber on `waiter` until more of the body arrives;
+    /// false when a read would not have to wait, and the fiber must not wait.
+    pub(crate) fn park(&self, waiter: Value) -> bool {
+        self.handle.stream.park(waiter.into())
+    }
+
+    /// Lets go of the waiter of a fiber that stopped waiting without being
+    /// woken.
+    pub(crate) fn unpark(&self) {
+        self.handle.stream.unpark();
     }
 }
 

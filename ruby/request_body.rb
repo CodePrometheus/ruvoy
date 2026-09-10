@@ -64,10 +64,15 @@ Class.new do
       break if yield
 
       variable = Async::Variable.new
-      @chunks.park(variable)
-      # A chunk that landed between the drain above and the park found nobody
-      # waiting, so look again rather than sleep on a wakeup already delivered.
-      variable.wait unless @chunks.ready?
+      # Refused when a chunk landed after the drain above: look again instead.
+      next unless @chunks.park(variable)
+
+      begin
+        variable.wait
+      ensure
+        # A stopped fiber must not leave the reactor a variable nobody holds.
+        @chunks.unpark
+      end
     end
   end
 end

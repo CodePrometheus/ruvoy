@@ -40,8 +40,9 @@ struct ResponseStreamInner {
     paused: bool,
     /// An `Async::Variable` the waiting fiber is parked on.
     ///
-    /// Held as an opaque handle because only the Ruby thread may touch it; the
-    /// fiber blocked on it keeps it reachable from the garbage collector.
+    /// Held as an opaque handle, which the garbage collector cannot see, so it
+    /// is only ever held while a fiber is blocked on the variable and keeping
+    /// it reachable.
     waiter: Option<Opaque<Value>>,
 }
 
@@ -72,10 +73,18 @@ impl ResponseStream {
 
     /// Parks a fiber on `waiter` until the other side makes progress.
     ///
-    /// Called from the Ruby thread only, which is also the only thread that
-    /// takes the handle back out again.
-    pub fn park(&self, waiter: Opaque<Value>) {
-        self.lock().waiter = Some(waiter);
+    /// Refuses, holding nothing, when a read would not have to wait. The check
+    /// shares the lock `push` takes, so progress cannot land between it and the
+    /// store. Called from the Ruby thread only, which is also the only thread
+    /// that takes the handle back out again.
+    #[must_use]
+    pub fn park(&self, waiter: Opaque<Value>) -> bool {
+        let mut inner = self.lock();
+        if inner.buffered_bytes > 0 || inner.ended || inner.cancelled {
+            return false;
+        }
+        inner.waiter = Some(waiter);
+        true
     }
 
     /// Takes the parked fiber's handle, if any.
@@ -242,6 +251,44 @@ impl fmt::Debug for StreamHandle {
         f.debug_struct("StreamHandle")
             .field("stream", &self.stream)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use magnus::value::QUNDEF;
+
+    fn waiter() -> Opaque<Value> {
+        // SAFETY: the value is only stored and taken back, never handed to Ruby.
+        let value = unsafe { QUNDEF.as_value() };
+        Opaque::from(value)
+    }
+
+    #[test]
+    fn parking_is_refused_once_a_read_would_not_wait() {
+        let buffered = ResponseStream::new(64);
+        buffered.push_chunk(vec![0; 4]);
+        let ended = ResponseStream::new(64);
+        ended.push_end();
+        let cancelled = ResponseStream::new(64);
+        cancelled.cancel();
+
+        for stream in [buffered, ended, cancelled] {
+            assert!(
+                !stream.park(waiter()),
+                "{stream:?} should refuse the waiter"
+            );
+            assert!(stream.unpark().is_none(), "{stream:?} should hold nothing");
+        }
+    }
+
+    #[test]
+    fn an_empty_stream_holds_the_waiter_until_it_is_taken() {
+        let stream = ResponseStream::new(64);
+        assert!(stream.park(waiter()));
+        assert!(stream.unpark().is_some());
+        assert!(stream.unpark().is_none());
     }
 }
 
