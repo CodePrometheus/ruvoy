@@ -26,6 +26,8 @@ jobs:
             arch: aarch64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    env:
+      BUNDLE_WITH: test
     steps:
       - uses: actions/checkout@v6
       - uses: ruby/setup-ruby@v1
@@ -43,7 +45,7 @@ jobs:
       # whole packaging exists to prevent, so nothing is published until an
       # installed copy has answered one.
       - name: Install the gems and serve a request through them
-        run: ./scripts/test-packaged-gem.sh
+        run: bundle exec rake e2e:packaged_gem
 
       - uses: actions/upload-artifact@v4
         with:
