@@ -22,7 +22,7 @@ class ConfigLifecycleTest < E2ETestCase
   def test_runtime_outlives_every_configuration_change
     @results = File.join(result_dir, "config-lifecycle-#{run_id}")
     FileUtils.mkdir_p(@results)
-    build_module("build-fiber-module.sh", log: File.join(@results, "build.log"))
+    build_module("fiber", log: File.join(@results, "build.log"))
     @lds = File.join(scratch_dir, "lds.yaml")
     @envoy_log = File.join(@results, "envoy.log")
     secondary_rackup = File.join(root, "bench", "config.ru")

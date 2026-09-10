@@ -10,6 +10,8 @@ require "rbconfig"
 require "socket"
 require "tmpdir"
 require "uri"
+require_relative "../../tasks/build"
+require_relative "../../tasks/lockfile"
 require_relative "support/envoy"
 require_relative "support/throttled_upload"
 
@@ -46,32 +48,20 @@ class E2ETestCase < Minitest::Test
         "BUNDLE_FROZEN" => "true" }
     end
 
-    def lockfile
-      Bundler::LockfileParser.new(File.read(File.join(ROOT, "Gemfile.lock")))
-    end
-
     def locked_version(gem_name)
-      spec = lockfile.specs.find { |candidate| candidate.name == gem_name }
-      raise ArgumentError, "gem #{gem_name} is not in Gemfile.lock" unless spec
-
-      spec.version.to_s
+      Lockfile.version(gem_name)
     end
 
     def bundler_version
-      lockfile.bundler_version.to_s
+      Lockfile.bundler_version
     end
 
-    # The scripts take the Ruby and the profile from the environment.
-    def run_script(script, log:)
-      env = { "RUVOY_RUBY" => RbConfig.ruby, "RUVOY_BUILD_PROFILE" => build_profile }
-      ran = Bundler.with_unbundled_env do
-        system(env, File.join(ROOT, "scripts", script), out: [ log, "a" ], err: [ :child, :out ], chdir: ROOT)
-      end
-      raise "#{script} failed; see #{log}" unless ran
+    def build_module(kind, log:)
+      Build.envoy_module(kind, profile: build_profile, ruby: RbConfig.ruby, log: log)
     end
 
-    def build_module(script, log:)
-      run_script(script, log: log)
+    def check_worker_boundary(log:)
+      Build.check_worker_boundary(log: log)
     end
 
     def admin_stat(port, name)

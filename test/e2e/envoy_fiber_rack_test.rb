@@ -89,8 +89,8 @@ class EnvoyFiberRackTest < E2ETestCase
            "envoy_package=#{Envoy::PACKAGE}", "envoy_sdk_commit=#{SDK_COMMIT}", "ruby_version=#{RUBY_VERSION}",
            "async_version=#{locked_version("async")}", "rustc=#{IO.popen(%w[rustc --version], &:read).strip}",
            "host=#{IO.popen(%w[uname -srm], &:read).strip}")
-    build_module("build-fiber-module.sh", log: @log)
-    run_script("check-worker-boundary.sh", log: @log)
+    build_module("fiber", log: @log)
+    check_worker_boundary(log: @log)
     system("uvx", "--from", Envoy::PACKAGE, "envoy", "--version", out: [ @log, "a" ], err: [ :child, :out ])
   end
 

@@ -82,8 +82,8 @@ class EnvoySyncRackTest < E2ETestCase
     record("run_id=#{run_id}", "envoy_package=#{Envoy::PACKAGE}", "envoy_sdk_commit=#{SDK_COMMIT}",
            "ruby_version=#{RUBY_VERSION}", "build_profile=#{build_profile}",
            "rustc=#{IO.popen(%w[rustc --version], &:read).strip}", "host=#{IO.popen(%w[uname -srm], &:read).strip}")
-    build_module("build-sync-module.sh", log: @log)
-    run_script("check-worker-boundary.sh", log: @log)
+    build_module("sync", log: @log)
+    check_worker_boundary(log: @log)
     system("uvx", "--from", Envoy::PACKAGE, "envoy", "--version", out: [ @log, "a" ], err: [ :child, :out ])
   end
 

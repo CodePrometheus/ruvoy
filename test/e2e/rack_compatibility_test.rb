@@ -28,7 +28,7 @@ class RackCompatibilityTest < E2ETestCase
       File.write(config, template.sub("value: bench/config.ru", "value: #{fixture_rackup}"))
       raise "failed to configure the Rack fixture" unless File.read(config).include?("value: #{fixture_rackup}")
 
-      build_module("build-fiber-module.sh", log: File.join(scratch_dir, "build.log"))
+      build_module("fiber", log: File.join(scratch_dir, "build.log"))
       log = File.join(scratch_dir, "envoy.log")
       Envoy.start(config: config, modules: module_dir, log: log, env: bundle_env).tap do |envoy|
         Minitest.after_run { envoy.stop }

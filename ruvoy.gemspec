@@ -46,7 +46,7 @@ Gem::Specification.new do |spec|
 
   # A platform build carries the module for the ABIs it was built against; the
   # plain gem carries only the command line, which then looks for the module in
-  # a source checkout. Built by scripts/build-gem.sh.
+  # a source checkout. Built by `rake build:gem`.
   #
   # Envoy is not here. It ships as ruvoy-envoy, versioned by the Envoy release
   # it carries, so a security fix reaches users without waiting for a release

@@ -258,7 +258,7 @@ Four honest qualifications:
 Not measured: CPU-bound Rack, real database or HTTP-client drivers, and
 multi-process deployment.
 
-Measurements were produced by `scripts/run-benchmark.sh`, which enforces the
+Measurements were produced by `bench/run.rb`, which enforces the
 protocol above — remote load generation, rotation, warm-up, per-round
 validation, and the pre-registered judgement — and writes raw oha output,
 CPU and RSS samples, and the generated summary for every run.

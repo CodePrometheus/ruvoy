@@ -29,7 +29,7 @@ class ResponseStreamingTest < E2ETestCase
     def start_envoy
       raise "TCP port #{PORT} is already in use" unless port_free?(PORT)
 
-      build_module("build-fiber-module.sh", log: File.join(results, "build.log"))
+      build_module("fiber", log: File.join(results, "build.log"))
       config = File.join(scratch_dir, "streaming.yaml")
       File.write(config, listener_config)
       log = File.join(results, "envoy.log")

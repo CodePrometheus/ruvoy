@@ -129,7 +129,7 @@ class FiberMemoryTest < E2ETestCase
     lines += settings.map { |key, value| "#{key}=#{value}" }
     lines += [ "envoy_package=#{Envoy::PACKAGE}", "oha=#{IO.popen([ oha, "--version" ], &:read).strip}", "" ]
     File.write(log, lines.join("\n"))
-    build_module("build-fiber-module.sh", log: log)
+    build_module("fiber", log: log)
   end
 
   def start_envoy

@@ -16,6 +16,8 @@ env:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      BUNDLE_WITH: test
     steps:
       - uses: actions/checkout@v6
       - uses: ruby/setup-ruby@v1
@@ -32,7 +34,7 @@ jobs:
       - run: cargo doc --no-deps --workspace
         env:
           RUSTDOCFLAGS: -D warnings
-      - run: scripts/check-worker-boundary.sh
+      - run: bundle exec rake check:worker_boundary
 
   # Model checking explores thread interleavings, so it runs on its own with the
   # loom cfg rather than as part of the normal test job.
@@ -65,7 +67,6 @@ jobs:
           bundler-cache: true
       - run: bundle exec rubocop
       - run: ruby -c ruby/*.rb crates/*/ruby/*.rb
-      - run: bash -n scripts/*.sh
       # Turns raw measurements into every number this project publishes.
       - run: bundle exec rake e2e:summarize
       # The whole installed interface.
@@ -89,10 +90,7 @@ jobs:
         with:
           key: e2e
       - uses: astral-sh/setup-uv@v6
-      - run: sudo apt-get update && sudo apt-get install --yes lsof
-      # The suites look for a developer's Ruby install unless told otherwise.
-      - run: echo "RUVOY_RUBY=$(command -v ruby)" >> "$GITHUB_ENV"
-      - run: scripts/install-oha.sh
+      - run: bundle exec rake tools:oha
       - run: bundle exec rake e2e:envoy_fiber_rack
       - run: bundle exec rake e2e:fiber_backpressure
       - run: bundle exec rake e2e:response_streaming

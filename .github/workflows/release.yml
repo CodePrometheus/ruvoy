@@ -36,10 +36,9 @@ jobs:
           bundler-cache: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install --yes lsof
 
       - name: Build both gems
-        run: ./scripts/build-gem.sh
+        run: bundle exec rake build:gem
 
       # A gem that installs and cannot serve a request is the failure this
       # whole packaging exists to prevent, so nothing is published until an

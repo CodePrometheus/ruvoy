@@ -17,7 +17,7 @@ class EnvoyBaselineTest < E2ETestCase
     File.write(log, [ "run_id=#{run_id}", "envoy_package=#{Envoy::PACKAGE}", "envoy_sdk_commit=#{SDK_COMMIT}",
                       "rustc=#{IO.popen(%w[rustc --version], &:read).strip}",
                       "host=#{IO.popen(%w[uname -srm], &:read).strip}", "" ].join("\n"))
-    build_module("build-modules.sh", log: log)
+    build_module("baseline", log: log)
     system("uvx", "--from", Envoy::PACKAGE, "envoy", "--version", out: [ log, "a" ], err: [ :child, :out ])
 
     envoy_log = File.join(scratch_dir, "envoy.log")

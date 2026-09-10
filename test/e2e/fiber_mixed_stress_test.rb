@@ -144,8 +144,8 @@ class FiberMixedStressTest < E2ETestCase
 
   def preflight
     log = File.join(@results, "preflight.log")
-    build_module("build-fiber-module.sh", log: log)
-    run_script("check-worker-boundary.sh", log: log)
+    build_module("fiber", log: log)
+    check_worker_boundary(log: log)
   end
 
   def start_envoy

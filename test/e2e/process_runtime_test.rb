@@ -17,7 +17,7 @@ class ProcessRuntimeTest < E2ETestCase
 
     def prepared
       @prepared ||= begin
-        build_module("build-fiber-module.sh", log: File.join(results, "build.log"))
+        build_module("fiber", log: File.join(results, "build.log"))
         true
       end
     end

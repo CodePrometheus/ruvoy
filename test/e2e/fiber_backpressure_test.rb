@@ -35,8 +35,8 @@ class FiberBackpressureTest < E2ETestCase
         log = File.join(results, "preflight.log")
         File.write(log, [ "run_id=#{run_id}", "envoy_package=#{Envoy::PACKAGE}", "ruby_version=#{RUBY_VERSION}",
                           "rustc=#{IO.popen(%w[rustc --version], &:read).strip}", "" ].join("\n"))
-        build_module("build-fiber-module.sh", log: log)
-        run_script("check-worker-boundary.sh", log: log)
+        build_module("fiber", log: log)
+        check_worker_boundary(log: log)
         true
       end
     end
