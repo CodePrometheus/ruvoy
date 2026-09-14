@@ -54,6 +54,42 @@ jobs:
         env:
           RUSTFLAGS: --cfg loom
 
+  rails:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: bench
+          POSTGRES_PASSWORD: bench
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BUNDLE_WITH: test
+      RUVOY_RAILS_DATABASE_URL: postgres://bench:bench@127.0.0.1/ruvoy_rails_app
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rails
+      - uses: astral-sh/setup-uv@v6
+      - run: bundle install
+        env:
+          BUNDLE_GEMFILE: ${{ github.workspace }}/test/fixtures/rails_app/Gemfile
+          BUNDLE_PATH: ${{ github.workspace }}/vendor/bundle
+      - run: bundle exec rake e2e:rails_app
+
   ruby:
     runs-on: ubuntu-latest
     # RuboCop lives in an optional group, so every step has to opt into it.

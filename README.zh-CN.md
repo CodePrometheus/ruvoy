@@ -121,7 +121,9 @@ Ruvoy 构建 Rack 环境、提供二进制 `rack.input`、保留重复的响应�
 
 请求体同样是流式的：请求头一到就调用应用，应用通过 `rack.input` 边到边读，
 上传与处理因此重叠。应用还没读走的部分留在 Envoy 里，Envoy 会暂停从客户端
-读取直到腾出空间。不支持裸 socket 劫持（`rack.hijack`），连接始终属于
+读取直到腾出空间。应用读过的部分会保留下来，128 KiB 以内放内存，超出放临时
+文件，所以 `rack.input` 可以倒回重读，照顾那些按早期 Rack 版本编写的框架。不支持
+裸 socket 劫持（`rack.hijack`），连接始终属于
 Envoy。
 
 响应体在响应头已经发出之后才失败时，只能停止：dynamic module 无法重置一个已经
@@ -153,6 +155,22 @@ rows = DATABASE.call { connection.sync_exec(sql) }
   程，而不是调用方。
 - 驱动有调度器友好的 API 时优先用它。`offload` 每次调用要占一个线程，不给上限时
   不做任何限流。
+
+## Rails
+
+Rails 应用无需改动即可运行，只需加上所有 fiber 服务器都需要的一项设置：
+
+```ruby
+config.active_support.isolation_level = :fiber
+```
+
+Active Record 默认按线程分配连接，而每个请求的 fiber 都跑在同一个运行时线程上，
+所以不加这项设置，并发请求会共用同一个连接；加上之后，每个在途请求各持一个连接。
+
+- 不支持 Action Cable：它需要 `rack.hijack`。
+- 请求经 Envoy 到达 Rails，Envoy 会在转交的请求上加上 `X-Forwarded-Proto`。
+- `test/e2e/rails_app_test.rb` 把一个 production 模式的 Rails 8.1 应用同时跑在
+  Ruvoy 和参照服务器上，逐条比对响应，并检查并发下与事务中途客户端断开时的连接行为。
 
 ## Envoy context 与上游调用
 

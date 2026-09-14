@@ -145,13 +145,27 @@ pub(crate) fn call_streaming(
     handle: &StreamHandle,
     sink: Value,
 ) -> Result<(), BridgeError> {
+    let build = build_env(ruby, context, request)?;
+    let result = respond(context, &build, handle, sink);
+    if let Some(input) = build.streaming_input {
+        // Releases a body kept in a temporary file now, not when the collector gets to it.
+        let _ = input.funcall::<_, _, Value>("close", ());
+    }
+    result
+}
+
+fn respond(
+    context: &CallContext,
+    build: &EnvBuild,
+    handle: &StreamHandle,
+    sink: Value,
+) -> Result<(), BridgeError> {
     let &CallContext {
         app,
         body_reader,
         ruby_thread_object_id,
         ..
     } = context;
-    let build = build_env(ruby, context, request)?;
 
     let rack_call_started_at = Instant::now();
     let rack_response = app
@@ -164,7 +178,7 @@ pub(crate) fn call_streaming(
         mut headers,
         body: response_body,
     } = response_parts(&rack_response)?;
-    headers.extend(stage_timing_headers(&build, rack_call_time, Duration::ZERO));
+    headers.extend(stage_timing_headers(build, rack_call_time, Duration::ZERO));
     if !handle.stream.push_head(ResponseHead {
         status,
         headers,
@@ -185,6 +199,9 @@ pub(crate) fn call_streaming(
 
 struct EnvBuild {
     env: RHash,
+    /// The input over a body still arriving, which the runtime closes once the
+    /// request is done.
+    streaming_input: Option<Value>,
     diagnostics: Option<RequestDiagnostics>,
     runtime_queue_time: Option<Duration>,
     rack_input_time: Duration,
@@ -262,14 +279,18 @@ fn build_env(
     }
 
     let rack_input_started_at = Instant::now();
-    let rack_input = match body_stream {
-        Some(handle) => streaming_input(ruby, context, handle)?,
-        None => collected_input(ruby, string_io_class, &body)?,
+    let (rack_input, closed_after) = match body_stream {
+        Some(handle) => {
+            let input = streaming_input(ruby, context, handle)?;
+            (input, Some(input))
+        }
+        None => (collected_input(ruby, string_io_class, &body)?, None),
     };
     set(env, "rack.input", rack_input)?;
 
     Ok(EnvBuild {
         env,
+        streaming_input: closed_after,
         diagnostics,
         runtime_queue_time,
         rack_input_time: rack_input_started_at.elapsed(),

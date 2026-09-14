@@ -44,6 +44,8 @@ namespace :e2e do
   end
 end
 
+# The Rails suite needs PostgreSQL and a bundle of its own, so it runs only as
+# e2e:rails_app.
 Rake::TestTask.new(:e2e) do |task|
-  task.test_files = FileList["test/e2e/*_test.rb"]
+  task.test_files = FileList["test/e2e/*_test.rb"].exclude("test/e2e/rails_app_test.rb")
 end

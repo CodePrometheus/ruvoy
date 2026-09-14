@@ -4,6 +4,7 @@
 
 require_relative "app"
 
+use RewindProbe
 use Rack::Lint
 use RackCompatibilityMiddleware
 run RackCompatibilityApp.new

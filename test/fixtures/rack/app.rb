@@ -1,5 +1,32 @@
 # frozen_string_literal: true
 
+require "digest"
+
+# Reads the body, rewinds and reads it again, the way frameworks written for
+# earlier Rack versions do. It sits outside Rack::Lint, whose input wrapper
+# offers no rewind.
+class RewindProbe
+  def initialize(app)
+    @app = app
+  end
+
+  def call(env)
+    return @app.call(env) unless env["PATH_INFO"] == "/rewind"
+
+    input = env["rack.input"]
+    head = input.read(16).to_s
+    input.rewind
+    whole = input.read.to_s
+    input.rewind
+    lines = +"".b
+    while (line = input.gets)
+      lines << line
+    end
+    body = [ whole.bytesize, Digest::SHA256.hexdigest(whole), lines == whole, head == whole.byteslice(0, 16) ].join(" ")
+    [ 200, { "content-type" => "text/plain" }, [ body ] ]
+  end
+end
+
 class RackCompatibilityMiddleware
   def initialize(app)
     @app = app

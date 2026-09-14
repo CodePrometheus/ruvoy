@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "digest"
 require_relative "test_helper"
 
 # One Rack::Lint application served by the fiber runtime and by Puma: whatever
@@ -9,6 +10,9 @@ class RackCompatibilityTest < E2ETestCase
   CONTROL_PORT = 19184
   PUMA_PORT = 19210
   READY_TIMEOUT = 15
+  # The larger body outgrows what the input keeps in memory and moves to a file.
+  REWOUND_BODIES = { "kept in memory" => Random.new(2).bytes(1024),
+                     "kept in a file" => Random.new(3).bytes(5 * 1024 * 1024) }.freeze
 
   class << self
     def ruvoy
@@ -69,6 +73,28 @@ class RackCompatibilityTest < E2ETestCase
   end
 
   # Fibers interleave app.call, so the fiber runtime must not claim exclusivity.
+  def test_rack_input_can_be_read_again_after_a_rewind
+    { "Ruvoy" => [ self.class.ruvoy, FIBER_PORT ], "Puma" => [ self.class.puma, PUMA_PORT ] }.each do |name, (_, port)|
+      REWOUND_BODIES.each do |kept, body|
+        response = http_post(url(port, "/rewind"), body, "content-type" => "application/octet-stream")
+        assert_equal "200", response.code, "#{name}, #{kept}: #{response.body}"
+        assert_equal "#{body.bytesize} #{Digest::SHA256.hexdigest(body)} true true", response.body, "#{name}, #{kept}"
+      end
+    end
+  end
+
+  def test_a_body_kept_in_a_file_releases_it_with_the_request
+    proxy = self.class.ruvoy.proxy_pid
+    descriptors = -> { Dir.children("/proc/#{proxy}/fd").size }
+    http_post(url(FIBER_PORT, "/rewind"), REWOUND_BODIES["kept in a file"], "content-type" => "application/octet-stream")
+    before = descriptors.call
+    10.times do
+      http_post(url(FIBER_PORT, "/rewind"), REWOUND_BODIES["kept in a file"], "content-type" => "application/octet-stream")
+    end
+
+    assert_operator descriptors.call, :<=, before + 2, "every request kept in a file must close it when it ends"
+  end
+
   def test_ruvoy_reports_multithread
     self.class.ruvoy
     assert_includes http_get(url(FIBER_PORT, "/rack-env")).body.lines(chomp: true), "rack.multithread=true"

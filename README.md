@@ -134,7 +134,10 @@ stops the enumeration and closes the body.
 Request bodies stream as well: the application is called once the headers
 arrive and reads through `rack.input` as the body lands, so uploading and
 processing overlap. What the application has not read yet waits in Envoy, which
-stops reading from the client until there is room again. Raw socket hijacking
+stops reading from the client until there is room again. What it has read is
+kept, in memory up to 128 KiB and in a temporary file beyond that, so
+`rack.input` can be rewound and read again, as frameworks written for earlier
+Rack versions expect. Raw socket hijacking
 (`rack.hijack`) is not supported; the connection always belongs to Envoy.
 
 A response body that fails after its headers are already on the wire can only
@@ -173,6 +176,26 @@ rows = DATABASE.call { connection.sync_exec(sql) }
   per-thread connection, belongs to that thread rather than to the caller.
 - Prefer a driver's scheduler-aware API where it has one. `offload` costs a
   thread per call and bounds nothing unless given a limit.
+
+## Rails
+
+Rails applications run unchanged, with one setting every fiber server needs:
+
+```ruby
+config.active_support.isolation_level = :fiber
+```
+
+Active Record hands out connections per thread by default, and every
+request's fiber runs on the one runtime thread, so without it concurrent
+requests share a single connection. With it, each request in flight holds a
+connection of its own.
+
+- Action Cable is not supported: it needs `rack.hijack`.
+- Requests reach Rails through Envoy, which adds `X-Forwarded-Proto` to what
+  it passes on.
+- `test/e2e/rails_app_test.rb` runs a production Rails 8.1 application on
+  Ruvoy and on a reference server, compares every answer, and checks
+  connections under concurrency and when a client leaves mid-transaction.
 
 ## Envoy context and upstream calls
 
