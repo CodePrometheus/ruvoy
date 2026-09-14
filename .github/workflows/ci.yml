@@ -101,6 +101,7 @@ jobs:
       - run: bundle exec rake e2e:fiber_runtime
       - run: bundle exec rake e2e:fiber_memory
       - run: bundle exec rake e2e:envoy_extensions
+      - run: bundle exec rake e2e:fiber_offload
       # What the suites measured, on the run's own page: a pass says nothing
       # about how much slack the numbers had.
       - if: always()

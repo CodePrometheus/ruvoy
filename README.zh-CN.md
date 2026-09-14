@@ -128,6 +128,32 @@ Envoy。
 开始应答的流，因此客户端收到的是一个短响应而不是错误。可能中途失败的应用应当
 自己带上长度或校验值。
 
+## 阻塞调用
+
+只有当 fiber 等待的调用配合 Ruby 的 fiber 调度器时，它才能不占用运行时线程地
+等待：Ruby 自己的 socket 与 IO、`sleep`，以及许多驱动提供的异步 API 都是如此。
+而在内核里阻塞的 C 扩展调用会占住所有请求共用的那一个线程，请求只能排队：
+这类 50ms 的调用，无论多少客户端在等，每秒大约只能服务 20 个请求。
+
+`Ruvoy.offload` 把这样的调用放到它自己的 Ruby 线程上执行，发起调用的 fiber 在一旁等待：
+
+```ruby
+rows = Ruvoy.offload { connection.sync_exec(sql) }
+
+# At most 16 in flight; callers beyond that wait their turn.
+DATABASE = Ruvoy::Offload.new(limit: 16)
+rows = DATABASE.call { connection.sync_exec(sql) }
+```
+
+- 它对阻塞时释放 GVL 的扩展有效，阻塞型 C 调用通常都是这样写的。阻塞时仍持有
+  GVL 的扩展会卡住所有线程，Ruby 这一侧无能为力。
+- 调用无法被中途切断。调用方被打断时（客户端断开或超时触发），它仍会等调用结束
+  才退出，因此调用正在使用的连接不会在使用中被还回去。
+- 代码块在另一个线程上运行，所以线程局部状态（例如按线程分配的连接）属于那个线
+  程，而不是调用方。
+- 驱动有调度器友好的 API 时优先用它。`offload` 每次调用要占一个线程，不给上限时
+  不做任何限流。
+
 ## Envoy context 与上游调用
 
 两项可选能力让应用拿到比 Rack 请求更多的 Envoy 信息。两者默认关闭，只有

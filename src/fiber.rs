@@ -41,6 +41,9 @@ const FIBER_RUNNER_SOURCE: &str = include_str!("../ruby/fiber_runner.rb");
 /// Rack input over a body that is still arriving.
 const REQUEST_BODY_SOURCE: &str = include_str!("../ruby/request_body.rb");
 
+/// Moves blocking calls off the runtime thread.
+const OFFLOAD_SOURCE: &str = include_str!("../ruby/offload.rb");
+
 enum FiberApp {
     Source(String),
     Rackup(PathBuf),
@@ -746,6 +749,7 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
         "stringio",
         "io/wait",
         "async",
+        "async/semaphore",
         "async/variable",
     ] {
         ruby.eval::<magnus::Value>(&format!("require {feature:?}"))
@@ -795,6 +799,8 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
         .and_then(|_| sink_class.define_method("cancelled?", method!(StreamSink::cancelled, 0)))
         .map_err(|error| ruby_error("defining StreamSink methods", error))?;
     crate::extensions::define(ruby, ruvoy_module)?;
+    ruby.eval::<Value>(OFFLOAD_SOURCE)
+        .map_err(|error| ruby_error("loading Ruvoy.offload", error))?;
 
     let app = BoxValue::new(load_fiber_app(ruby, app)?);
     let rack_errors = BoxValue::new(

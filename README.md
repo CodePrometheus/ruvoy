@@ -142,6 +142,38 @@ stop: a dynamic module cannot reset a stream it has started answering, so the
 client receives a short body rather than an error. Applications that can fail
 partway through should send their own length or checksum.
 
+## Blocking calls
+
+A fiber waits without holding the runtime thread only when the call it waits
+on cooperates with Ruby's fiber scheduler: Ruby's own sockets and IO, `sleep`,
+and the asynchronous APIs many drivers offer do. A C extension call that
+blocks in the kernel instead holds the one thread every request shares, so
+requests queue behind it: fifty-millisecond calls of that kind serve about
+twenty requests a second however many clients wait.
+
+`Ruvoy.offload` runs such a call on its own Ruby thread while the calling
+fiber waits:
+
+```ruby
+rows = Ruvoy.offload { connection.sync_exec(sql) }
+
+# At most 16 in flight; callers beyond that wait their turn.
+DATABASE = Ruvoy::Offload.new(limit: 16)
+rows = DATABASE.call { connection.sync_exec(sql) }
+```
+
+- It helps extensions that release the GVL while they block, which is how
+  blocking C calls are normally written. One that holds the GVL stalls every
+  thread, and nothing on the Ruby side helps.
+- A call cannot be cut short. When the caller is interrupted, because its
+  client went away or a timeout fired, it still waits for the call to finish
+  before it unwinds, so a connection the call is using is not handed back
+  while in use.
+- The block runs on another thread, so thread-local state, such as a
+  per-thread connection, belongs to that thread rather than to the caller.
+- Prefer a driver's scheduler-aware API where it has one. `offload` costs a
+  thread per call and bounds nothing unless given a limit.
+
 ## Envoy context and upstream calls
 
 Two optional capabilities give the application more of Envoy than a Rack
