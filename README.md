@@ -193,6 +193,9 @@ connection of its own.
 - Action Cable is not supported: it needs `rack.hijack`.
 - Requests reach Rails through Envoy, which adds `X-Forwarded-Proto` to what
   it passes on.
+- Envoy serves static files ahead of the application, so
+  `config.public_file_server.enabled = false` spares Rails a filesystem lookup
+  on every request: about a fifth more throughput on small responses here.
 - `test/e2e/rails_app_test.rb` runs a production Rails 8.1 application on
   Ruvoy and on a reference server, compares every answer, and checks
   connections under concurrency and when a client leaves mid-transaction.
