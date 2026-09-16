@@ -5,8 +5,15 @@ use crate::{
     error::ruby_error,
     extensions::{ContextObject, UpstreamObject},
 };
-use magnus::{IntoValue, RArray, RClass, RHash, RString, Ruby, Value, prelude::*, r_hash::ForEach};
-use std::time::{Duration, Instant};
+use magnus::{
+    IntoValue, RArray, RClass, RHash, RString, Ruby, Value, gc, prelude::*, r_hash::ForEach,
+    value::Opaque,
+};
+use std::{
+    collections::HashMap,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 /// Collects a Rack body into one buffer; used by the serial runtime.
 pub(crate) const BODY_READER_SOURCE: &str = include_str!("../ruby/rack_body_reader.rb");
@@ -240,25 +247,26 @@ fn build_env(
     let (path_info, query_string) = path.split_once('?').unwrap_or((&path, ""));
 
     let env = ruby.hash_new();
-    set(env, "REQUEST_METHOD", method)?;
-    set(env, "SCRIPT_NAME", "")?;
-    set(env, "PATH_INFO", path_info)?;
-    set(env, "QUERY_STRING", query_string)?;
-    set(env, "SERVER_NAME", metadata.server_name)?;
-    set(env, "SERVER_PORT", metadata.server_port.to_string())?;
-    set(env, "SERVER_PROTOCOL", metadata.protocol)?;
-    set(env, "HTTP_HOST", metadata.authority)?;
+    set(ruby, env, "REQUEST_METHOD", method)?;
+    set(ruby, env, "SCRIPT_NAME", "")?;
+    set(ruby, env, "PATH_INFO", path_info)?;
+    set(ruby, env, "QUERY_STRING", query_string)?;
+    set(ruby, env, "SERVER_NAME", metadata.server_name)?;
+    set(ruby, env, "SERVER_PORT", metadata.server_port.to_string())?;
+    set(ruby, env, "SERVER_PROTOCOL", metadata.protocol)?;
+    set(ruby, env, "HTTP_HOST", metadata.authority)?;
     if let Some(remote_addr) = metadata.remote_addr {
-        set(env, "REMOTE_ADDR", remote_addr)?;
+        set(ruby, env, "REMOTE_ADDR", remote_addr)?;
     }
-    set(env, "rack.url_scheme", metadata.scheme)?;
-    set(env, "rack.errors", rack_errors)?;
-    set(env, "rack.multithread", concurrency.multithread())?;
-    set(env, "rack.multiprocess", false)?;
-    set(env, "rack.run_once", false)?;
-    set(env, "ruvoy.force_gc", force_gc)?;
+    set(ruby, env, "rack.url_scheme", metadata.scheme)?;
+    set(ruby, env, "rack.errors", rack_errors)?;
+    set(ruby, env, "rack.multithread", concurrency.multithread())?;
+    set(ruby, env, "rack.multiprocess", false)?;
+    set(ruby, env, "rack.run_once", false)?;
+    set(ruby, env, "ruvoy.force_gc", force_gc)?;
     if let Some(envoy_context) = envoy_context.filter(|_| extensions) {
         set(
+            ruby,
             env,
             "ruvoy.context",
             ruby.obj_wrap(ContextObject(envoy_context)),
@@ -266,15 +274,17 @@ fn build_env(
     }
     if let Some(upstreams) = upstreams.filter(|_| extensions) {
         set(
+            ruby,
             env,
             "ruvoy.upstream",
             ruby.obj_wrap(UpstreamObject(upstreams)),
         )?;
     }
 
+    let mut header_key = String::new();
     for (name, value) in headers {
-        if let Some(key) = env_header_name(&name) {
-            set(env, &key, ruby.str_from_slice(&value))?;
+        if let Some(key) = env_header_key(&name, &mut header_key) {
+            set(ruby, env, key, ruby.str_from_slice(&value))?;
         }
     }
 
@@ -286,7 +296,7 @@ fn build_env(
         }
         None => (collected_input(ruby, string_io_class, &body)?, None),
     };
-    set(env, "rack.input", rack_input)?;
+    set(ruby, env, "rack.input", rack_input)?;
 
     Ok(EnvBuild {
         env,
@@ -329,9 +339,82 @@ fn streaming_input(
         .map_err(|error| ruby_error("creating rack.input", error))
 }
 
-fn set(env: RHash, key: &str, value: impl IntoValue) -> Result<(), BridgeError> {
-    env.aset(key, value)
-        .map_err(|error| ruby_error(&format!("setting {key}"), error))
+/// Environment keys as interned strings, built once.
+///
+/// A key string handed to `Hash#[]=` is deduplicated against the interned
+/// table anyway, so a fresh one spends an allocation per key per request
+/// while the interned string spends none.
+struct EnvKeys(HashMap<&'static str, Opaque<RString>>);
+
+/// The keys every request carries, plus the header keys common enough to be
+/// worth interning up front. A key outside this list still works; it is the
+/// fresh string the other path avoids.
+const INTERNED_KEYS: &[&str] = &[
+    "CONTENT_LENGTH",
+    "CONTENT_TYPE",
+    "HTTP_ACCEPT",
+    "HTTP_ACCEPT_ENCODING",
+    "HTTP_ACCEPT_LANGUAGE",
+    "HTTP_AUTHORIZATION",
+    "HTTP_CACHE_CONTROL",
+    "HTTP_CONNECTION",
+    "HTTP_COOKIE",
+    "HTTP_HOST",
+    "HTTP_IF_MODIFIED_SINCE",
+    "HTTP_IF_NONE_MATCH",
+    "HTTP_ORIGIN",
+    "HTTP_RANGE",
+    "HTTP_REFERER",
+    "HTTP_USER_AGENT",
+    "HTTP_X_FORWARDED_FOR",
+    "HTTP_X_FORWARDED_PROTO",
+    "HTTP_X_REQUEST_ID",
+    "PATH_INFO",
+    "QUERY_STRING",
+    "REMOTE_ADDR",
+    "REQUEST_METHOD",
+    "SCRIPT_NAME",
+    "SERVER_NAME",
+    "SERVER_PORT",
+    "SERVER_PROTOCOL",
+    "rack.errors",
+    "rack.input",
+    "rack.multiprocess",
+    "rack.multithread",
+    "rack.run_once",
+    "rack.url_scheme",
+    "ruvoy.context",
+    "ruvoy.force_gc",
+    "ruvoy.upstream",
+];
+
+static ENV_KEYS: OnceLock<EnvKeys> = OnceLock::new();
+
+/// Interned strings outlive every request, so the table is built once and
+/// shared by both runtimes.
+fn env_keys(ruby: &Ruby) -> &'static EnvKeys {
+    ENV_KEYS.get_or_init(|| {
+        EnvKeys(
+            INTERNED_KEYS
+                .iter()
+                .map(|&key| {
+                    let interned = ruby.str_new(key).to_interned_str();
+                    // The interned table holds its strings weakly, and this one
+                    // is reachable only from Rust.
+                    gc::register_mark_object(interned);
+                    (key, Opaque::from(interned))
+                })
+                .collect(),
+        )
+    })
+}
+
+fn set(ruby: &Ruby, env: RHash, key: &str, value: impl IntoValue) -> Result<(), BridgeError> {
+    let written = match env_keys(ruby).0.get(key) {
+        Some(&interned) => env.aset(ruby.get_inner(interned), value),
+        None => env.aset(key, value),
+    };
+    written.map_err(|error| ruby_error(&format!("setting {key}"), error))
 }
 
 struct ResponseParts {
@@ -392,17 +475,23 @@ fn copy_headers(headers: RHash) -> Result<Vec<(String, String)>, BridgeError> {
 /// Maps an HTTP header name onto its Rack environment key.
 ///
 /// Pseudo-headers have no Rack representation and are dropped.
-fn env_header_name(name: &str) -> Option<String> {
-    let lowercase = name.to_ascii_lowercase();
-    match lowercase.as_str() {
-        name if name.starts_with(':') => None,
-        "content-type" => Some("CONTENT_TYPE".to_owned()),
-        "content-length" => Some("CONTENT_LENGTH".to_owned()),
-        _ => Some(format!(
-            "HTTP_{}",
-            lowercase.replace('-', "_").to_ascii_uppercase()
-        )),
+fn env_header_key<'a>(name: &str, key: &'a mut String) -> Option<&'a str> {
+    if name.starts_with(':') {
+        return None;
     }
+    key.clear();
+    if name.eq_ignore_ascii_case("content-type") {
+        key.push_str("CONTENT_TYPE");
+    } else if name.eq_ignore_ascii_case("content-length") {
+        key.push_str("CONTENT_LENGTH");
+    } else {
+        key.push_str("HTTP_");
+        key.extend(name.chars().map(|character| match character {
+            '-' => '_',
+            _ => character.to_ascii_uppercase(),
+        }));
+    }
+    Some(key)
 }
 
 fn stage_timing_headers(
@@ -451,18 +540,40 @@ fn stage_timing_headers(
 
 #[cfg(test)]
 mod tests {
-    use super::env_header_name;
+    use super::{INTERNED_KEYS, env_header_key};
 
     #[test]
     fn header_names_map_onto_rack_keys() {
-        assert_eq!(env_header_name(":method"), None);
+        let mut key = String::new();
+        assert_eq!(env_header_key(":method", &mut key), None);
         assert_eq!(
-            env_header_name("Content-Type").as_deref(),
+            env_header_key("Content-Type", &mut key),
             Some("CONTENT_TYPE")
         );
         assert_eq!(
-            env_header_name("X-Ruvoy-Test").as_deref(),
+            env_header_key("content-length", &mut key),
+            Some("CONTENT_LENGTH")
+        );
+        assert_eq!(
+            env_header_key("X-Ruvoy-Test", &mut key),
             Some("HTTP_X_RUVOY_TEST")
         );
+    }
+
+    #[test]
+    fn a_reused_buffer_carries_nothing_from_the_header_before_it() {
+        let mut key = String::new();
+        env_header_key("X-A-Very-Long-Header-Name", &mut key);
+
+        assert_eq!(env_header_key("X-Short", &mut key), Some("HTTP_X_SHORT"));
+    }
+
+    #[test]
+    fn interned_keys_are_unique() {
+        let mut keys = INTERNED_KEYS.to_vec();
+        keys.sort_unstable();
+        keys.dedup();
+
+        assert_eq!(keys.len(), INTERNED_KEYS.len());
     }
 }
