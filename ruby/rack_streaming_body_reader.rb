@@ -7,12 +7,20 @@ lambda do |body, sink|
 
   begin
     body.each do |chunk|
-      until sink.writable?
-        break if sink.cancelled?
+      offset = 0
+      # The sink takes no more than the queue has room for, so a chunk larger
+      # than the budget goes over in slices.
+      while offset < chunk.bytesize
+        until sink.writable?
+          return if sink.cancelled?
 
-        sleep 0.001
+          sleep 0.001
+        end
+        taken = sink.write(chunk, offset)
+        return if taken.nil?
+
+        offset += taken
       end
-      break unless sink.write(chunk)
     end
   ensure
     body.close if body.respond_to?(:close)

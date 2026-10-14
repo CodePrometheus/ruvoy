@@ -141,6 +141,26 @@ impl ResponseStream {
         self.push(StreamItem::Chunk(chunk))
     }
 
+    /// Queues as much of `bytes` as the queue has room for and returns how many
+    /// it took, so a body larger than the budget is handed over in slices
+    /// instead of held whole. `None` once the stream is cancelled.
+    pub fn push_chunk_within_budget(&self, bytes: &[u8]) -> Option<usize> {
+        let mut inner = self.lock();
+        if inner.cancelled {
+            return None;
+        }
+        let taken = bytes
+            .len()
+            .min(self.max_buffered_bytes.saturating_sub(inner.buffered_bytes));
+        if taken > 0 {
+            inner.buffered_bytes += taken;
+            inner
+                .items
+                .push_back(StreamItem::Chunk(bytes[..taken].to_vec()));
+        }
+        Some(taken)
+    }
+
     /// Marks the body complete. Returns `false` once the stream is cancelled.
     pub fn push_end(&self) -> bool {
         self.push(StreamItem::End)
@@ -290,6 +310,32 @@ mod tests {
         assert!(stream.unpark().is_some());
         assert!(stream.unpark().is_none());
     }
+
+    #[test]
+    fn a_chunk_larger_than_the_budget_is_taken_in_slices() {
+        let stream = ResponseStream::new(4);
+        let body = b"abcdefghij";
+
+        assert_eq!(stream.push_chunk_within_budget(body), Some(4));
+        assert_eq!(stream.push_chunk_within_budget(&body[4..]), Some(0));
+        assert_eq!(stream.buffered_bytes(), 4);
+
+        let Some(StreamItem::Chunk(first)) = stream.take_next() else {
+            panic!("the first slice should be queued");
+        };
+        assert_eq!(first, b"abcd");
+        assert_eq!(stream.push_chunk_within_budget(&body[4..]), Some(4));
+        assert_eq!(stream.buffered_bytes(), 4);
+    }
+
+    #[test]
+    fn a_cancelled_stream_takes_nothing() {
+        let stream = ResponseStream::new(4);
+        stream.cancel();
+
+        assert_eq!(stream.push_chunk_within_budget(b"abc"), None);
+        assert_eq!(stream.buffered_bytes(), 0);
+    }
 }
 
 #[cfg(loom)]
@@ -358,6 +404,45 @@ mod loom_tests {
                 assert!(stream.take_next().is_none());
             }
             assert_eq!(stream.buffered_bytes(), 0, "cancel must release the queue");
+        });
+    }
+
+    /// A body sliced into the queue while the worker drains it must never
+    /// take the queue past its budget, and must arrive whole and in order.
+    #[test]
+    fn slices_never_take_the_queue_past_its_budget() {
+        loom::model(|| {
+            let stream = Arc::new(ResponseStream::new(2));
+            let body = vec![1u8, 2, 3, 4, 5];
+
+            let producer = {
+                let stream = Arc::clone(&stream);
+                let body = body.clone();
+                thread::spawn(move || {
+                    let mut offset = 0;
+                    while offset < body.len() {
+                        let taken = stream
+                            .push_chunk_within_budget(&body[offset..])
+                            .expect("nothing cancels this stream");
+                        assert!(stream.buffered_bytes() <= 2, "over the budget");
+                        offset += taken;
+                        if taken == 0 {
+                            thread::yield_now();
+                        }
+                    }
+                })
+            };
+
+            let mut received = Vec::new();
+            while received.len() < body.len() {
+                match stream.take_next() {
+                    Some(StreamItem::Chunk(chunk)) => received.extend(chunk),
+                    Some(_) => unreachable!("only chunks are pushed"),
+                    None => thread::yield_now(),
+                }
+            }
+            producer.join().expect("producer should not panic");
+            assert_eq!(received, body);
         });
     }
 }

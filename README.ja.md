@@ -20,17 +20,17 @@ HTTP を担い、Ruby が Rack を担い、その間を Rust の owned メッセ
 ## インストール
 
 ```console
-$ gem install ruvoy
+$ gem install ruvoy ruvoy-envoy
 ```
 
-gem には動的モジュールと Envoy バイナリが同梱されているため、他に入れるものは
-なく、バージョンを手で合わせる必要もありません。
+`ruvoy` gem には動的モジュールが入っています。Envoy は `ruvoy-envoy` gem か
+マシンのものを使い、`RUVOY_ENVOY`、`ruvoy-envoy`、`PATH` 上の `envoy` の順に探します。
 
 | | |
 |---|---|
 | Ruby | 4.0.x。モジュールはビルド時の Ruby にリンクするため、gem は ABI ごとに公開されます。 |
 | プラットフォーム | Linux `x86_64` と `aarch64`。Envoy が公式バイナリを公開しているものに揃えています。 |
-| Envoy | 同梱（1.39.1、動的モジュール ABI 0.1.0）。個別インストールは不要です。 |
+| Envoy | 1.39（動的モジュール ABI 0.1.0）。`ruvoy-envoy` gem またはマシンのものを使います。 |
 
 ## クイックスタート
 
@@ -269,9 +269,11 @@ Array で返ります。
   タイムアウトは 504、上流に接続できないか途中で切断された場合は 503 です。
 - 呼び出しを送れなかったときは `Ruvoy::UpstreamError` が発生します。cluster
   が存在しない場合や、健全なホストがない・サーキットブレーカーが開いている
-  などで cluster がその場で拒否した場合です。レスポンスボディが
-  `max_response_bytes` を超えたとき、呼び出しより先にリクエストが終わった
-  ときも発生します。
+  などで cluster がその場で拒否した場合です。呼び出しより先にリクエストが
+  終わったときも発生します。
+- レスポンスボディが `max_response_bytes` または Envoy 自身のバッファ上限を
+  超えたときは、そのサブクラス `Ruvoy::UpstreamResponseTooLarge` が発生する
+  ため、呼び出し側は「要求を減らす」と「後で再試行する」を区別できます。
 - レスポンスは丸ごとバッファされるので、`max_response_bytes` が 1 回の呼び
   出しが占有できるメモリの上限になります。
 

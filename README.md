@@ -19,17 +19,18 @@ speaks Rack, and owned Rust messages bridge the two.
 ## Install
 
 ```console
-$ gem install ruvoy
+$ gem install ruvoy ruvoy-envoy
 ```
 
-The gem carries the dynamic module and the Envoy binary, so there is nothing
-else to install and no version to match by hand.
+The `ruvoy` gem carries the dynamic module. Envoy comes from the `ruvoy-envoy`
+gem or the machine: ruvoy looks for `RUVOY_ENVOY`, then `ruvoy-envoy`, then
+`envoy` on `PATH`.
 
 | | |
 |---|---|
 | Ruby | 4.0.x. The module links against the Ruby it was built for, so the gem is published per ABI. |
 | Platform | Linux `x86_64` and `aarch64`, matching the platforms Envoy publishes binaries for. |
-| Envoy | Bundled (1.39.1, dynamic module ABI 0.1.0). Not installed separately. |
+| Envoy | 1.39 (dynamic module ABI 0.1.0), from the `ruvoy-envoy` gem or the machine. |
 
 ## Quickstart
 
@@ -268,8 +269,11 @@ one request overlap. A repeated response header arrives as an Array.
   or hung up.
 - `Ruvoy::UpstreamError` is raised when the call could not be sent: the cluster
   does not exist, or turned the call away at once because it has no healthy
-  host or a circuit breaker is open. It is also raised when the response body is
-  over `max_response_bytes`, and when the request finished before the call did.
+  host or a circuit breaker is open. It is also raised when the request finished
+  before the call did.
+- A response body over `max_response_bytes`, or over Envoy's own buffer limit,
+  raises `Ruvoy::UpstreamResponseTooLarge`, a subclass of `Ruvoy::UpstreamError`,
+  so a caller can tell asking for less apart from trying again later.
 - Responses are buffered whole, so `max_response_bytes` bounds what one call
   can hold in memory.
 

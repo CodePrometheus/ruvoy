@@ -27,6 +27,8 @@ pub enum BridgeError {
     RuntimePanicked(String),
     /// A call the application made to an upstream cluster failed.
     Upstream(String),
+    /// An upstream response was larger than the call may hold.
+    UpstreamTooLarge(String),
 }
 
 impl fmt::Display for BridgeError {
@@ -42,6 +44,7 @@ impl fmt::Display for BridgeError {
             Self::ResponseTimeout => write!(f, "timed out waiting for Ruby runtime"),
             Self::RuntimePanicked(message) => write!(f, "Ruby runtime panicked: {message}"),
             Self::Upstream(message) => write!(f, "upstream call failed: {message}"),
+            Self::UpstreamTooLarge(message) => write!(f, "upstream response too large: {message}"),
         }
     }
 }

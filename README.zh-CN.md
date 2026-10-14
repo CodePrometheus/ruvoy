@@ -19,16 +19,17 @@ Rack，两者之间由 Rust owned 消息桥接。
 ## 安装
 
 ```console
-$ gem install ruvoy
+$ gem install ruvoy ruvoy-envoy
 ```
 
-gem 内含动态模块与 Envoy 二进制，不需要再装别的，也不需要手工对齐版本。
+`ruvoy` gem 内含动态模块。Envoy 来自 `ruvoy-envoy` gem 或机器自带：ruvoy 依次查找
+`RUVOY_ENVOY`、`ruvoy-envoy`、`PATH` 上的 `envoy`。
 
 | | |
 |---|---|
 | Ruby | 4.0.x。模块链接到构建时的那个 Ruby，因此 gem 按 ABI 分别发布。 |
 | 平台 | Linux `x86_64` 与 `aarch64`，与 Envoy 官方发布二进制的平台一致。 |
-| Envoy | 已内置（1.39.1，动态模块 ABI 0.1.0），不单独安装。 |
+| Envoy | 1.39（动态模块 ABI 0.1.0），来自 `ruvoy-envoy` gem 或机器自带。 |
 
 ## 快速开始
 
@@ -235,8 +236,9 @@ fiber 等待时不占用运行时线程，其他请求照常服务，同一请�
 - 调用进行中由 Envoy 自己生成的回复按普通响应返回：超时为 504，上游连不上
   或中途断开为 503。
 - 调用发不出去时抛 `Ruvoy::UpstreamError`：cluster 不存在，或者 cluster 当场
-  拒绝了调用，例如没有健康主机、熔断器已打开。响应体超过
-  `max_response_bytes`、请求在调用完成前已经结束时也会抛出。
+  拒绝了调用，例如没有健康主机、熔断器已打开。请求在调用完成前已经结束时也会抛出。
+- 响应体超过 `max_response_bytes` 或 Envoy 自身的缓冲上限时，抛它的子类
+  `Ruvoy::UpstreamResponseTooLarge`，调用方据此区分「该少要一点」和「稍后重试」。
 - 响应整体缓冲，所以 `max_response_bytes` 限定了单次调用在内存里能占用的大小。
 
 [`examples/extensions`](examples/extensions) 用一个替身服务把两项能力都跑一遍，

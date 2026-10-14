@@ -76,12 +76,12 @@ pub(crate) fn deliver(
             body.unwrap_or_default(),
             max_response_bytes,
         ),
-        envoy_dynamic_module_type_http_callout_result::Reset => {
-            Err("the upstream stream was reset".to_owned())
-        }
-        envoy_dynamic_module_type_http_callout_result::ExceedResponseBufferLimit => {
-            Err("the response exceeded Envoy's buffer limit".to_owned())
-        }
+        envoy_dynamic_module_type_http_callout_result::Reset => Err(BridgeError::Upstream(
+            "the upstream stream was reset".to_owned(),
+        )),
+        envoy_dynamic_module_type_http_callout_result::ExceedResponseBufferLimit => Err(
+            BridgeError::UpstreamTooLarge("the response exceeded Envoy's buffer limit".to_owned()),
+        ),
     };
     match outcome {
         Ok((head, body)) => {
@@ -91,8 +91,8 @@ pub(crate) fn deliver(
             }
             response.push_end();
         }
-        Err(reason) => {
-            response.push_failure(BridgeError::Upstream(reason));
+        Err(error) => {
+            response.push_failure(error);
         }
     }
 }
@@ -101,15 +101,15 @@ fn answer(
     headers: &[(EnvoyBuffer<'_>, EnvoyBuffer<'_>)],
     body: &[EnvoyBuffer<'_>],
     max_response_bytes: usize,
-) -> Result<(ResponseHead, Vec<u8>), String> {
+) -> Result<(ResponseHead, Vec<u8>), BridgeError> {
     let size = body
         .iter()
         .map(|chunk| chunk.as_slice().len())
         .sum::<usize>();
     if size > max_response_bytes {
-        return Err(format!(
+        return Err(BridgeError::UpstreamTooLarge(format!(
             "the {size} byte response body is over the {max_response_bytes} byte limit"
-        ));
+        )));
     }
 
     let mut status = None;
@@ -123,7 +123,8 @@ fn answer(
             fields.push((name.into_owned(), value));
         }
     }
-    let status = status.ok_or_else(|| "the response carried no valid :status".to_owned())?;
+    let status = status
+        .ok_or_else(|| BridgeError::Upstream("the response carried no valid :status".to_owned()))?;
 
     let mut bytes = Vec::with_capacity(size);
     for chunk in body {
@@ -263,17 +264,19 @@ mod tests {
         }
     }
 
-    /// Why delivering a five byte body under `limit` failed.
+    /// Why delivering a five byte body under `limit` failed, and whether it
+    /// failed for being too large.
     fn failure(
         result: Outcome,
         headers: &[(EnvoyBuffer<'_>, EnvoyBuffer<'_>)],
         limit: usize,
-    ) -> String {
+    ) -> (String, bool) {
         let stream = ResponseStream::new(64);
         let body = [EnvoyBuffer::new(b"12345")];
         deliver(&stream, result, Some(headers), Some(&body), limit);
         match items(&stream).as_slice() {
-            [StreamItem::Failed(BridgeError::Upstream(reason))] => reason.clone(),
+            [StreamItem::Failed(BridgeError::Upstream(reason))] => (reason.clone(), false),
+            [StreamItem::Failed(BridgeError::UpstreamTooLarge(reason))] => (reason.clone(), true),
             other => panic!("expected one failure, got {other:?}"),
         }
     }
@@ -283,9 +286,19 @@ mod tests {
         let status = [(EnvoyBuffer::new(b":status"), EnvoyBuffer::new(b"200"))];
         let no_status = [(EnvoyBuffer::new(b"x-a"), EnvoyBuffer::new(b"1"))];
 
-        assert!(failure(Outcome::Success, &status, 4).contains("limit"));
-        assert!(failure(Outcome::Success, &no_status, 64).contains(":status"));
-        assert!(failure(Outcome::Reset, &[], 64).contains("reset"));
-        assert!(failure(Outcome::ExceedResponseBufferLimit, &[], 64).contains("buffer limit"));
+        let cases = [
+            (failure(Outcome::Success, &status, 4), "limit", true),
+            (failure(Outcome::Success, &no_status, 64), ":status", false),
+            (failure(Outcome::Reset, &[], 64), "reset", false),
+            (
+                failure(Outcome::ExceedResponseBufferLimit, &[], 64),
+                "buffer limit",
+                true,
+            ),
+        ];
+        for ((reason, too_large), expected, expected_too_large) in cases {
+            assert!(reason.contains(expected), "{reason}");
+            assert_eq!(too_large, expected_too_large, "{reason}");
+        }
     }
 }

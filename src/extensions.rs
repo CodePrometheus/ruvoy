@@ -55,9 +55,12 @@ pub(crate) fn define(ruby: &Ruby, module: RModule) -> Result<(), BridgeError> {
         .and_then(|()| call.define_method("park", method!(UpstreamCall::park, 1)))
         .and_then(|()| call.define_method("unpark", method!(UpstreamCall::unpark, 0)))
         .map_err(|error| ruby_error("defining UpstreamCall methods", error))?;
-    module
+    let upstream_error = module
         .define_error("UpstreamError", ruby.exception_standard_error())
         .map_err(|error| ruby_error("defining UpstreamError", error))?;
+    module
+        .define_error("UpstreamResponseTooLarge", upstream_error)
+        .map_err(|error| ruby_error("defining UpstreamResponseTooLarge", error))?;
     ruby.eval::<Value>(UPSTREAM_SOURCE)
         .map_err(|error| ruby_error("loading Upstream#call", error))?;
     Ok(())
@@ -313,9 +316,14 @@ fn rack_response(ruby: &Ruby, head: ResponseHead, body: &[u8]) -> Result<RArray,
 }
 
 fn upstream_error(ruby: &Ruby, error: &BridgeError) -> Error {
+    // A subclass, so a caller can tell asking for less from trying again later.
+    let class = match error {
+        BridgeError::UpstreamTooLarge(_) => "UpstreamResponseTooLarge",
+        _ => "UpstreamError",
+    };
     ruby.class_object()
         .const_get::<_, RModule>("Ruvoy")
-        .and_then(|module| module.const_get::<_, ExceptionClass>("UpstreamError"))
+        .and_then(|module| module.const_get::<_, ExceptionClass>(class))
         .map_or_else(
             |lookup| lookup,
             |class| Error::new(class, error.to_string()),

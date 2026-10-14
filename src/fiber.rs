@@ -105,16 +105,18 @@ struct StreamSink {
 }
 
 impl StreamSink {
-    fn write(&self, chunk: magnus::RString) -> bool {
-        // SAFETY: the bytes are copied before any further Ruby call can run.
+    /// Queues what fits of `chunk` from `offset` on and returns how many bytes
+    /// were taken, or `None` once the client has gone away.
+    fn write(&self, chunk: magnus::RString, offset: usize) -> Option<usize> {
         // SAFETY: the bytes are copied before control returns to Ruby, so the
         // string cannot be moved or collected while the slice is alive.
-        let bytes = unsafe { chunk.as_slice() }.to_vec();
-        if !self.handle.stream.push_chunk(bytes) {
-            return false;
+        let bytes = unsafe { chunk.as_slice() };
+        let rest = bytes.get(offset..).unwrap_or_default();
+        let taken = self.handle.stream.push_chunk_within_budget(rest)?;
+        if taken > 0 {
+            self.handle.wake();
         }
-        self.handle.wake();
-        true
+        Some(taken)
     }
 
     fn writable(&self) -> bool {
@@ -794,7 +796,7 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
         .define_class("StreamSink", ruby.class_object())
         .map_err(|error| ruby_error("defining StreamSink", error))?;
     sink_class
-        .define_method("write", method!(StreamSink::write, 1))
+        .define_method("write", method!(StreamSink::write, 2))
         .and_then(|_| sink_class.define_method("writable?", method!(StreamSink::writable, 0)))
         .and_then(|_| sink_class.define_method("cancelled?", method!(StreamSink::cancelled, 0)))
         .map_err(|error| ruby_error("defining StreamSink methods", error))?;

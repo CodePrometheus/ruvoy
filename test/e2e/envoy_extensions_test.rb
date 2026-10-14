@@ -321,7 +321,7 @@ class EnvoyExtensionsTest < E2ETestCase
     assert_equal MAX_RESPONSE_BYTES, at_limit["body"].bytesize
 
     over = call("cluster" => "test_upstream", "path" => "/bytes/#{MAX_RESPONSE_BYTES + 1}")
-    assert_equal "Ruvoy::UpstreamError", over["error"]
+    assert_equal "Ruvoy::UpstreamResponseTooLarge", over["error"]
     assert_includes over["message"], "limit"
   end
 
