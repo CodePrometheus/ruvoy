@@ -102,6 +102,9 @@ impl Drop for FiberRackFilter {
         // The downstream is gone, so tell Ruby to stop enumerating the body.
         if let Some(stream) = self.stream.take() {
             stream.cancel();
+            if stream.writer_owed_wakeup() {
+                self.client.wake_body(stream);
+            }
         }
         // Envoy cancels what it sent without reporting back, so every fiber
         // still waiting on a call hears it from here.
@@ -447,6 +450,10 @@ impl FiberRackFilter {
                     return;
                 }
             }
+        }
+        // Room opened up or the downstream resumed: wake the writer parked on it.
+        if stream.writer_owed_wakeup() {
+            self.client.wake_body(stream);
         }
     }
 

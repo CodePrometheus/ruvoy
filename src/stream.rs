@@ -92,6 +92,30 @@ impl ResponseStream {
         self.lock().waiter.take()
     }
 
+    /// Parks a writing fiber on `waiter` until the queue can take more.
+    ///
+    /// Refuses, holding nothing, when a write would not have to wait or the
+    /// stream is cancelled. The check shares the lock the worker takes when it
+    /// drains and when it asks [`Self::writer_owed_wakeup`], so room cannot open
+    /// up between the check and the store without the worker seeing the waiter.
+    #[must_use]
+    pub fn park_writer(&self, waiter: Opaque<Value>) -> bool {
+        let mut inner = self.lock();
+        if inner.cancelled || !self.full(&inner) {
+            return false;
+        }
+        inner.waiter = Some(waiter);
+        true
+    }
+
+    /// True when a writer is parked and may now continue: the queue has room
+    /// again, or the stream is cancelled and the writer must hear it.
+    #[must_use]
+    pub fn writer_owed_wakeup(&self) -> bool {
+        let inner = self.lock();
+        inner.waiter.is_some() && (inner.cancelled || !self.full(&inner))
+    }
+
     /// True once nothing more will arrive and everything queued has been taken.
     #[must_use]
     pub fn is_finished(&self) -> bool {
@@ -127,7 +151,10 @@ impl ResponseStream {
     /// downstream asked us to stop writing.
     #[must_use]
     pub fn is_saturated(&self) -> bool {
-        let inner = self.lock();
+        self.full(&self.lock())
+    }
+
+    fn full(&self, inner: &ResponseStreamInner) -> bool {
         inner.paused || inner.buffered_bytes >= self.max_buffered_bytes
     }
 
@@ -329,6 +356,52 @@ mod tests {
     }
 
     #[test]
+    fn a_writer_parks_only_while_the_queue_is_full() {
+        let stream = ResponseStream::new(4);
+        assert!(
+            !stream.park_writer(waiter()),
+            "an empty queue needs no wait"
+        );
+
+        assert_eq!(stream.push_chunk_within_budget(b"abcd"), Some(4));
+        assert!(stream.park_writer(waiter()));
+        assert!(
+            !stream.writer_owed_wakeup(),
+            "still full, so nothing is owed yet"
+        );
+
+        stream.take_next();
+        assert!(stream.writer_owed_wakeup());
+        assert!(stream.unpark().is_some());
+        assert!(!stream.writer_owed_wakeup());
+    }
+
+    #[test]
+    fn a_paused_downstream_parks_the_writer_until_it_resumes() {
+        let stream = ResponseStream::new(4);
+        stream.set_paused(true);
+        assert!(stream.park_writer(waiter()));
+        assert!(!stream.writer_owed_wakeup());
+
+        stream.set_paused(false);
+        assert!(stream.writer_owed_wakeup());
+    }
+
+    #[test]
+    fn cancelling_owes_a_parked_writer_its_wakeup() {
+        let stream = ResponseStream::new(4);
+        assert_eq!(stream.push_chunk_within_budget(b"abcd"), Some(4));
+        assert!(stream.park_writer(waiter()));
+
+        stream.cancel();
+        assert!(stream.writer_owed_wakeup());
+        assert!(
+            !stream.park_writer(waiter()),
+            "a cancelled stream never parks"
+        );
+    }
+
+    #[test]
     fn a_cancelled_stream_takes_nothing() {
         let stream = ResponseStream::new(4);
         stream.cancel();
@@ -443,6 +516,37 @@ mod loom_tests {
             }
             producer.join().expect("producer should not panic");
             assert_eq!(received, body);
+        });
+    }
+
+    /// A writer parking on a full queue while the worker drains it must never
+    /// be stranded: either the worker sees it parked and owes it a wakeup, or
+    /// the room was already there and the park is refused.
+    #[test]
+    fn a_parked_writer_is_never_stranded() {
+        loom::model(|| {
+            let stream = Arc::new(ResponseStream::new(2));
+            assert_eq!(stream.push_chunk_within_budget(&[1, 2]), Some(2));
+
+            let writer = {
+                let stream = Arc::clone(&stream);
+                thread::spawn(move || {
+                    // SAFETY: the value is only stored and taken back, never handed to Ruby.
+                    let waiter = Opaque::from(unsafe { magnus::value::QUNDEF.as_value() });
+                    stream.park_writer(waiter)
+                })
+            };
+            let worker = {
+                let stream = Arc::clone(&stream);
+                thread::spawn(move || {
+                    stream.take_next();
+                    stream.writer_owed_wakeup()
+                })
+            };
+
+            let parked = writer.join().expect("writer should not panic");
+            let owed = worker.join().expect("worker should not panic");
+            assert!(!parked || owed, "a parked writer was left without a wakeup");
         });
     }
 }

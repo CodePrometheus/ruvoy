@@ -123,6 +123,17 @@ impl StreamSink {
         !self.handle.stream.is_saturated()
     }
 
+    /// Parks the writing fiber on `waiter` until the worker has drained room
+    /// or the client has gone; false when there is no reason to wait.
+    fn park(&self, waiter: Value) -> bool {
+        self.handle.stream.park_writer(waiter.into())
+    }
+
+    /// Lets go of the waiter of a fiber that stopped waiting without being woken.
+    fn unpark(&self) {
+        self.handle.stream.unpark();
+    }
+
     fn cancelled(&self) -> bool {
         self.handle.stream.is_cancelled()
     }
@@ -799,6 +810,8 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
         .define_method("write", method!(StreamSink::write, 2))
         .and_then(|_| sink_class.define_method("writable?", method!(StreamSink::writable, 0)))
         .and_then(|_| sink_class.define_method("cancelled?", method!(StreamSink::cancelled, 0)))
+        .and_then(|_| sink_class.define_method("park", method!(StreamSink::park, 1)))
+        .and_then(|_| sink_class.define_method("unpark", method!(StreamSink::unpark, 0)))
         .map_err(|error| ruby_error("defining StreamSink methods", error))?;
     crate::extensions::define(ruby, ruvoy_module)?;
     ruby.eval::<Value>(OFFLOAD_SOURCE)
