@@ -442,10 +442,13 @@ impl FiberRackFilter {
                             "ruvoy_fiber_ruby_error",
                         );
                     } else {
-                        // Headers are already out; the only honest signal left
-                        // is to end the stream short rather than fake success.
+                        // Headers are already out, and ending the body would pass
+                        // it off as complete, so the client sees the stream reset.
                         self.state = FilterState::Responded;
-                        envoy_filter.send_response_data(&[], true);
+                        envoy_filter.reset_stream(
+                            envoy_dynamic_module_type_http_filter_stream_reset_reason::LocalReset,
+                            "ruvoy_fiber_ruby_error",
+                        );
                     }
                     return;
                 }

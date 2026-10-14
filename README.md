@@ -141,10 +141,9 @@ kept, in memory up to 128 KiB and in a temporary file beyond that, so
 Rack versions expect. Raw socket hijacking
 (`rack.hijack`) is not supported; the connection always belongs to Envoy.
 
-A response body that fails after its headers are already on the wire can only
-stop: a dynamic module cannot reset a stream it has started answering, so the
-client receives a short body rather than an error. Applications that can fail
-partway through should send their own length or checksum.
+A response body that fails after its headers are already on the wire resets
+the stream, so the client sees an error rather than a short body that looks
+complete.
 
 ## Blocking calls
 

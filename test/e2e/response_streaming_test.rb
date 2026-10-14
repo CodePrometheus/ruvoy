@@ -153,14 +153,14 @@ class ResponseStreamingTest < E2ETestCase
   end
 
   # The status and headers are already on the wire when the failure happens,
-  # and a module cannot reset the stream through the current ABI, so the only
-  # honest thing left is to stop. The client sees a short body.
-  def test_a_body_that_fails_midway_stops_rather_than_inventing_the_rest
+  # so the stream is reset: ending the body would pass it off as complete.
+  def test_a_body_that_fails_midway_is_reset_rather_than_passed_off_as_complete
     failing = timed_get("/raise-mid-body", read_timeout: 10)
     assert_equal "200", failing[:status], "the failing body returned '#{failing[:status]}' after its headers were sent"
     assert_operator failing[:size], :>, 0, "the failing body delivered nothing"
     assert_operator failing[:size], :<, FAILING_BODY_BYTES,
                     "the failing body delivered #{failing[:size]} bytes instead of stopping early"
+    refute_nil failing[:error], "the client read a short body as if it were complete"
     assert_equal "200", http_get(url("/rack-env")).code, "the listener stopped serving after a mid-body failure"
   end
 
@@ -180,6 +180,7 @@ class ResponseStreamingTest < E2ETestCase
     first_byte = nil
     size = 0
     status = nil
+    error = nil
     begin
       Net::HTTP.start(uri.host, uri.port, read_timeout: read_timeout) do |http|
         http.request_get(uri.request_uri) do |response|
@@ -190,10 +191,10 @@ class ResponseStreamingTest < E2ETestCase
           end
         end
       end
-    rescue EOFError, IOError, Net::ReadTimeout
+    rescue EOFError, IOError, SystemCallError, Net::ReadTimeout => error
       # A body that stops early ends the connection; what arrived still counts.
     end
-    { first_byte: first_byte, total: clock - started, status: status, size: size }
+    { first_byte: first_byte, total: clock - started, status: status, size: size, error: error }
   end
 
   def abandon_after(seconds, path)
