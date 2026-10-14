@@ -6,7 +6,10 @@
 
 use crate::{
     BridgeError, ResponseStream, StreamWaker,
-    concurrency::{Arc, Mutex, MutexGuard},
+    concurrency::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use std::{fmt, time::Duration};
 
@@ -20,6 +23,9 @@ pub struct UpstreamSettings {
     pub timeout: Duration,
     /// Largest response body a call may bring back.
     pub max_response_bytes: usize,
+    /// Most of a streamed response that may wait for the application to read
+    /// it; beyond that the stream is reset.
+    pub stream_buffer_bytes: usize,
 }
 
 impl UpstreamSettings {
@@ -45,6 +51,93 @@ pub struct UpstreamRequest {
     pub response: Arc<ResponseStream>,
 }
 
+/// One streamed call on its way to the worker.
+#[derive(Debug)]
+pub struct UpstreamStreamRequest {
+    /// Cluster to send it to.
+    pub cluster: String,
+    /// Headers, `:method`, `:path` and `host` included.
+    pub headers: Vec<(String, Vec<u8>)>,
+    /// Deadline for the whole exchange; zero for none.
+    pub timeout: Duration,
+    /// Where the worker takes the body from and delivers the response to.
+    pub channel: Arc<StreamChannel>,
+}
+
+/// Both directions of one streamed call, shared by the fiber that made it
+/// and the worker that carries it.
+#[derive(Debug)]
+pub struct StreamChannel {
+    /// What the upstream sends back, for the fiber to read.
+    pub response: Arc<ResponseStream>,
+    /// The request body the application is still sending, for the worker to
+    /// forward.
+    pub request: Arc<ResponseStream>,
+    reset_wanted: AtomicBool,
+    trailers: Mutex<Option<Vec<(String, String)>>>,
+}
+
+impl StreamChannel {
+    /// Opens both directions, each holding at most `budget` bytes.
+    #[must_use]
+    pub fn new(budget: usize) -> Self {
+        Self {
+            response: Arc::new(ResponseStream::new(budget)),
+            request: Arc::new(ResponseStream::new(budget)),
+            reset_wanted: AtomicBool::new(false),
+            trailers: Mutex::new(None),
+        }
+    }
+
+    /// The application stops the stream: nothing more is read or sent, and
+    /// the worker resets it.
+    pub fn close(&self) {
+        self.response.cancel();
+        self.request.cancel();
+        self.reset_wanted.store(true, Ordering::Release);
+    }
+
+    /// The stream fails with `error`, which the fiber reads in place of the
+    /// rest of the response; the worker resets it if it is still open.
+    pub fn fail(&self, error: BridgeError) {
+        self.response.push_failure(error);
+        self.request.cancel();
+        self.reset_wanted.store(true, Ordering::Release);
+    }
+
+    /// True once the worker should reset the stream.
+    #[must_use]
+    pub fn wants_reset(&self) -> bool {
+        self.reset_wanted.load(Ordering::Acquire)
+    }
+
+    /// Keeps the trailers the upstream ended with.
+    pub fn set_trailers(&self, trailers: Vec<(String, String)>) {
+        *self
+            .trailers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(trailers);
+    }
+
+    /// The trailers the upstream ended with, if it sent any.
+    #[must_use]
+    pub fn trailers(&self) -> Option<Vec<(String, String)>> {
+        self.trailers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// What a closed route never sent.
+#[derive(Debug, Default)]
+pub struct Unsent {
+    /// Calls still queued.
+    pub calls: Vec<UpstreamRequest>,
+    /// Streams still queued.
+    pub streams: Vec<UpstreamStreamRequest>,
+}
+
 /// One request's route to the upstreams its worker can reach.
 #[derive(Clone)]
 pub struct Upstreams {
@@ -56,6 +149,7 @@ pub struct Upstreams {
 #[derive(Default)]
 struct Calls {
     queued: Vec<UpstreamRequest>,
+    streams: Vec<UpstreamStreamRequest>,
     /// Set once the request is gone, after which nothing queued would be sent.
     closed: bool,
 }
@@ -79,17 +173,19 @@ impl Upstreams {
 
     /// Queues a call and wakes the worker. Refused once the request is gone.
     pub fn queue(&self, request: UpstreamRequest) -> Result<(), BridgeError> {
-        {
-            let mut calls = self.lock();
-            if calls.closed {
-                return Err(BridgeError::Upstream(
-                    "the request this call belongs to has finished".to_owned(),
-                ));
-            }
-            calls.queued.push(request);
-        }
+        self.push(|calls| calls.queued.push(request))
+    }
+
+    /// Queues a streamed call and wakes the worker. Refused once the request
+    /// is gone.
+    pub fn queue_stream(&self, request: UpstreamStreamRequest) -> Result<(), BridgeError> {
+        self.push(|calls| calls.streams.push(request))
+    }
+
+    /// Asks the worker to look at its streams again, for body to send or a
+    /// stream to stop.
+    pub fn wake(&self) {
         (self.waker)();
-        Ok(())
     }
 
     /// Takes every call queued since the last take.
@@ -97,11 +193,33 @@ impl Upstreams {
         std::mem::take(&mut self.lock().queued)
     }
 
+    /// Takes every streamed call queued since the last take.
+    pub fn take_queued_streams(&self) -> Vec<UpstreamStreamRequest> {
+        std::mem::take(&mut self.lock().streams)
+    }
+
     /// Refuses every later call and hands back the ones never sent.
-    pub fn close(&self) -> Vec<UpstreamRequest> {
+    pub fn close(&self) -> Unsent {
         let mut calls = self.lock();
         calls.closed = true;
-        std::mem::take(&mut calls.queued)
+        Unsent {
+            calls: std::mem::take(&mut calls.queued),
+            streams: std::mem::take(&mut calls.streams),
+        }
+    }
+
+    fn push(&self, add: impl FnOnce(&mut Calls)) -> Result<(), BridgeError> {
+        {
+            let mut calls = self.lock();
+            if calls.closed {
+                return Err(BridgeError::Upstream(
+                    "the request this call belongs to has finished".to_owned(),
+                ));
+            }
+            add(&mut calls);
+        }
+        (self.waker)();
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, Calls> {
@@ -117,6 +235,7 @@ impl fmt::Debug for Upstreams {
         f.debug_struct("Upstreams")
             .field("settings", &self.settings)
             .field("queued", &calls.queued.len())
+            .field("streams", &calls.streams.len())
             .field("closed", &calls.closed)
             .finish_non_exhaustive()
     }
@@ -132,6 +251,7 @@ mod tests {
             clusters: vec!["users".to_owned()],
             timeout: Duration::from_secs(1),
             max_response_bytes: 64,
+            stream_buffer_bytes: 64,
         })
     }
 
@@ -182,12 +302,68 @@ mod tests {
             .queue(request())
             .expect("an open route should queue");
 
-        assert_eq!(upstreams.close().len(), 1);
+        assert_eq!(upstreams.close().calls.len(), 1);
         assert!(matches!(
             upstreams.queue(request()),
             Err(BridgeError::Upstream(_))
         ));
         assert!(upstreams.take_queued().is_empty());
+    }
+
+    fn stream_request() -> UpstreamStreamRequest {
+        UpstreamStreamRequest {
+            cluster: "users".to_owned(),
+            headers: Vec::new(),
+            timeout: Duration::ZERO,
+            channel: Arc::new(StreamChannel::new(64)),
+        }
+    }
+
+    #[test]
+    fn a_queued_stream_wakes_the_worker_and_a_close_hands_it_back() {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&wakes);
+        let upstreams = Upstreams::new(
+            settings(),
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        upstreams
+            .queue_stream(stream_request())
+            .expect("an open route should queue");
+
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(upstreams.close().streams.len(), 1);
+        assert!(upstreams.queue_stream(stream_request()).is_err());
+    }
+
+    #[test]
+    fn a_failed_channel_keeps_the_error_for_the_fiber_and_wants_a_reset() {
+        let channel = StreamChannel::new(8);
+        channel.fail(BridgeError::UpstreamOverflow("read too slowly".to_owned()));
+
+        assert!(channel.wants_reset());
+        assert!(channel.request.is_cancelled());
+        assert!(matches!(
+            channel.response.take_next(),
+            Some(crate::StreamItem::Failed(BridgeError::UpstreamOverflow(_)))
+        ));
+    }
+
+    #[test]
+    fn closing_a_channel_drops_what_was_buffered_and_wants_a_reset() {
+        let channel = StreamChannel::new(8);
+        assert_eq!(
+            channel.response.push_chunk_if_room(vec![1, 2, 3]),
+            Some(true)
+        );
+        channel.close();
+
+        assert!(channel.wants_reset());
+        assert!(channel.response.is_cancelled());
+        assert!(channel.response.take_next().is_none());
     }
 }
 
@@ -206,6 +382,7 @@ mod loom_tests {
                     clusters: vec!["users".to_owned()],
                     timeout: Duration::from_secs(1),
                     max_response_bytes: 64,
+                    stream_buffer_bytes: 64,
                 }),
                 Arc::from_std(std::sync::Arc::new(|| {})),
             );
@@ -226,7 +403,7 @@ mod loom_tests {
             };
             let closer = {
                 let upstreams = upstreams.clone();
-                thread::spawn(move || upstreams.close().len())
+                thread::spawn(move || upstreams.close().calls.len())
             };
 
             let queued = caller.join().expect("caller should not panic");

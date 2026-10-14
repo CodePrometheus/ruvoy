@@ -29,6 +29,8 @@ pub enum BridgeError {
     Upstream(String),
     /// An upstream response was larger than the call may hold.
     UpstreamTooLarge(String),
+    /// A streamed response arrived faster than the application read it.
+    UpstreamOverflow(String),
 }
 
 impl fmt::Display for BridgeError {
@@ -45,6 +47,7 @@ impl fmt::Display for BridgeError {
             Self::RuntimePanicked(message) => write!(f, "Ruby runtime panicked: {message}"),
             Self::Upstream(message) => write!(f, "upstream call failed: {message}"),
             Self::UpstreamTooLarge(message) => write!(f, "upstream response too large: {message}"),
+            Self::UpstreamOverflow(message) => write!(f, "upstream stream overflowed: {message}"),
         }
     }
 }

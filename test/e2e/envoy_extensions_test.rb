@@ -17,6 +17,7 @@ class EnvoyExtensionsTest < E2ETestCase
   ADMIN_PORT = 19234
   UNREACHABLE_PORT = 19235
   MAX_RESPONSE_BYTES = 65_536
+  STREAM_BUFFER_BYTES = 65_536
 
   class << self
     def envoy
@@ -67,7 +68,14 @@ class EnvoyExtensionsTest < E2ETestCase
                      tls: downstream_tls(require_client_certificate: true))
           ],
           "clusters" => [
-            cluster("test_upstream", upstream.port),
+            cluster("test_upstream", upstream.port).merge(
+              "typed_extension_protocol_options" => {
+                "envoy.extensions.upstreams.http.v3.HttpProtocolOptions" => {
+                  "@type" => "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+                  "explicit_http_config" => { "http_protocol_options" => { "enable_trailers" => true } }
+                }
+              }
+            ),
             cluster("breaker", upstream.port).merge(
               "circuit_breakers" => {
                 "thresholds" => [ { "max_connections" => 1, "max_pending_requests" => 1, "max_requests" => 1 } ]
@@ -147,7 +155,8 @@ class EnvoyExtensionsTest < E2ETestCase
         filter_config["upstream"] = {
           "clusters" => %w[test_upstream breaker unreachable mtls_upstream missing_cluster],
           "timeout_ms" => 2_000,
-          "max_response_bytes" => MAX_RESPONSE_BYTES
+          "max_response_bytes" => MAX_RESPONSE_BYTES,
+          "stream_buffer_bytes" => STREAM_BUFFER_BYTES
         }
       end
       [
@@ -402,6 +411,190 @@ class EnvoyExtensionsTest < E2ETestCase
     refute_match(/\[BUG\]|panicked/, File.read(self.class.envoy.log))
   end
 
+  def test_a_stream_hands_over_each_chunk_as_it_arrives
+    result = stream("path" => "/chunks/3/200")
+
+    assert_equal 200, result["status"], result.to_s
+    assert_equal "text/plain", result["headers"]["content-type"]
+    assert_equal "chunk 0\nchunk 1\nchunk 2\n", result["chunks"].join
+    assert_operator result["times"].last - result["times"].first, :>=, 0.3, "chunks 200ms apart arrived together"
+    assert_nil result["trailers"]
+    assert_nil result["error"]
+  end
+
+  def test_a_stream_keeps_the_trailers_it_ended_with
+    result = stream("path" => "/trailers")
+
+    assert_equal [ "hello" ], result["chunks"], result.to_s
+    assert_equal({ "x-checksum" => "5d41402a" }, result["trailers"])
+  end
+
+  def test_a_stream_returned_as_the_response_reaches_the_client_as_it_arrives
+    started = clock
+    body = +""
+    times = []
+    Net::HTTP.start("127.0.0.1", PORT) do |http|
+      http.request(Net::HTTP::Get.new("/proxy/chunks/3/200")) do |response|
+        assert_equal "200", response.code
+        response.read_body do |chunk|
+          body << chunk
+          times << clock - started
+        end
+      end
+    end
+
+    assert_equal "chunk 0\nchunk 1\nchunk 2\n", body
+    assert_operator times.last - times.first, :>=, 0.3, "the client should not wait for the whole stream"
+  end
+
+  def test_a_proxied_stream_that_fails_midway_reaches_the_client_as_a_reset
+    received = +""
+    failure = begin
+      Net::HTTP.start("127.0.0.1", PORT, read_timeout: 10) do |http|
+        http.request(Net::HTTP::Get.new("/proxy/hang/proxied")) do |response|
+          response.read_body { |chunk| received << chunk }
+        end
+      end
+      nil
+    rescue IOError, SystemCallError => error
+      error
+    end
+
+    assert_equal "first\n", received
+    refute_nil failure, "the client read a stream cut off by the idle timeout as complete"
+    wait_for { self.class.upstream.hung_up?("proxied") }
+  end
+
+  def test_a_proxied_request_goes_up_with_the_body_it_came_with
+    bodyless = proxied("/proxy/echo")
+    assert_equal "GET", bodyless["method"]
+    assert_empty bodyless["headers"].slice("content-length", "transfer-encoding").values.flatten,
+                 "a GET has no body to frame"
+
+    short = proxied("/proxy/digest", "hello")
+    assert_equal [ 5, "length" ], short.values_at("bytes", "framing")
+
+    payload = Random.new(7).bytes(300_000)
+    long = proxied("/proxy/digest", payload)
+    assert_equal [ payload.bytesize, Digest::SHA256.hexdigest(payload), "chunked" ],
+                 long.values_at("bytes", "sha256", "framing")
+  end
+
+  def test_an_io_body_goes_up_with_its_length_unless_it_is_long
+    bytes = STREAM_BUFFER_BYTES * 16
+    long = streamed_json("method" => "POST", "path" => "/digest", "upload_bytes" => bytes)
+    assert_equal [ bytes, Digest::SHA256.hexdigest("g" * bytes), "chunked" ],
+                 long.values_at("bytes", "sha256", "framing"), "a body past the buffer goes up a piece at a time"
+
+    short = streamed_json("method" => "POST", "path" => "/digest", "upload_bytes" => 10)
+    assert_equal [ 10, "length" ], short.values_at("bytes", "framing")
+
+    empty = streamed_json("method" => "POST", "path" => "/echo", "upload_bytes" => 0)
+    assert_empty empty["headers"].fetch("transfer-encoding", []), "an empty body is sent as none"
+  end
+
+  def test_a_reader_that_falls_behind_overflows_the_buffer
+    flood = 8 * 1024 * 1024
+    result = stream("path" => "/flood/#{flood}", "pause" => 0.5)
+
+    assert_equal "Ruvoy::UpstreamOverflow", result["error"], result.except("chunks").to_s
+    assert_operator result["bytes"], :<, flood
+  end
+
+  def test_an_upstream_that_goes_quiet_is_given_up_and_hung_up_on_at_once
+    request = Thread.new { stream("path" => "/hang/quiet", "idle_timeout" => 0.3, "linger" => 2) }
+    wait_for(timeout: 1.5) { self.class.upstream.hung_up?("quiet") }
+    quiet = request.value
+    assert_equal "Ruvoy::UpstreamTimeout", quiet["error"], quiet.to_s
+    assert_equal [ "first\n" ], quiet["chunks"]
+
+    started = clock
+    headless = stream("path" => "/delay/1500", "idle_timeout" => 0.3)
+    assert_equal "Ruvoy::UpstreamTimeout", headless["error"], headless.to_s
+    assert_operator clock - started, :<, 1.2
+  end
+
+  def test_closing_a_stream_early_hangs_up_on_the_upstream_at_once
+    request = Thread.new { stream("path" => "/hang/closed", "take" => 1, "linger" => 2) }
+    wait_for(timeout: 1.5) { self.class.upstream.hung_up?("closed") }
+    result = request.value
+
+    assert_equal [ "first\n" ], result["chunks"], result.to_s
+    assert_nil result["error"]
+  end
+
+  def test_a_deadline_ends_the_exchange_however_far_it_got
+    cut = stream("path" => "/chunks/8/150", "timeout" => 0.5)
+    assert_equal "Ruvoy::UpstreamError", cut["error"], cut.to_s
+    assert_includes 1..7, cut["chunks"].size
+
+    before_head = stream("path" => "/delay/1500", "timeout" => 0.3)
+    assert_equal 504, before_head["status"], before_head.to_s
+  end
+
+  def test_a_stream_outliving_its_request_is_hung_up_on
+    assert_equal "first\n", post_json(PORT, "/abandon", "path" => "/hang/abandoned")["first"]
+
+    wait_for { self.class.upstream.hung_up?("abandoned") }
+    outcome = wait_for { get_json(PORT, "/state")["abandoned"].last }
+    assert_equal "Ruvoy::UpstreamError", outcome["error"], outcome.to_s
+    assert_includes outcome["message"], "request finished"
+  end
+
+  def test_a_client_leaving_a_proxied_stream_hangs_up_on_the_upstream
+    socket = TCPSocket.new("127.0.0.1", PORT)
+    socket.write("GET /proxy/hang/left HTTP/1.1\r\nhost: localhost\r\n\r\n")
+    received = +""
+    received << socket.readpartial(4096) until received.include?("first")
+    socket.close
+
+    wait_for { self.class.upstream.hung_up?("left") }
+  end
+
+  def test_streams_from_one_request_overlap
+    overlapped = post_json(PORT, "/streams", Array.new(3) { { "path" => "/chunks/3/200" } })
+
+    assert_equal [ "chunk 0\nchunk 1\nchunk 2\n" ] * 3, overlapped["results"].map { |result| result["chunks"]&.join },
+                 overlapped.to_s
+    assert_operator overlapped["elapsed"], :<, 0.9, "three 400ms streams should run together, not in turn"
+  end
+
+  def test_a_stream_that_cannot_be_opened_raises_where_it_was_asked_for
+    refused = {
+      { "cluster" => "not_listed", "path" => "/echo" } => [ "ArgumentError", "not one this filter" ],
+      { "cluster" => "missing_cluster", "path" => "/echo" } => [ "Ruvoy::UpstreamError", "does not exist" ],
+      { "path" => "/echo", "idle_timeout" => 0 } => [ "ArgumentError", "idle_timeout" ],
+      { "path" => "/echo", "timeout" => -1 } => [ "ArgumentError", "timeout" ],
+      { "path" => "/echo", "body" => 42 } => [ "ArgumentError", "body" ]
+    }
+
+    refused.each do |spec, (error, message)|
+      result = stream(spec)
+      assert_equal error, result["error"], "#{spec} => #{result}"
+      assert_includes result["message"], message
+    end
+  end
+
+  def test_many_streams_leave_nothing_behind
+    outcomes = Array.new(8) do |thread|
+      Thread.new do
+        Net::HTTP.start("127.0.0.1", PORT) do |http|
+          Array.new(25) do |index|
+            request = Net::HTTP::Post.new("/stream", "content-type" => "application/json")
+            # Every other stream is closed while the upstream is still sending.
+            spec = index.even? ? { "path" => "/chunks/2/0" } : { "path" => "/hang/many-#{thread}-#{index}", "take" => 1 }
+            request.body = JSON.generate(spec)
+            JSON.parse(http.request(request).body).values_at("status", "error")
+          end
+        end
+      end
+    end.flat_map(&:value)
+
+    assert_equal [ [ 200, nil ] ] * 200, outcomes
+    assert_equal 0, get_json(PORT, "/state")["in_progress"]
+    refute_match(/\[BUG\]|panicked/, File.read(self.class.envoy.log))
+  end
+
   private
 
   def breaker_overflows
@@ -410,6 +603,23 @@ class EnvoyExtensionsTest < E2ETestCase
 
   def call(arguments)
     post_json(PORT, "/call", arguments)
+  end
+
+  def stream(spec)
+    post_json(PORT, "/stream", spec)
+  end
+
+  def streamed_json(spec)
+    result = stream(spec)
+    assert_equal 200, result["status"], result.to_s
+    JSON.parse(result.fetch("chunks").join)
+  end
+
+  def proxied(path, body = nil)
+    url = "http://127.0.0.1:#{PORT}#{path}"
+    response = body ? http_post(url, body, {}) : http_get(url)
+    assert_equal "200", response.code, response.body
+    JSON.parse(response.body)
   end
 
   def get_json(port, path, tls: false, client_certificate: false)

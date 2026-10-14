@@ -273,8 +273,30 @@ Array で返ります。
 - レスポンスボディが `max_response_bytes` または Envoy 自身のバッファ上限を
   超えたときは、そのサブクラス `Ruvoy::UpstreamResponseTooLarge` が発生する
   ため、呼び出し側は「要求を減らす」と「後で再試行する」を区別できます。
-- レスポンスは丸ごとバッファされるので、`max_response_bytes` が 1 回の呼び
-  出しが占有できるメモリの上限になります。
+- `call` はレスポンスを丸ごとバッファするので、`max_response_bytes` が 1 回の
+  呼び出しが占有できるメモリの上限になります。
+
+`stream` は同じ引数を取り、レスポンスヘッダーが届いた時点で返ります。ボディは
+届いた順に渡され、そのまま Rack レスポンスとして返せるので、プロキシは 1 行です。
+
+```ruby
+run ->(env) { env["ruvoy.upstream"].stream("api", env["REQUEST_METHOD"], env["PATH_INFO"], body: env["rack.input"]) }
+```
+
+- リクエストボディは String か、`rack.input` のように `read` に応答するもの
+  です。最初の 64 KiB 以内で終わるものは長さ付きで、空のものはボディなしで、
+  それより長いものはレスポンスの受信と並行してチャンクで送られます。
+- `idle_timeout:` はヘッダーとチャンク間の待ち時間の上限で、既定は
+  `timeout_ms`、超えると `Ruvoy::UpstreamTimeout` が発生します。`timeout:` は
+  やり取り全体の上限で、既定では設定されません。ヘッダー前なら Envoy が 504
+  を返し、ヘッダー後ならストリームをリセットします。
+- モジュールが開始したストリームに Envoy はフロー制御をかけないため、遅い
+  読み手の前に溜まるレスポンスは `upstream.stream_buffer_bytes`（既定 1 MiB）
+  までです。超えるとストリームはリセットされ、読み手には
+  `Ruvoy::UpstreamOverflow` が発生します。リクエストボディも Envoy に渡すまで
+  は同じ予算に収まり、渡した後のバッファは Ruvoy の管理外です。
+- 最後まで読まずにボディを閉じるか、リクエストが終わると、ストリームはリセッ
+  トされます。ボディを読み終えると `body.trailers` で上流の trailers が得られます。
 
 [`examples/extensions`](examples/extensions) では、代わりのサービスを相手に両方
 の機能を動かし、1 つのリクエストからの 2 つの呼び出しが並行する様子も確認できます。

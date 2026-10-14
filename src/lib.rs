@@ -42,7 +42,9 @@ pub use crate::{
     request::{Request, RequestDiagnostics, RequestMetadata},
     response::{Response, ResponseHead},
     stream::{ResponseStream, StreamHandle, StreamItem, StreamWaker, Wakeups},
-    upstream::{UpstreamRequest, UpstreamSettings, Upstreams},
+    upstream::{
+        StreamChannel, Unsent, UpstreamRequest, UpstreamSettings, UpstreamStreamRequest, Upstreams,
+    },
 };
 
 #[cfg(not(loom))]

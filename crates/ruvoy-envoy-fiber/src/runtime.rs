@@ -20,6 +20,10 @@ const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 15_000;
 /// The same bound as every other body Ruvoy holds in memory.
 const DEFAULT_MAX_UPSTREAM_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// What a streamed response may hold waiting for the application, when the
+/// filter configuration does not say.
+const DEFAULT_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
+
 static PROCESS_RUNTIME: OnceLock<Result<ProcessRuntime, BridgeError>> = OnceLock::new();
 static PROCESS_SHUTDOWN_HOOK: OnceLock<Result<(), BridgeError>> = OnceLock::new();
 
@@ -121,6 +125,8 @@ struct UpstreamConfig {
     timeout_ms: u64,
     #[serde(default = "UpstreamConfig::default_max_response_bytes")]
     max_response_bytes: usize,
+    #[serde(default = "UpstreamConfig::default_stream_buffer_bytes")]
+    stream_buffer_bytes: usize,
 }
 
 impl FilterConfig {
@@ -165,6 +171,10 @@ impl UpstreamConfig {
         DEFAULT_MAX_UPSTREAM_RESPONSE_BYTES
     }
 
+    fn default_stream_buffer_bytes() -> usize {
+        DEFAULT_STREAM_BUFFER_BYTES
+    }
+
     /// Refuses settings under which no call could ever succeed.
     fn into_settings(self) -> Result<UpstreamSettings, BridgeError> {
         let invalid = |message: &str| {
@@ -184,10 +194,14 @@ impl UpstreamConfig {
         if self.max_response_bytes == 0 {
             return invalid("upstream.max_response_bytes must be positive");
         }
+        if self.stream_buffer_bytes == 0 {
+            return invalid("upstream.stream_buffer_bytes must be positive");
+        }
         Ok(UpstreamSettings {
             clusters: self.clusters,
             timeout: Duration::from_millis(self.timeout_ms),
             max_response_bytes: self.max_response_bytes,
+            stream_buffer_bytes: self.stream_buffer_bytes,
         })
     }
 }
@@ -459,6 +473,7 @@ mod tests {
                 clusters: vec!["users".to_owned()],
                 timeout: Duration::from_secs(15),
                 max_response_bytes: 1024 * 1024,
+                stream_buffer_bytes: 1024 * 1024,
             }))
         );
     }

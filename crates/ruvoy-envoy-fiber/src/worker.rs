@@ -5,13 +5,14 @@ use crate::{
         REJECTED_INTERNAL, REJECTED_INVALID_REQUEST,
     },
     runtime::{ContextConfig, FiberRackConfig},
-    upstream::{self, InFlight},
+    upstream::{self, InFlight, OpenStream, OpenStreams, Started, StreamAction},
 };
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use ruvoy::{
     BridgeError, Request, RequestDiagnostics, RequestMetadata, ResponseHead, ResponseStream,
-    StreamHandle, StreamItem, StreamWaker, UpstreamSettings, Upstreams, fiber::FiberRuntimeClient,
+    StreamChannel, StreamHandle, StreamItem, StreamWaker, UpstreamSettings, Upstreams,
+    fiber::FiberRuntimeClient,
 };
 use std::{sync::Arc, time::Instant};
 
@@ -59,6 +60,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FiberRackConfig {
             upstream_settings: self.upstream(),
             upstreams: None,
             upstream_calls: InFlight::default(),
+            upstream_streams: OpenStreams::default(),
         }))
     }
 }
@@ -95,6 +97,8 @@ struct FiberRackFilter {
     upstreams: Option<Upstreams>,
     /// Calls sent to Envoy and not yet answered.
     upstream_calls: InFlight,
+    /// Streams started and not yet reported finished.
+    upstream_streams: OpenStreams,
 }
 
 impl Drop for FiberRackFilter {
@@ -114,6 +118,7 @@ impl Drop for FiberRackFilter {
             .map(|upstreams| upstreams.close())
             .unwrap_or_default();
         let waiting = unsent
+            .calls
             .into_iter()
             .map(|request| request.response)
             .chain(self.upstream_calls.drain().map(|(_, response)| response));
@@ -122,6 +127,21 @@ impl Drop for FiberRackFilter {
                 "the request finished before the call did".to_owned(),
             ));
             self.client.wake_body(response);
+        }
+        for request in unsent.streams {
+            request.channel.fail(BridgeError::Upstream(
+                "the request finished before the stream did".to_owned(),
+            ));
+            self.wake_stream(&request.channel);
+        }
+        let open = self
+            .upstream_streams
+            .drain()
+            .map(|(_, stream)| stream)
+            .collect::<Vec<_>>();
+        for mut stream in open {
+            stream.abandon();
+            self.wake_stream(&stream.channel);
         }
     }
 }
@@ -460,15 +480,71 @@ impl FiberRackFilter {
         }
     }
 
-    /// Sends the calls the application queued since the last event.
+    /// Sends the calls the application queued since the last event, starts its
+    /// streams and moves their bodies along.
     fn send_upstream_calls<EHF: EnvoyHttpFilter>(&mut self, envoy_filter: &mut EHF) {
         let Some(upstreams) = self.upstreams.as_ref() else {
             return;
         };
-        for request in upstreams.take_queued() {
+        let (calls, streams) = (upstreams.take_queued(), upstreams.take_queued_streams());
+        for request in calls {
             if let Some(refused) = upstream::send(envoy_filter, request, &mut self.upstream_calls) {
                 self.client.wake_body(refused);
             }
+        }
+        for request in streams {
+            match upstream::start(envoy_filter, request) {
+                Started::Open(handle, stream) => {
+                    self.upstream_streams.insert(handle, stream);
+                }
+                Started::Refused(channel) => self.wake_stream(&channel),
+                Started::Skipped => {}
+            }
+        }
+        self.pump_streams(envoy_filter);
+    }
+
+    /// Sends what the application has written of each stream's body, and resets
+    /// the streams it closed or the worker failed.
+    fn pump_streams<EHF: EnvoyHttpFilter>(&mut self, envoy_filter: &mut EHF) {
+        let handles = self.upstream_streams.keys().copied().collect::<Vec<_>>();
+        for handle in handles {
+            // Envoy may report a stream's end from inside these calls, removing it
+            // from the table, so no borrow of the table is held across them.
+            while let Some(action) = self
+                .upstream_streams
+                .get_mut(&handle)
+                .and_then(OpenStream::next_action)
+            {
+                match action {
+                    // SAFETY: the handle came from start_http_stream and is still in
+                    // the table, which loses it only when Envoy reports the end.
+                    StreamAction::Reset => unsafe { envoy_filter.reset_http_stream(handle) },
+                    StreamAction::Send(data, end_stream) => {
+                        // SAFETY: as above.
+                        let _ = unsafe {
+                            envoy_filter.send_http_stream_data(handle, &data, end_stream)
+                        };
+                    }
+                }
+            }
+            if let Some(channel) = self
+                .upstream_streams
+                .get(&handle)
+                .map(|stream| Arc::clone(&stream.channel))
+                && channel.request.writer_owed_wakeup()
+            {
+                self.client.wake_body(Arc::clone(&channel.request));
+            }
+        }
+    }
+
+    /// Wakes the fiber reading a stream, and the one writing its body if that
+    /// one may continue.
+    fn wake_stream(&self, channel: &StreamChannel) {
+        self.client.wake_body(Arc::clone(&channel.response));
+        if channel.request.writer_owed_wakeup() {
+            self.client.wake_body(Arc::clone(&channel.request));
         }
     }
 }
@@ -556,6 +632,76 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
     /// disconnect drives `requests_total` and `responses_total` further apart.
     fn on_stream_complete(&mut self, envoy_filter: &mut EHF) {
         self.report_outcome(envoy_filter, OUTCOME_CANCELLED);
+    }
+
+    fn on_http_stream_headers(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        stream_handle: u64,
+        response_headers: &[(EnvoyBuffer<'_>, EnvoyBuffer<'_>)],
+        end_stream: bool,
+    ) {
+        let Some(stream) = self.upstream_streams.get_mut(&stream_handle) else {
+            return;
+        };
+        stream.headers_arrived(response_headers, end_stream);
+        let channel = Arc::clone(&stream.channel);
+        self.wake_stream(&channel);
+    }
+
+    fn on_http_stream_data(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        stream_handle: u64,
+        response_data: &[EnvoyBuffer<'_>],
+        end_stream: bool,
+    ) {
+        let Some(stream) = self.upstream_streams.get_mut(&stream_handle) else {
+            return;
+        };
+        let overflowed = stream.data_arrived(response_data, end_stream);
+        let channel = Arc::clone(&stream.channel);
+        self.wake_stream(&channel);
+        // Resetting from inside Envoy's own delivery would re-enter it; the next
+        // turn does it instead.
+        if overflowed && let Some(upstreams) = self.upstreams.as_ref() {
+            upstreams.wake();
+        }
+    }
+
+    fn on_http_stream_trailers(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        stream_handle: u64,
+        response_trailers: &[(EnvoyBuffer<'_>, EnvoyBuffer<'_>)],
+    ) {
+        let Some(stream) = self.upstream_streams.get_mut(&stream_handle) else {
+            return;
+        };
+        stream.trailers_arrived(response_trailers);
+        let channel = Arc::clone(&stream.channel);
+        self.wake_stream(&channel);
+    }
+
+    fn on_http_stream_complete(&mut self, _envoy_filter: &mut EHF, stream_handle: u64) {
+        let Some(mut stream) = self.upstream_streams.remove(&stream_handle) else {
+            return;
+        };
+        stream.completed();
+        self.wake_stream(&stream.channel);
+    }
+
+    fn on_http_stream_reset(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        stream_handle: u64,
+        reset_reason: envoy_dynamic_module_type_http_stream_reset_reason,
+    ) {
+        let Some(mut stream) = self.upstream_streams.remove(&stream_handle) else {
+            return;
+        };
+        stream.reset_by_envoy(reset_reason);
+        self.wake_stream(&stream.channel);
     }
 
     fn on_downstream_above_write_buffer_high_watermark(&mut self, _envoy_filter: &mut EHF) {

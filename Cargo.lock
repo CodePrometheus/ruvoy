@@ -450,7 +450,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "ruvoy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "loom",
@@ -459,14 +459,14 @@ dependencies = [
 
 [[package]]
 name = "ruvoy-envoy-baseline"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "envoy-proxy-dynamic-modules-rust-sdk",
 ]
 
 [[package]]
 name = "ruvoy-envoy-fiber"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "envoy-proxy-dynamic-modules-rust-sdk",
  "libc",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "ruvoy-envoy-sync"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "envoy-proxy-dynamic-modules-rust-sdk",
  "ruvoy",

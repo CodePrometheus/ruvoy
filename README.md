@@ -273,8 +273,31 @@ one request overlap. A repeated response header arrives as an Array.
 - A response body over `max_response_bytes`, or over Envoy's own buffer limit,
   raises `Ruvoy::UpstreamResponseTooLarge`, a subclass of `Ruvoy::UpstreamError`,
   so a caller can tell asking for less apart from trying again later.
-- Responses are buffered whole, so `max_response_bytes` bounds what one call
-  can hold in memory.
+- `call` buffers the response whole, so `max_response_bytes` bounds what one
+  call can hold in memory.
+
+`stream` takes the same arguments and returns once the response head is in.
+The body yields the response as it arrives and can be returned as the Rack
+response, so a proxy is one line:
+
+```ruby
+run ->(env) { env["ruvoy.upstream"].stream("api", env["REQUEST_METHOD"], env["PATH_INFO"], body: env["rack.input"]) }
+```
+
+- The request body may be a String or anything that responds to `read`, such
+  as `rack.input`. One that ends within its first 64 KiB goes with its length,
+  an empty one as none, and a longer one chunked while the response comes down.
+- `idle_timeout:` bounds the wait for the head and between chunks, `timeout_ms`
+  by default, and raises `Ruvoy::UpstreamTimeout`. `timeout:` bounds the whole
+  exchange and is unset by default: Envoy answers 504 before the head, and
+  resets the stream after it.
+- Envoy applies no flow control to a stream a module starts, so at most
+  `upstream.stream_buffer_bytes` (default 1 MiB) of the response waits for a
+  slow reader. Past that the stream is reset and the reader gets
+  `Ruvoy::UpstreamOverflow`. The request body is held to the same budget until
+  Envoy takes it; what Envoy buffers after that is not bounded by Ruvoy.
+- Closing the body before its end, or finishing the request, resets the
+  stream. `body.trailers` holds the upstream's trailers once the body has ended.
 
 [`examples/extensions`](examples/extensions) runs both against a stand-in
 service, including two calls from one request overlapping.

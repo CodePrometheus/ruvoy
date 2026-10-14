@@ -238,7 +238,26 @@ fiber 等待时不占用运行时线程，其他请求照常服务，同一请�
   拒绝了调用，例如没有健康主机、熔断器已打开。请求在调用完成前已经结束时也会抛出。
 - 响应体超过 `max_response_bytes` 或 Envoy 自身的缓冲上限时，抛它的子类
   `Ruvoy::UpstreamResponseTooLarge`，调用方据此区分「该少要一点」和「稍后重试」。
-- 响应整体缓冲，所以 `max_response_bytes` 限定了单次调用在内存里能占用的大小。
+- `call` 把响应整体缓冲，所以 `max_response_bytes` 限定了单次调用在内存里能占用的大小。
+
+`stream` 参数相同，收到响应头即返回。响应体随到随交，可以直接作为 Rack 响应
+返回，所以代理只需一行：
+
+```ruby
+run ->(env) { env["ruvoy.upstream"].stream("api", env["REQUEST_METHOD"], env["PATH_INFO"], body: env["rack.input"]) }
+```
+
+- 请求体可以是 String，也可以是任何响应 `read` 的对象（例如 `rack.input`）。
+  64 KiB 以内读完的带长度发送，空的当作没有请求体，更长的分块上传，与下行同时进行。
+- `idle_timeout:` 限定等待响应头以及两块数据之间的间隔，默认取 `timeout_ms`，
+  超时抛 `Ruvoy::UpstreamTimeout`。`timeout:` 限定整个交换，默认不设：响应头
+  到达前超时由 Envoy 回 504，之后超时则重置流。
+- Envoy 对模块发起的流不做流控，所以慢读者面前最多积压
+  `upstream.stream_buffer_bytes`（默认 1 MiB）的响应，超出即重置流，读者得到
+  `Ruvoy::UpstreamOverflow`。请求体在交给 Envoy 之前同样受这个预算约束；交给
+  Envoy 之后的缓冲不在 Ruvoy 的控制范围内。
+- 未读完就关闭响应体，或者请求结束，都会重置流。响应体读完后，
+  `body.trailers` 给出上游的 trailers。
 
 [`examples/extensions`](examples/extensions) 用一个替身服务把两项能力都跑一遍，
 包括同一请求里两次调用的重叠。

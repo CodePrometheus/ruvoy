@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "digest"
 require "json"
 require "socket"
 
@@ -12,6 +13,11 @@ require "socket"
 #   /bytes/N        N bytes of body
 #   /flaky/KEY      503 the first time KEY is asked for, 200 after that
 #   /reset          closes the connection without answering
+#   /digest         the size, SHA-256 and framing of the request body, as JSON
+#   /chunks/N/MS    N chunks of "chunk I\n", MS milliseconds apart
+#   /flood/N        N bytes, chunked, as fast as the connection takes them
+#   /trailers       a chunked body that ends with a trailer
+#   /hang/KEY       one chunk, then nothing until the client hangs up on KEY
 class UpstreamServer
   attr_reader :port
 
@@ -19,6 +25,7 @@ class UpstreamServer
     @server = TCPServer.new("127.0.0.1", 0)
     @port = @server.addr[1]
     @hits = Hash.new(0)
+    @hung_up = []
     @lock = Mutex.new
     @connections = []
   end
@@ -47,12 +54,18 @@ class UpstreamServer
     @lock.synchronize { @hits[path] }
   end
 
+  # Whether the client hung up on /hang/KEY.
+  def hung_up?(key)
+    @lock.synchronize { @hung_up.include?(key) }
+  end
+
   private
 
   def serve(connection)
     while (request = read_request(connection))
       @lock.synchronize { @hits[request[:path]] += 1 }
       break connection.close if request[:path] == "/reset"
+      break if stream(connection, request)
 
       status, headers, body = respond(request)
       write_response(connection, status, headers, body)
@@ -78,7 +91,7 @@ class UpstreamServer
   def read_body(connection, headers)
     if headers["transfer-encoding"].include?("chunked")
       body = +"".b
-      while (size = connection.gets("\r\n").to_i(16)).positive?
+      while (size = (connection.gets("\r\n") or raise EOFError).to_i(16)).positive?
         body << connection.read(size)
         connection.read(2)
       end
@@ -103,9 +116,55 @@ class UpstreamServer
       [ 200, {}, "u" * Integer($1, 10) ]
     when %r{\A/flaky/}
       hits(request[:path]) == 1 ? [ 503, {}, "not yet" ] : [ 200, {}, "recovered" ]
+    when "/digest"
+      framing = request[:headers]["transfer-encoding"].include?("chunked") ? "chunked" : "length"
+      digest = { bytes: request[:body].bytesize, sha256: Digest::SHA256.hexdigest(request[:body]), framing: framing }
+      [ 200, { "content-type" => [ "application/json" ] }, JSON.generate(digest) ]
     else
       [ 404, {}, "no route #{request[:path]}" ]
     end
+  end
+
+  # Answers the paths whose body is written a piece at a time, on a connection
+  # that closes after. False for any other path.
+  def stream(connection, request)
+    case request[:path]
+    when %r{\A/chunks/(\d+)/(\d+)\z}
+      count = Integer($1, 10)
+      interval = Integer($2, 10) / 1000.0
+      chunked(connection) do |send|
+        count.times do |index|
+          sleep interval if index.positive?
+          send.call("chunk #{index}\n")
+        end
+      end
+    when %r{\A/flood/(\d+)\z}
+      remaining = Integer($1, 10)
+      chunked(connection) do |send|
+        while remaining.positive?
+          send.call("f" * [ remaining, 16_384 ].min)
+          remaining -= 16_384
+        end
+      end
+    when "/trailers"
+      chunked(connection, trailer: "x-checksum: 5d41402a\r\n") { |send| send.call("hello") }
+    when %r{\A/hang/(.+)\z}
+      key = $1
+      chunked(connection, finish: false) { |send| send.call("first\n") }
+      # Nothing more arrives on the connection until the client closes it.
+      connection.read rescue nil
+      @lock.synchronize { @hung_up << key }
+    else
+      return false
+    end
+    true
+  end
+
+  def chunked(connection, finish: true, trailer: nil)
+    connection.write("HTTP/1.1 200 Streaming\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n" \
+                     "connection: close\r\n\r\n")
+    yield ->(data) { connection.write("#{data.bytesize.to_s(16)}\r\n", data, "\r\n") }
+    connection.write("0\r\n#{trailer}\r\n") if finish
   end
 
   def write_response(connection, status, headers, body)

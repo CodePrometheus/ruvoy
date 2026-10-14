@@ -188,6 +188,24 @@ impl ResponseStream {
         Some(taken)
     }
 
+    /// Queues `chunk` whole if it fits the budget, or if the queue is empty: a
+    /// single delivery larger than the whole budget says nothing about a slow
+    /// reader. `Some(false)` when it does not fit; `None` once cancelled.
+    #[must_use]
+    pub fn push_chunk_if_room(&self, chunk: Vec<u8>) -> Option<bool> {
+        let mut inner = self.lock();
+        if inner.cancelled {
+            return None;
+        }
+        let room = self.max_buffered_bytes.saturating_sub(inner.buffered_bytes);
+        if inner.buffered_bytes > 0 && chunk.len() > room {
+            return Some(false);
+        }
+        inner.buffered_bytes += chunk.len();
+        inner.items.push_back(StreamItem::Chunk(chunk));
+        Some(true)
+    }
+
     /// Marks the body complete. Returns `false` once the stream is cancelled.
     pub fn push_end(&self) -> bool {
         self.push(StreamItem::End)
@@ -399,6 +417,30 @@ mod tests {
             !stream.park_writer(waiter()),
             "a cancelled stream never parks"
         );
+    }
+
+    #[test]
+    fn a_delivery_is_taken_whole_or_refused_whole() {
+        let stream = ResponseStream::new(4);
+        assert_eq!(
+            stream.push_chunk_if_room(vec![1; 8]),
+            Some(true),
+            "an empty queue takes any delivery"
+        );
+        assert_eq!(
+            stream.push_chunk_if_room(vec![1]),
+            Some(false),
+            "a full queue refuses the next one"
+        );
+        stream.take_next();
+        assert_eq!(stream.push_chunk_if_room(vec![1; 3]), Some(true));
+        assert_eq!(
+            stream.push_chunk_if_room(vec![1; 2]),
+            Some(false),
+            "3 + 2 is over a budget of 4"
+        );
+        stream.cancel();
+        assert_eq!(stream.push_chunk_if_room(vec![1]), None);
     }
 
     #[test]
