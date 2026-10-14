@@ -341,16 +341,21 @@ class EnvoyExtensionsTest < E2ETestCase
   end
 
   # Envoy refuses the call over the limit while it is being sent, so the
-  # application hears it as an error rather than as a 503.
+  # application hears it as an error rather than as a 503. One connection and
+  # one pending slot hold two of three calls at most, whether or not the first
+  # has connected by the time the others arrive.
   def test_the_clusters_circuit_breaker_turns_away_the_call_over_its_limit
     overflows = breaker_overflows
-    overlapped = post_json(PORT, "/calls", Array.new(2) { { "cluster" => "breaker", "path" => "/delay/300" } })
+    overlapped = post_json(PORT, "/calls", Array.new(3) { { "cluster" => "breaker", "path" => "/delay/300" } })
     served, refused = overlapped["results"].partition { |result| result["status"] == 200 }
 
-    assert_equal [ 1, 1 ], [ served.size, refused.size ], overlapped.to_s
-    assert_equal "Ruvoy::UpstreamError", refused.first["error"]
-    assert_includes refused.first["message"], "turned the call away"
-    assert_equal overflows + 1, breaker_overflows, "the breaker, not something else, must have refused it"
+    assert_includes 1..2, served.size, overlapped.to_s
+    assert_equal 3 - served.size, refused.size, overlapped.to_s
+    refused.each do |result|
+      assert_equal "Ruvoy::UpstreamError", result["error"]
+      assert_includes result["message"], "turned the call away"
+    end
+    assert_equal overflows + refused.size, breaker_overflows, "the breaker, not something else, must have refused them"
   end
 
   def test_envoy_presents_the_clusters_client_certificate
