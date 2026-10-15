@@ -41,6 +41,8 @@ class UpstreamServer
       nil
     end
     self
+        # As a real server would: a frame's header and payload go out together.
+        socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
   end
 
   def stop
