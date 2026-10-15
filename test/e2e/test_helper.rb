@@ -42,9 +42,11 @@ class E2ETestCase < Minitest::Test
     end
 
     # Whatever a suite launches loads gems from the bundle the suite runs under.
+    # Fixtures may use the test group's gems, such as a WebSocket library.
     def bundle_env
       { "BUNDLE_GEMFILE" => File.join(ROOT, "Gemfile"),
         "BUNDLE_PATH" => File.join(ROOT, "vendor", "bundle"),
+        "BUNDLE_WITH" => "test",
         "BUNDLE_FROZEN" => "true" }
     end
 

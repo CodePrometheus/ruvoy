@@ -11,6 +11,8 @@ gem "rack", "= 3.2.7"
 
 # End-to-end suites only; kept out of the default install for the same reason.
 group :test, optional: true do
+  # A WebSocket client, and a server-side Rack adapter to check upgrades against.
+  gem "async-websocket", "= 0.30.1"
   gem "minitest", "= 6.0.6"
   gem "rake", "= 13.3.1"
 end

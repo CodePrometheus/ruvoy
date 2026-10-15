@@ -110,6 +110,12 @@ impl Drop for FiberRackFilter {
                 self.client.wake_body(stream);
             }
         }
+        // A fiber can still be reading what the client sends after the response
+        // has ended, as an upgraded connection's does: it hears the end here.
+        if let Some(request) = self.request_body.take() {
+            request.stream.cancel();
+            self.client.wake_body(request.stream);
+        }
         // Envoy cancels what it sent without reporting back, so every fiber
         // still waiting on a call hears it from here.
         let unsent = self

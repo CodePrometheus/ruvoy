@@ -1,8 +1,13 @@
 # frozen_string_literal: true
 
+require "async/http/endpoint"
+require "async/http/protocol/http1"
+require "async/http/protocol/http2"
+require "async/websocket/client"
 require "digest"
 require "json"
 require "openssl"
+require "securerandom"
 require_relative "test_helper"
 require_relative "support/certificates"
 require_relative "support/upstream_server"
@@ -34,6 +39,30 @@ class EnvoyExtensionsTest < E2ETestCase
 
     def results
       @results ||= File.join(result_dir, "extensions-#{run_id}").tap { |dir| FileUtils.mkdir_p(dir) }
+    end
+
+    # A second Envoy with the same configuration on ports of its own, for a
+    # test that has to stop it. The shared instance has built the module.
+    def start_dedicated_envoy(offset, name)
+      own = [ PORT, TLS_PORT, PLAIN_PORT, TERMINATOR_PORT, UNREACHABLE_PORT ]
+      shift = lambda do |node|
+        case node
+        when Hash
+          node["port_value"] += offset if own.include?(node["port_value"])
+          node.each_value { |value| shift.call(value) }
+        when Array then node.each { |value| shift.call(value) }
+        end
+      end
+      config = JSON.parse(JSON.generate(envoy_config)).tap { |copy| shift.call(copy) }
+      path = File.join(scratch_dir, "extensions-#{name}.json")
+      File.write(path, JSON.pretty_generate(config))
+      log = File.join(results, "envoy-#{name}.log")
+      envoy = Envoy.start(config: path, modules: module_dir, log: log, log_level: "info", admin_port: ADMIN_PORT + offset,
+                          env: bundle_env)
+      raise "#{name} Envoy did not become ready:\n#{tail(log, lines: 5)}" unless envoy.serving?(
+        "http://127.0.0.1:#{PLAIN_PORT + offset}/keys"
+      )
+      [ envoy, log ]
     end
 
     private
@@ -116,6 +145,9 @@ class EnvoyExtensionsTest < E2ETestCase
           "stat_prefix" => name,
           "codec_type" => "AUTO",
           "stream_idle_timeout" => "30s",
+          # WebSockets over HTTP/1.1 upgrades and over HTTP/2 extended CONNECT.
+          "upgrade_configs" => [ { "upgrade_type" => "websocket" } ],
+          "http2_protocol_options" => { "allow_connect" => true },
           "route_config" => { "virtual_hosts" => [ terminator ? terminator_host : rack_host ] },
           "http_filters" => http_filters
         }
@@ -595,6 +627,205 @@ class EnvoyExtensionsTest < E2ETestCase
     refute_match(/\[BUG\]|panicked/, File.read(self.class.envoy.log))
   end
 
+  def test_a_websocket_application_on_rack_protocol_echoes_over_http1_and_http2
+    [ Async::HTTP::Protocol::HTTP1, Async::HTTP::Protocol::HTTP2 ].each do |protocol|
+      echoed = websocket("/ws/echo", protocol) do |connection|
+        connection.send_text("ping")
+        connection.send_binary("b" * 200_000)
+        connection.flush
+        [ connection.read.to_str, connection.read.to_str.bytesize ]
+      end
+      assert_equal [ "ping", 200_000 ], echoed, protocol.name
+    end
+    assert_no_live_upgrades
+  end
+
+  def test_a_bare_streaming_body_serves_an_upgrade
+    key = SecureRandom.base64(16)
+    socket, headers, rest = upgrade("/ws/raw", key)
+
+    assert_equal "websocket", headers["upgrade"]
+    assert_equal "upgrade", headers["connection"].downcase
+    assert_equal Digest::SHA1.base64digest(key + UpstreamServer::WEBSOCKET_GUID), headers["sec-websocket-accept"]
+    socket.write("hello")
+    rest << socket.readpartial(16) while rest.bytesize < 5
+    assert_equal "HELLO", rest
+    socket.close_write
+    assert_includes [ nil, "" ], (socket.read rescue nil), "the server should end once the client has"
+    assert_no_live_upgrades
+  ensure
+    socket&.close
+  end
+
+  def test_a_streaming_body_also_answers_an_ordinary_request
+    response = http_post("http://127.0.0.1:#{PORT}/duplex", "shout", {})
+    assert_equal [ "200", "SHOUT" ], [ response.code, response.body ]
+  end
+
+  def test_a_protocol_the_client_did_not_offer_is_refused
+    assert_equal "500", http_get("http://127.0.0.1:#{PORT}/unoffered").code
+  end
+
+  def test_a_websocket_relayed_upstream_round_trips_over_http1_and_http2
+    [ Async::HTTP::Protocol::HTTP1, Async::HTTP::Protocol::HTTP2 ].each do |protocol|
+      echoed = websocket("/relay/ws/echo", protocol) do |connection|
+        connection.send_text("through")
+        connection.send_binary("r" * 60_000)
+        connection.flush
+        [ connection.read.to_str, connection.read.to_str.bytesize ]
+      end
+      assert_equal [ "through", 60_000 ], echoed, protocol.name
+    end
+    assert_no_live_upgrades
+  end
+
+  def test_an_upgraded_upstream_reads_through_to_the_upstreams_close
+    assert_equal({ "status" => 101, "bytes" => 11, "ending" => "eof" }, get_json(PORT, "/upgraded/ws/hello"),
+                 "a text frame and a close frame, then the end rather than a failure")
+  end
+
+  def test_an_upgrade_request_names_its_protocols_in_rack_protocol
+    response = http_get("http://127.0.0.1:#{PORT}/ws/protocols",
+                        "connection" => "Upgrade", "upgrade" => "websocket",
+                        "sec-websocket-version" => "13", "sec-websocket-key" => SecureRandom.base64(16))
+
+    assert_equal [ "200", [ "websocket" ] ], [ response.code, JSON.parse(response.body) ]
+  end
+
+  def test_an_upgraded_stream_hands_over_what_arrived_before_its_overflow
+    result = get_json(PORT, "/upgraded/ws/flood/overflowed?pause=0.5")
+
+    assert_operator result["bytes"], :>, 0, "what arrived before the overflow should be read first"
+    assert_match(/\ARuvoy::UpstreamOverflow/, result["ending"])
+    wait_for { self.class.upstream.hung_up?("overflowed") }
+  end
+
+  def test_an_upstream_that_closes_closes_the_relayed_websocket
+    messages = websocket("/relay/ws/hello", Async::HTTP::Protocol::HTTP1) do |connection|
+      [ connection.read&.to_str, connection.read ]
+    end
+    assert_equal [ "hello", nil ], messages
+    assert_no_live_upgrades
+  end
+
+  def test_a_client_dropping_a_websocket_ends_its_session
+    socket, = upgrade("/ws/echo", SecureRandom.base64(16))
+    socket.close
+
+    assert_no_live_upgrades
+  end
+
+  def test_a_websocket_application_that_fails_ends_its_session
+    first = websocket("/ws/raise", Async::HTTP::Protocol::HTTP1) do |connection|
+      connection.send_text("x")
+      connection.flush
+      connection.read.to_str
+    end
+
+    assert_equal "x", first
+    assert_no_live_upgrades
+  end
+
+  def test_a_server_closing_a_websocket_closes_the_client
+    messages = websocket("/ws/bye", Async::HTTP::Protocol::HTTP1) { |connection| [ connection.read&.to_str, connection.read ] }
+
+    assert_equal [ "bye", nil ], messages
+    assert_no_live_upgrades
+  end
+
+  def test_a_relay_whose_client_falls_behind_is_cut_off
+    socket, = upgrade("/relay/ws/flood/behind", SecureRandom.base64(16))
+    # The client reads nothing while the upstream floods, so the stream's
+    # budget overflows and both sides are let go.
+    wait_for(timeout: 10) { self.class.upstream.hung_up?("behind") }
+    received = 0
+    begin
+      received += socket.readpartial(65_536).bytesize while received < 512 * 1024 * 1024
+    rescue IOError, SystemCallError
+      nil
+    end
+
+    assert_operator received, :<, 512 * 1024 * 1024, "the client should have been cut off"
+    assert_no_live_upgrades
+  ensure
+    socket&.close
+  end
+
+  def test_an_upstream_refusing_the_upgrade_answers_the_client_as_is
+    socket = TCPSocket.new("127.0.0.1", PORT)
+    socket.write(upgrade_request("/relay/status/404", SecureRandom.base64(16)))
+    assert_match(%r{\AHTTP/1\.1 404}, socket.gets)
+  ensure
+    socket&.close
+  end
+
+  def test_a_client_leaving_a_relayed_websocket_hangs_up_on_the_upstream
+    socket, = upgrade("/relay/ws/silent/left", SecureRandom.base64(16))
+    socket.close
+
+    wait_for { self.class.upstream.hung_up?("left") }
+    assert_no_live_upgrades
+  end
+
+  def test_a_silent_upstream_is_given_up_and_the_client_reset
+    started = clock
+    socket, = upgrade("/relay/ws/silent/quiet?idle=0.5", SecureRandom.base64(16))
+    ended = begin
+      socket.read
+    rescue IOError, SystemCallError
+      nil
+    end
+
+    assert_includes [ nil, "" ], ended
+    assert_operator clock - started, :<, 3, "the idle timeout should end the relay"
+    wait_for { self.class.upstream.hung_up?("quiet") }
+    assert_no_live_upgrades
+  ensure
+    socket&.close
+  end
+
+  # Shutting Envoy down ends the open connections; the fibers parked in them
+  # hear the end and leave, so the runtime stops without waiting them out.
+  def test_shutdown_ends_open_websockets_and_the_runtime_stops_cleanly
+    offset = 10
+    envoy, log = self.class.start_dedicated_envoy(offset, "shutdown")
+    sockets = [ "/ws/echo", "/relay/ws/echo" ].map do |path|
+      socket, = upgrade(path, SecureRandom.base64(16), port: PORT + offset)
+      framer = Protocol::WebSocket::Framer.new(socket)
+      framer.write_frame(Protocol::WebSocket::TextFrame.new(true, mask: SecureRandom.bytes(4)).pack("live"))
+      assert_equal "live", framer.read_frame.unpack, "#{path} should be live before the shutdown"
+      socket
+    end
+
+    stopped_in = elapsed { assert_kind_of Process::Status, envoy.stop(grace: 15), "Envoy had to be killed" }
+    assert_operator stopped_in, :<, 5, "the shutdown waited on the parked fibers"
+    text = File.read(log)
+    assert_includes text, "Fiber runtime stopped"
+    refute_match(/shutdown failed|panicked|\[BUG\]/, text)
+    sockets.each { |socket| assert_includes [ nil, "" ], (socket.read rescue nil), "the client should see the end" }
+  ensure
+    sockets&.each(&:close)
+    envoy&.stop
+  end
+
+  def test_many_relayed_websockets_leave_nothing_behind
+    replies = Array.new(20) do |index|
+      Thread.new do
+        websocket("/relay/ws/echo", Async::HTTP::Protocol::HTTP1) do |connection|
+          Array.new(3) do |round|
+            connection.send_text("#{index}-#{round}")
+            connection.flush
+            connection.read.to_str
+          end
+        end
+      end
+    end.map(&:value)
+
+    assert_equal Array.new(20) { |index| Array.new(3) { |round| "#{index}-#{round}" } }, replies
+    refute_match(/\[BUG\]|panicked/, File.read(self.class.envoy.log))
+    assert_no_live_upgrades
+  end
+
   private
 
   def breaker_overflows
@@ -607,6 +838,32 @@ class EnvoyExtensionsTest < E2ETestCase
 
   def stream(spec)
     post_json(PORT, "/stream", spec)
+  end
+
+  def assert_no_live_upgrades
+    wait_for { get_json(PORT, "/state")["live_upgrades"].zero? }
+  end
+
+  def websocket(path, protocol, &)
+    Async::WebSocket::Client.connect(Async::HTTP::Endpoint.parse("http://127.0.0.1:#{PORT}#{path}", protocol: protocol), &)
+  end
+
+  def upgrade_request(path, key)
+    "GET #{path} HTTP/1.1\r\nhost: localhost\r\nconnection: Upgrade\r\nupgrade: websocket\r\n" \
+      "sec-websocket-version: 13\r\nsec-websocket-key: #{key}\r\n\r\n"
+  end
+
+  # Opens an HTTP/1.1 upgrade by hand: the socket, the 101's headers, and
+  # whatever arrived after them.
+  def upgrade(path, key, port: PORT)
+    socket = TCPSocket.new("127.0.0.1", port)
+    socket.write(upgrade_request(path, key))
+    received = +"".b
+    received << socket.readpartial(4096) until received.include?("\r\n\r\n")
+    head, rest = received.split("\r\n\r\n", 2)
+    status, *fields = head.split("\r\n")
+    assert_match(%r{\AHTTP/1\.1 101}, status)
+    [ socket, fields.to_h { |field| field.split(": ", 2).then { |name, value| [ name.downcase, value ] } }, rest.to_s.b ]
   end
 
   def streamed_json(spec)

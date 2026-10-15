@@ -23,6 +23,8 @@ mod upstream;
 // A loom build models the concurrent primitives on their own; the runtimes
 // drive a Ruby VM, which loom cannot schedule.
 #[cfg(not(loom))]
+mod chunks;
+#[cfg(not(loom))]
 mod extensions;
 #[cfg(not(loom))]
 pub mod fiber;

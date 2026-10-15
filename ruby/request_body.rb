@@ -63,6 +63,18 @@ Class.new do
     nil
   end
 
+  # Hands the rest of the body to a reader that keeps nothing, for a connection
+  # upgraded to another protocol, which stays open for as long as the client
+  # does. Returns the bytes pulled but not yet read, and the chunks still to
+  # come; the input cannot be read afterwards.
+  def detach
+    leftover = unread.zero? ? +"".b : take(unread, nil)
+    chunks = @chunks
+    @chunks = nil
+    close
+    [ leftover, chunks ]
+  end
+
   private
 
   def unread
@@ -111,22 +123,15 @@ Class.new do
   end
 
   def fill
+    raise IOError, "rack.input was handed to the response stream" if @chunks.nil?
+
     loop do
       while (chunk = @chunks.next_chunk)
         keep(chunk)
       end
       break if yield
 
-      variable = Async::Variable.new
-      # Refused when a chunk landed after the drain above: look again instead.
-      next unless @chunks.park(variable)
-
-      begin
-        variable.wait
-      ensure
-        # A stopped fiber must not leave the reactor a variable nobody holds.
-        @chunks.unpark
-      end
+      Ruvoy::Park.on(@chunks)
     end
   end
 end

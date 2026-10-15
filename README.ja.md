@@ -139,7 +139,9 @@ Ruvoy は Rack 環境を構築し、バイナリの `rack.input` を提供し、
 ため、以前の Rack 向けに書かれたフレームワークが期待するように `rack.input` を
 巻き戻して読み直せます。生
 ソケットのハイジャック（`rack.hijack`）はサポートされず、コネクションは常に
-Envoy に属します。
+Envoy に属します。WebSocket などのアップグレードは、代わりに Rack 3 の
+`rack.protocol` とストリーミングボディで扱い、HTTP/1.1 と HTTP/2 に対応します。
+Envoy 側での許可（`upgrade_configs`、HTTP/2 では加えて `allow_connect`）が必要です。
 
 レスポンスヘッダーが送出済みになってからボディが失敗した場合、Ruvoy はストリーム
 をリセットするため、クライアントには完全に見える短いボディではなくエラーが届き
@@ -276,27 +278,16 @@ Array で返ります。
 - `call` はレスポンスを丸ごとバッファするので、`max_response_bytes` が 1 回の
   呼び出しが占有できるメモリの上限になります。
 
-`stream` は同じ引数を取り、レスポンスヘッダーが届いた時点で返ります。ボディは
-届いた順に渡され、そのまま Rack レスポンスとして返せるので、プロキシは 1 行です。
+`stream` は同じ引数を取りますが、ヘッダーが届いた時点で返り、ボディは届いた順に
+渡され、そのまま Rack レスポンスとして返せるので、プロキシは 1 行です。
 
 ```ruby
 run ->(env) { env["ruvoy.upstream"].stream("api", env["REQUEST_METHOD"], env["PATH_INFO"], body: env["rack.input"]) }
 ```
 
-- リクエストボディは String か、`rack.input` のように `read` に応答するもの
-  です。最初の 64 KiB 以内で終わるものは長さ付きで、空のものはボディなしで、
-  それより長いものはレスポンスの受信と並行してチャンクで送られます。
-- `idle_timeout:` はヘッダーとチャンク間の待ち時間の上限で、既定は
-  `timeout_ms`、超えると `Ruvoy::UpstreamTimeout` が発生します。`timeout:` は
-  やり取り全体の上限で、既定では設定されません。ヘッダー前なら Envoy が 504
-  を返し、ヘッダー後ならストリームをリセットします。
-- モジュールが開始したストリームに Envoy はフロー制御をかけないため、遅い
-  読み手の前に溜まるレスポンスは `upstream.stream_buffer_bytes`（既定 1 MiB）
-  までです。超えるとストリームはリセットされ、読み手には
-  `Ruvoy::UpstreamOverflow` が発生します。リクエストボディも Envoy に渡すまで
-  は同じ予算に収まり、渡した後のバッファは Ruvoy の管理外です。
-- 最後まで読まずにボディを閉じるか、リクエストが終わると、ストリームはリセッ
-  トされます。ボディを読み終えると `body.trailers` で上流の trailers が得られます。
+Envoy はこれにフロー制御をかけないため、読み手が `upstream.stream_buffer_bytes`
+（既定 1 MiB）以上遅れるとストリームはリセットされます。`protocol: "websocket"` を
+付けると、レスポンスはクライアントも切り替えて双方向に中継します。
 
 [`examples/extensions`](examples/extensions) では、代わりのサービスを相手に両方
 の機能を動かし、1 つのリクエストからの 2 つの呼び出しが並行する様子も確認できます。

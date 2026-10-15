@@ -165,6 +165,9 @@ pub(crate) struct OpenStream {
     response_ended: bool,
     /// The reset has been sent, so it is not sent again.
     reset_sent: bool,
+    /// The upstream agreed to switch protocols, so the exchange is now a byte
+    /// stream.
+    upgraded: bool,
 }
 
 /// One thing the worker must ask of Envoy for a stream.
@@ -190,6 +193,7 @@ impl OpenStream {
             request_ended,
             response_ended: false,
             reset_sent: false,
+            upgraded: false,
         }
     }
 
@@ -232,6 +236,7 @@ impl OpenStream {
             ));
             return;
         };
+        self.upgraded = head.status == 101;
         self.channel.response.push_head(head);
         if end_stream {
             self.end();
@@ -301,6 +306,12 @@ impl OpenStream {
         &mut self,
         reason: envoy_dynamic_module_type_http_stream_reset_reason,
     ) {
+        if self.upgraded && !self.reset_sent {
+            // A byte stream ends when the upstream closes it, which is how Envoy
+            // reports it, and the protocol on top judges whether that was early.
+            self.completed();
+            return;
+        }
         if !self.response_ended {
             self.fail(BridgeError::Upstream(reset_reason(reason).to_owned()));
         }
@@ -805,6 +816,33 @@ mod tests {
             }
             other => panic!("expected one failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_upgraded_stream_the_upstream_closes_ends_after_what_it_sent() {
+        let channel = Arc::new(StreamChannel::new(64));
+        let mut stream = OpenStream::new(Arc::clone(&channel), false);
+        stream.headers_arrived(&status(b"101"), false);
+        assert!(!stream.data_arrived(&[EnvoyBuffer::new(b"bye")], false));
+        stream.reset_by_envoy(envoy_dynamic_module_type_http_stream_reset_reason::LocalReset);
+
+        assert!(matches!(
+            items(&channel.response).as_slice(),
+            [StreamItem::Head(_), StreamItem::Chunk(bytes), StreamItem::End] if bytes == b"bye"
+        ));
+        assert!(channel.request.is_cancelled(), "nothing more can go up");
+    }
+
+    #[test]
+    fn an_upgraded_stream_the_worker_reset_still_fails() {
+        let channel = Arc::new(StreamChannel::new(64));
+        let mut stream = OpenStream::new(Arc::clone(&channel), false);
+        stream.headers_arrived(&status(b"101"), false);
+        channel.close();
+        assert_eq!(stream.next_action(), Some(StreamAction::Reset));
+        stream.reset_by_envoy(envoy_dynamic_module_type_http_stream_reset_reason::LocalReset);
+
+        assert!(channel.response.is_cancelled());
     }
 
     #[test]

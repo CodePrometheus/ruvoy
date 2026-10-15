@@ -141,6 +141,10 @@ kept, in memory up to 128 KiB and in a temporary file beyond that, so
 Rack versions expect. Raw socket hijacking
 (`rack.hijack`) is not supported; the connection always belongs to Envoy.
 
+WebSocket and other upgrades use Rack 3's `rack.protocol` with a streaming
+body instead, over HTTP/1.1 and HTTP/2, once Envoy allows them
+(`upgrade_configs`, plus `allow_connect` for HTTP/2).
+
 A response body that fails after its headers are already on the wire resets
 the stream, so the client sees an error rather than a short body that looks
 complete.
@@ -276,28 +280,18 @@ one request overlap. A repeated response header arrives as an Array.
 - `call` buffers the response whole, so `max_response_bytes` bounds what one
   call can hold in memory.
 
-`stream` takes the same arguments and returns once the response head is in.
-The body yields the response as it arrives and can be returned as the Rack
-response, so a proxy is one line:
+`stream` takes the same arguments but returns once the head is in, with a
+body that streams and can be returned as the Rack response, so a proxy is one
+line:
 
 ```ruby
 run ->(env) { env["ruvoy.upstream"].stream("api", env["REQUEST_METHOD"], env["PATH_INFO"], body: env["rack.input"]) }
 ```
 
-- The request body may be a String or anything that responds to `read`, such
-  as `rack.input`. One that ends within its first 64 KiB goes with its length,
-  an empty one as none, and a longer one chunked while the response comes down.
-- `idle_timeout:` bounds the wait for the head and between chunks, `timeout_ms`
-  by default, and raises `Ruvoy::UpstreamTimeout`. `timeout:` bounds the whole
-  exchange and is unset by default: Envoy answers 504 before the head, and
-  resets the stream after it.
-- Envoy applies no flow control to a stream a module starts, so at most
-  `upstream.stream_buffer_bytes` (default 1 MiB) of the response waits for a
-  slow reader. Past that the stream is reset and the reader gets
-  `Ruvoy::UpstreamOverflow`. The request body is held to the same budget until
-  Envoy takes it; what Envoy buffers after that is not bounded by Ruvoy.
-- Closing the body before its end, or finishing the request, resets the
-  stream. `body.trailers` holds the upstream's trailers once the body has ended.
+Envoy applies no flow control to it, so a reader that falls more than
+`upstream.stream_buffer_bytes` (1 MiB by default) behind has the stream reset.
+With `protocol: "websocket"`, the response upgrades the client too and relays
+both ways.
 
 [`examples/extensions`](examples/extensions) runs both against a stand-in
 service, including two calls from one request overlapping.

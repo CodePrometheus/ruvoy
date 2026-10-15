@@ -6,6 +6,7 @@
 use crate::{
     BridgeError, Budget, DEFAULT_RESPONSE_TIMEOUT, Lease, Request, Response, ResponseHead,
     ResponseStream, RuntimeInfo, StreamHandle, StreamItem, StreamWaker, Wakeups,
+    chunks::ChunkSink,
     error::{panic_message, ruby_error},
     rack::{self, CallContext, Concurrency},
     response::Completion,
@@ -40,6 +41,10 @@ const FIBER_RUNNER_SOURCE: &str = include_str!("../ruby/fiber_runner.rb");
 
 /// Rack input over a body that is still arriving.
 const REQUEST_BODY_SOURCE: &str = include_str!("../ruby/request_body.rb");
+
+/// Parking on a queue, and the duplex stream over a pair of them, which the
+/// request body, streaming responses and upstream streams all build on.
+const STREAM_SOURCE: &str = include_str!("../ruby/stream.rb");
 
 /// Moves blocking calls off the runtime thread.
 const OFFLOAD_SOURCE: &str = include_str!("../ruby/offload.rb");
@@ -95,47 +100,6 @@ impl ReactorHeartbeat {
 
     fn elapsed_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
-    }
-}
-
-/// The Ruby-facing half of a streaming response.
-#[magnus::wrap(class = "Ruvoy::StreamSink", free_immediately)]
-struct StreamSink {
-    handle: StreamHandle,
-}
-
-impl StreamSink {
-    /// Queues what fits of `chunk` from `offset` on and returns how many bytes
-    /// were taken, or `None` once the client has gone away.
-    fn write(&self, chunk: magnus::RString, offset: usize) -> Option<usize> {
-        // SAFETY: the bytes are copied before control returns to Ruby, so the
-        // string cannot be moved or collected while the slice is alive.
-        let bytes = unsafe { chunk.as_slice() };
-        let rest = bytes.get(offset..).unwrap_or_default();
-        let taken = self.handle.stream.push_chunk_within_budget(rest)?;
-        if taken > 0 {
-            self.handle.wake();
-        }
-        Some(taken)
-    }
-
-    fn writable(&self) -> bool {
-        !self.handle.stream.is_saturated()
-    }
-
-    /// Parks the writing fiber on `waiter` until the worker has drained room
-    /// or the client has gone; false when there is no reason to wait.
-    fn park(&self, waiter: Value) -> bool {
-        self.handle.stream.park_writer(waiter.into())
-    }
-
-    /// Lets go of the waiter of a fiber that stopped waiting without being woken.
-    fn unpark(&self) {
-        self.handle.stream.unpark();
-    }
-
-    fn cancelled(&self) -> bool {
-        self.handle.stream.is_cancelled()
     }
 }
 
@@ -229,9 +193,7 @@ impl FiberBridge {
             concurrency: Concurrency::Interleaved,
             extensions: true,
         };
-        let sink = ruby.obj_wrap(StreamSink {
-            handle: call.handle.clone(),
-        });
+        let sink = ruby.obj_wrap(ChunkSink::new(call.handle.clone()));
         let result =
             rack::call_streaming(ruby, &context, call.request, &call.handle, sink.as_value());
         if let Err(error) = result {
@@ -789,30 +751,9 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
     envelope_class
         .define_method("cancelled?", method!(FiberEnvelope::cancelled, 0))
         .map_err(|error| ruby_error("defining FiberEnvelope methods", error))?;
-    let chunks_class = ruvoy_module
-        .define_class("RequestChunks", ruby.class_object())
-        .map_err(|error| ruby_error("defining RequestChunks", error))?;
-    chunks_class
-        .define_method("next_chunk", method!(rack::RequestChunks::next_chunk, 0))
-        .and_then(|()| {
-            chunks_class.define_method("finished?", method!(rack::RequestChunks::finished, 0))
-        })
-        .and_then(|()| chunks_class.define_method("park", method!(rack::RequestChunks::park, 1)))
-        .and_then(|()| {
-            chunks_class.define_method("unpark", method!(rack::RequestChunks::unpark, 0))
-        })
-        .map_err(|error| ruby_error("defining RequestChunks methods", error))?;
-
-    let sink_class = ruvoy_module
-        .define_class("StreamSink", ruby.class_object())
-        .map_err(|error| ruby_error("defining StreamSink", error))?;
-    sink_class
-        .define_method("write", method!(StreamSink::write, 2))
-        .and_then(|_| sink_class.define_method("writable?", method!(StreamSink::writable, 0)))
-        .and_then(|_| sink_class.define_method("cancelled?", method!(StreamSink::cancelled, 0)))
-        .and_then(|_| sink_class.define_method("park", method!(StreamSink::park, 1)))
-        .and_then(|_| sink_class.define_method("unpark", method!(StreamSink::unpark, 0)))
-        .map_err(|error| ruby_error("defining StreamSink methods", error))?;
+    crate::chunks::define(ruby, ruvoy_module)?;
+    ruby.eval::<Value>(STREAM_SOURCE)
+        .map_err(|error| ruby_error("loading Ruvoy::Stream", error))?;
     crate::extensions::define(ruby, ruvoy_module)?;
     ruby.eval::<Value>(OFFLOAD_SOURCE)
         .map_err(|error| ruby_error("loading Ruvoy.offload", error))?;

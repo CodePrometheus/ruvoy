@@ -170,10 +170,10 @@ impl ResponseStream {
 
     /// Queues as much of `bytes` as the queue has room for and returns how many
     /// it took, so a body larger than the budget is handed over in slices
-    /// instead of held whole. `None` once the stream is cancelled.
+    /// instead of held whole. `None` once the stream is cancelled or ended.
     pub fn push_chunk_within_budget(&self, bytes: &[u8]) -> Option<usize> {
         let mut inner = self.lock();
-        if inner.cancelled {
+        if inner.cancelled || inner.ended {
             return None;
         }
         let taken = bytes
@@ -190,11 +190,11 @@ impl ResponseStream {
 
     /// Queues `chunk` whole if it fits the budget, or if the queue is empty: a
     /// single delivery larger than the whole budget says nothing about a slow
-    /// reader. `Some(false)` when it does not fit; `None` once cancelled.
+    /// reader. `Some(false)` when it does not fit; `None` once cancelled or ended.
     #[must_use]
     pub fn push_chunk_if_room(&self, chunk: Vec<u8>) -> Option<bool> {
         let mut inner = self.lock();
-        if inner.cancelled {
+        if inner.cancelled || inner.ended {
             return None;
         }
         let room = self.max_buffered_bytes.saturating_sub(inner.buffered_bytes);
@@ -218,7 +218,9 @@ impl ResponseStream {
 
     fn push(&self, item: StreamItem) -> bool {
         let mut inner = self.lock();
-        if inner.cancelled {
+        // Nothing follows the end, so a writer that finished early and the
+        // runtime finishing after it cannot end the stream twice.
+        if inner.cancelled || inner.ended {
             return false;
         }
         match &item {
@@ -371,6 +373,16 @@ mod tests {
         assert_eq!(first, b"abcd");
         assert_eq!(stream.push_chunk_within_budget(&body[4..]), Some(4));
         assert_eq!(stream.buffered_bytes(), 4);
+    }
+
+    #[test]
+    fn nothing_is_accepted_after_the_end() {
+        let stream = ResponseStream::new(64);
+        assert!(stream.push_end());
+        assert!(!stream.push_end());
+        assert!(!stream.push_failure(BridgeError::Upstream("late".to_owned())));
+        assert_eq!(stream.push_chunk_within_budget(b"late"), None);
+        assert_eq!(stream.push_chunk_if_room(b"late".to_vec()), None);
     }
 
     #[test]

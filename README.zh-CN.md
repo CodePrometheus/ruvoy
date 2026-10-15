@@ -125,7 +125,8 @@ Ruvoy 构建 Rack 环境、提供二进制 `rack.input`、保留重复的响应�
 读取直到腾出空间。应用读过的部分会保留下来，128 KiB 以内放内存，超出放临时
 文件，所以 `rack.input` 可以倒回重读，照顾那些按早期 Rack 版本编写的框架。不支持
 裸 socket 劫持（`rack.hijack`），连接始终属于
-Envoy。
+Envoy。WebSocket 等协议升级改用 Rack 3 的 `rack.protocol` 加流式响应体，支持
+HTTP/1.1 与 HTTP/2，需要 Envoy 放行（`upgrade_configs`，HTTP/2 另需 `allow_connect`）。
 
 响应体在响应头已经发出之后才失败时，Ruvoy 会重置这个流，客户端看到的是错误，
 而不是一个看似完整的短响应。
@@ -240,24 +241,15 @@ fiber 等待时不占用运行时线程，其他请求照常服务，同一请�
   `Ruvoy::UpstreamResponseTooLarge`，调用方据此区分「该少要一点」和「稍后重试」。
 - `call` 把响应整体缓冲，所以 `max_response_bytes` 限定了单次调用在内存里能占用的大小。
 
-`stream` 参数相同，收到响应头即返回。响应体随到随交，可以直接作为 Rack 响应
-返回，所以代理只需一行：
+`stream` 参数相同，但收到响应头就返回，响应体流式交出，可以直接作为 Rack 响应，
+所以代理只需一行：
 
 ```ruby
 run ->(env) { env["ruvoy.upstream"].stream("api", env["REQUEST_METHOD"], env["PATH_INFO"], body: env["rack.input"]) }
 ```
 
-- 请求体可以是 String，也可以是任何响应 `read` 的对象（例如 `rack.input`）。
-  64 KiB 以内读完的带长度发送，空的当作没有请求体，更长的分块上传，与下行同时进行。
-- `idle_timeout:` 限定等待响应头以及两块数据之间的间隔，默认取 `timeout_ms`，
-  超时抛 `Ruvoy::UpstreamTimeout`。`timeout:` 限定整个交换，默认不设：响应头
-  到达前超时由 Envoy 回 504，之后超时则重置流。
-- Envoy 对模块发起的流不做流控，所以慢读者面前最多积压
-  `upstream.stream_buffer_bytes`（默认 1 MiB）的响应，超出即重置流，读者得到
-  `Ruvoy::UpstreamOverflow`。请求体在交给 Envoy 之前同样受这个预算约束；交给
-  Envoy 之后的缓冲不在 Ruvoy 的控制范围内。
-- 未读完就关闭响应体，或者请求结束，都会重置流。响应体读完后，
-  `body.trailers` 给出上游的 trailers。
+Envoy 对它不做流控，读者落后超过 `upstream.stream_buffer_bytes`（默认 1 MiB）
+即重置流。带上 `protocol: "websocket"` 时，响应会把客户端也升级，并双向转发。
 
 [`examples/extensions`](examples/extensions) 用一个替身服务把两项能力都跑一遍，
 包括同一请求里两次调用的重叠。

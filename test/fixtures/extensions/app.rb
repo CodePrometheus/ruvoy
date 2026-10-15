@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "async/websocket/adapters/rack"
+require "digest"
 require "json"
 
 # Reports what the filter exposed and makes the upstream calls a suite scripts.
@@ -8,6 +10,7 @@ class ExtensionsApp
     @in_progress = 0
     @outcomes = []
     @abandoned = []
+    @live_upgrades = 0
   end
 
   def call(env)
@@ -21,9 +24,46 @@ class ExtensionsApp
     when "/streams" then json(overlapping_streams(env, JSON.parse(env["rack.input"].read)))
     when "/abandon" then abandon(env, JSON.parse(env["rack.input"].read))
     when %r{\A/proxy(/.*)\z} then proxy(env, $1)
-    when "/state" then json("in_progress" => @in_progress, "outcomes" => @outcomes, "abandoned" => @abandoned)
+    when %r{\A/upgraded(/.*)\z} then json(read_upgraded(env, $1))
+    when "/ws/protocols" then json(env["rack.protocol"])
+    when "/ws/echo" then counted(websocket_echo(env))
+    when "/ws/raise" then counted(websocket_echo(env) { raise "the application failed mid-stream" })
+    when "/ws/bye" then counted(websocket_bye(env))
+    when "/ws/raw" then counted(raw_upgrade(env))
+    when "/duplex" then [ 200, { "content-type" => "text/plain" }, ->(stream) { stream.write(stream.read.upcase) } ]
+    when "/fibers" then json(fibers)
+    when "/state"
+      json("in_progress" => @in_progress, "outcomes" => @outcomes, "abandoned" => @abandoned,
+           "live_upgrades" => @live_upgrades)
     else [ 404, { "content-type" => "text/plain", "content-length" => "0" }, [] ]
     end
+  end
+
+  # Relays a WebSocket to the upstream path it names, as a proxy would: the
+  # upstream's 101 response, returned as is, upgrades the client too.
+  def relay(env)
+    handshake = %w[sec-websocket-key sec-websocket-version sec-websocket-extensions].filter_map do |name|
+      value = env["HTTP_#{name.upcase.tr("-", "_")}"]
+      [ name, value ] if value
+    end
+    idle_timeout = Float(Rack::Utils.parse_query(env["QUERY_STRING"])["idle"] || 5)
+    counted(env.fetch("ruvoy.upstream").stream("test_upstream", "GET", env.fetch("PATH_INFO"),
+                                               headers: handshake.to_h, protocol: "websocket", idle_timeout: idle_timeout))
+  end
+
+  # Counts upgraded sessions while they run, so a test can tell that one was
+  # left behind.
+  def counted(response)
+    status, headers, body = response
+    return response unless body.respond_to?(:call) && !body.respond_to?(:each)
+
+    app = self
+    counting = Object.new
+    counting.define_singleton_method(:call) do |stream|
+      app.send(:live_upgrade) { body.call(stream) }
+    end
+    counting.define_singleton_method(:close) { body.close if body.respond_to?(:close) }
+    [ status, headers, counting ]
   end
 
   private
@@ -91,6 +131,75 @@ class ExtensionsApp
       end
     end
     json("first" => first)
+  end
+
+  # Upgrades a stream to the upstream path and reads it to its end, after
+  # `pause` seconds, reporting what arrived and how it ended.
+  def read_upgraded(env, path)
+    status, _headers, upstream = env.fetch("ruvoy.upstream").stream("test_upstream", "GET", path,
+                                                                    protocol: "websocket", idle_timeout: 2)
+    sleep Float(Rack::Utils.parse_query(env["QUERY_STRING"])["pause"] || 0)
+    received = +"".b
+    ending = begin
+      loop { received << upstream.readpartial(65_536) }
+    rescue EOFError
+      "eof"
+    rescue StandardError => error
+      "#{error.class}: #{error.message}"
+    ensure
+      upstream.close
+    end
+    { "status" => status, "bytes" => received.bytesize, "ending" => ending }
+  end
+
+  # Where every live fiber is parked: the diagnostic for a stalled stream.
+  def fibers
+    ObjectSpace.each_object(Fiber).filter_map do |fiber|
+      next unless fiber.alive? && fiber != Fiber.current
+
+      trace = fiber.backtrace(0, 14) or next
+      trace.map { |line| line.sub(%r{\A.*/(gems/[^/]+|ruby|lib|test)/}, "\\1/") }
+    end
+  end
+
+  def live_upgrade
+    @live_upgrades += 1
+    yield
+  ensure
+    @live_upgrades -= 1
+  end
+
+  # A WebSocket served through a library written against Rack 3's upgrade; a
+  # given block runs after the first message is echoed.
+  def websocket_echo(env, &after_first)
+    Async::WebSocket::Adapters::Rack.open(env) do |connection|
+      while (message = connection.read)
+        connection.write(message)
+        connection.flush
+        after_first&.call
+      end
+    end || [ 400, { "content-type" => "text/plain" }, [ "not a WebSocket request" ] ]
+  end
+
+  # Says goodbye and closes from the server's side.
+  def websocket_bye(env)
+    Async::WebSocket::Adapters::Rack.open(env) do |connection|
+      connection.send_text("bye")
+      connection.close
+    end
+  end
+
+  # The same upgrade by hand, through nothing but the stream Rack 3 specifies:
+  # five bytes in, the same five shouted back, then the end. The status is the
+  # server's to choose once rack.protocol asks for the upgrade.
+  def raw_upgrade(env)
+    accept = Digest::SHA1.base64digest(env.fetch("HTTP_SEC_WEBSOCKET_KEY") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    [ 200, { "rack.protocol" => "websocket", "sec-websocket-accept" => accept }, lambda do |stream|
+      stream.write(stream.read(5).upcase)
+      stream.flush
+      stream.read
+      stream.close
+    end ]
   end
 
   # Passes the request on and the response back as it arrives.

@@ -3,7 +3,8 @@
 
 use crate::{
     BridgeError, Context, MetadataValue, Namespace, ResponseHead, ResponseStream, StreamChannel,
-    StreamItem, UpstreamRequest, UpstreamStreamRequest, Upstreams,
+    StreamHandle, StreamItem, UpstreamRequest, UpstreamStreamRequest, Upstreams,
+    chunks::{ChunkSink, ChunkSource},
     context::{Connection, Tls},
     error::ruby_error,
 };
@@ -57,33 +58,18 @@ pub(crate) fn define(ruby: &Ruby, module: RModule) -> Result<(), BridgeError> {
             )
         })
         .map_err(|error| ruby_error("defining Upstream methods", error))?;
-    let stream = module
-        .define_class("UpstreamStream", ruby.class_object())
-        .map_err(|error| ruby_error("defining UpstreamStream", error))?;
-    stream
-        .define_method("head", method!(UpstreamStreamObject::head, 0))
-        .and_then(|()| stream.define_method("read", method!(UpstreamStreamObject::read, 0)))
-        .and_then(|()| stream.define_method("park", method!(UpstreamStreamObject::park, 1)))
-        .and_then(|()| stream.define_method("unpark", method!(UpstreamStreamObject::unpark, 0)))
-        .and_then(|()| stream.define_method("write", method!(UpstreamStreamObject::write, 2)))
+    let channel = module
+        .define_class("UpstreamChannel", ruby.class_object())
+        .map_err(|error| ruby_error("defining UpstreamChannel", error))?;
+    channel
+        .define_method("head", method!(UpstreamChannelObject::head, 0))
+        .and_then(|()| channel.define_method("reader", method!(UpstreamChannelObject::reader, 0)))
+        .and_then(|()| channel.define_method("writer", method!(UpstreamChannelObject::writer, 0)))
+        .and_then(|()| channel.define_method("close", method!(UpstreamChannelObject::close, 0)))
         .and_then(|()| {
-            stream.define_method("writable?", method!(UpstreamStreamObject::writable, 0))
+            channel.define_method("trailers", method!(UpstreamChannelObject::trailers, 0))
         })
-        .and_then(|()| {
-            stream.define_method("park_writer", method!(UpstreamStreamObject::park_writer, 1))
-        })
-        .and_then(|()| {
-            stream.define_method(
-                "unpark_writer",
-                method!(UpstreamStreamObject::unpark_writer, 0),
-            )
-        })
-        .and_then(|()| {
-            stream.define_method("finish_body", method!(UpstreamStreamObject::finish_body, 0))
-        })
-        .and_then(|()| stream.define_method("close", method!(UpstreamStreamObject::close, 0)))
-        .and_then(|()| stream.define_method("trailers", method!(UpstreamStreamObject::trailers, 0)))
-        .map_err(|error| ruby_error("defining UpstreamStream methods", error))?;
+        .map_err(|error| ruby_error("defining UpstreamChannel methods", error))?;
     let call = module
         .define_class("UpstreamCall", ruby.class_object())
         .map_err(|error| ruby_error("defining UpstreamCall", error))?;
@@ -275,7 +261,7 @@ impl UpstreamObject {
         headers: RArray,
         timeout: Option<f64>,
         has_body: bool,
-    ) -> Result<Obj<UpstreamStreamObject>, Error> {
+    ) -> Result<Obj<UpstreamChannelObject>, Error> {
         let settings = rb_self.0.settings();
         if !settings.allows(&cluster) {
             return Err(Error::new(
@@ -312,7 +298,7 @@ impl UpstreamObject {
                 channel: Arc::clone(&channel),
             })
             .map_err(|error| upstream_error(ruby, &error))?;
-        Ok(ruby.obj_wrap(UpstreamStreamObject {
+        Ok(ruby.obj_wrap(UpstreamChannelObject {
             channel,
             upstreams: rb_self.0.clone(),
         }))
@@ -393,17 +379,22 @@ impl UpstreamCall {
 }
 
 /// One streamed call in flight, as the fiber that made it sees it.
-#[magnus::wrap(class = "Ruvoy::UpstreamStream", free_immediately, size)]
-pub(crate) struct UpstreamStreamObject {
+#[magnus::wrap(class = "Ruvoy::UpstreamChannel", free_immediately, size)]
+pub(crate) struct UpstreamChannelObject {
     channel: Arc<StreamChannel>,
     upstreams: Upstreams,
 }
 
-impl UpstreamStreamObject {
+impl UpstreamChannelObject {
     /// `[status, headers]` once the response head is in, nil before that;
-    /// raises `Ruvoy::UpstreamError` when the stream failed first.
+    /// raises `Ruvoy::UpstreamError` when the stream failed or was closed first.
     fn head(ruby: &Ruby, rb_self: &Self) -> Result<Option<RArray>, Error> {
-        match rb_self.next(ruby)? {
+        let response = &rb_self.channel.response;
+        match response.take_next() {
+            None if response.is_cancelled() => Err(upstream_error(
+                ruby,
+                &BridgeError::Upstream("the stream was closed".to_owned()),
+            )),
             None => Ok(None),
             Some(StreamItem::Head(head)) => {
                 let pair = ruby.ary_new_capa(2);
@@ -411,6 +402,7 @@ impl UpstreamStreamObject {
                 pair.push(rack_headers(ruby, head.headers)?)?;
                 Ok(Some(pair))
             }
+            Some(StreamItem::Failed(error)) => Err(upstream_error(ruby, &error)),
             Some(_) => Err(upstream_error(
                 ruby,
                 &BridgeError::Upstream("the response arrived without a head".to_owned()),
@@ -418,80 +410,22 @@ impl UpstreamStreamObject {
         }
     }
 
-    /// The next piece of the body: a String, false once it has ended, nil when
-    /// nothing has arrived yet; raises when the stream failed.
-    fn read(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
-        match rb_self.next(ruby)? {
-            None => Ok(ruby.qnil().as_value()),
-            Some(StreamItem::Chunk(bytes)) => Ok(ruby.str_from_slice(&bytes).as_value()),
-            Some(StreamItem::End) => Ok(ruby.qfalse().as_value()),
-            Some(_) => Err(upstream_error(
-                ruby,
-                &BridgeError::Upstream("the response sent a second head".to_owned()),
-            )),
-        }
+    /// The response, after its head. Reading needs nothing from the worker,
+    /// since Envoy applies no flow control to a stream a module starts.
+    fn reader(&self) -> ChunkSource {
+        ChunkSource::new(StreamHandle::new(
+            Arc::clone(&self.channel.response),
+            Arc::new(|| {}),
+        ))
     }
 
-    /// Takes the next item, turning a failure into an exception. A closed
-    /// stream raises rather than reporting nothing, so no fiber waits on it.
-    fn next(&self, ruby: &Ruby) -> Result<Option<StreamItem>, Error> {
-        match self.channel.response.take_next() {
-            Some(StreamItem::Failed(error)) => Err(upstream_error(ruby, &error)),
-            None if self.channel.response.is_cancelled() => Err(upstream_error(
-                ruby,
-                &BridgeError::Upstream("the stream was closed".to_owned()),
-            )),
-            item => Ok(item),
-        }
-    }
-
-    /// Parks the reading fiber on `waiter` until more of the response lands;
-    /// false when it already has, and the fiber must not wait.
-    fn park(&self, waiter: Value) -> bool {
-        self.channel.response.park(waiter.into())
-    }
-
-    /// Lets go of the waiter of a reader that stopped waiting without being
-    /// woken.
-    fn unpark(&self) {
-        self.channel.response.unpark();
-    }
-
-    /// Queues what fits of `chunk` from `offset` on for the upstream and returns
-    /// how many bytes were taken, or nil once the stream is over.
-    fn write(&self, chunk: RString, offset: usize) -> Option<usize> {
-        // SAFETY: the bytes are copied before control returns to Ruby, so the
-        // string cannot be moved or collected while the slice is alive.
-        let bytes = unsafe { chunk.as_slice() };
-        let taken = self
-            .channel
-            .request
-            .push_chunk_within_budget(bytes.get(offset..).unwrap_or_default())?;
-        if taken > 0 {
-            self.upstreams.wake();
-        }
-        Some(taken)
-    }
-
-    fn writable(&self) -> bool {
-        !self.channel.request.is_saturated()
-    }
-
-    /// Parks the writing fiber on `waiter` until the worker has sent enough of
-    /// the body to make room; false when there is no reason to wait.
-    fn park_writer(&self, waiter: Value) -> bool {
-        self.channel.request.park_writer(waiter.into())
-    }
-
-    fn unpark_writer(&self) {
-        self.channel.request.unpark();
-    }
-
-    /// Marks the request body complete.
-    fn finish_body(&self) {
-        if self.channel.request.push_end() {
-            self.upstreams.wake();
-        }
+    /// The request body, which the worker sends on as it lands.
+    fn writer(&self) -> ChunkSink {
+        let upstreams = self.upstreams.clone();
+        ChunkSink::new(StreamHandle::new(
+            Arc::clone(&self.channel.request),
+            Arc::new(move || upstreams.wake()),
+        ))
     }
 
     /// Stops the stream: nothing more is read or sent, and the worker resets it.
@@ -539,7 +473,7 @@ fn rack_response(ruby: &Ruby, head: ResponseHead, body: &[u8]) -> Result<RArray,
     Ok(response)
 }
 
-fn upstream_error(ruby: &Ruby, error: &BridgeError) -> Error {
+pub(crate) fn upstream_error(ruby: &Ruby, error: &BridgeError) -> Error {
     // A subclass, so a caller can tell asking for less from trying again later.
     let class = match error {
         BridgeError::UpstreamTooLarge(_) => "UpstreamResponseTooLarge",

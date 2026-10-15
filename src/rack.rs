@@ -1,7 +1,8 @@
 //! Translation between owned Rust requests and the Rack protocol.
 
 use crate::{
-    BridgeError, Request, RequestDiagnostics, Response, ResponseHead, StreamHandle, StreamItem,
+    BridgeError, Request, RequestDiagnostics, Response, ResponseHead, StreamHandle,
+    chunks::ChunkSource,
     error::ruby_error,
     extensions::{ContextObject, UpstreamObject},
 };
@@ -21,47 +22,6 @@ pub(crate) const BODY_READER_SOURCE: &str = include_str!("../ruby/rack_body_read
 /// Feeds a Rack body into a stream sink; used by the fiber runtime.
 pub(crate) const STREAMING_BODY_READER_SOURCE: &str =
     include_str!("../ruby/rack_streaming_body_reader.rb");
-
-/// The Ruby-facing half of a request body still arriving from the client.
-///
-/// Chunks are handed over as owned bytes; `park` registers the
-/// `Async::Variable` the reactor resolves once more of them land.
-#[magnus::wrap(class = "Ruvoy::RequestChunks", free_immediately)]
-pub(crate) struct RequestChunks {
-    handle: StreamHandle,
-}
-
-impl RequestChunks {
-    /// Takes the next chunk, or `nil` when none is buffered right now.
-    pub(crate) fn next_chunk(ruby: &Ruby, chunks: &Self) -> Option<RString> {
-        let stream = &chunks.handle.stream;
-        let item = stream.take_next()?;
-        // Envoy stopped sending once the queue filled up; taking from it is what
-        // lets the worker ask for the rest.
-        chunks.handle.wake();
-        match item {
-            StreamItem::Chunk(bytes) => Some(ruby.str_from_slice(&bytes)),
-            _ => None,
-        }
-    }
-
-    /// True once the client will send nothing more.
-    pub(crate) fn finished(&self) -> bool {
-        self.handle.stream.is_finished()
-    }
-
-    /// Parks the calling fiber on `waiter` until more of the body arrives;
-    /// false when a read would not have to wait, and the fiber must not wait.
-    pub(crate) fn park(&self, waiter: Value) -> bool {
-        self.handle.stream.park(waiter.into())
-    }
-
-    /// Lets go of the waiter of a fiber that stopped waiting without being
-    /// woken.
-    pub(crate) fn unpark(&self) {
-        self.handle.stream.unpark();
-    }
-}
 
 /// Whether the runtime may re-enter `app.call` before an earlier call returns.
 ///
@@ -181,10 +141,15 @@ fn respond(
     let rack_call_time = rack_call_started_at.elapsed();
 
     let ResponseParts {
-        status,
+        mut status,
         mut headers,
         body: response_body,
     } = response_parts(&rack_response)?;
+    if let Some(protocol) = accepted_protocol(&mut headers, build.protocols.as_deref())? {
+        status = 101;
+        headers.push(("upgrade".to_owned(), protocol));
+        headers.push(("connection".to_owned(), "upgrade".to_owned()));
+    }
     headers.extend(stage_timing_headers(build, rack_call_time, Duration::ZERO));
     if !handle.stream.push_head(ResponseHead {
         status,
@@ -196,7 +161,7 @@ fn respond(
     handle.wake();
 
     body_reader
-        .funcall::<_, _, Value>("call", (response_body, sink))
+        .funcall::<_, _, Value>("call", (response_body, sink, build.input))
         .map_err(|error| ruby_error("streaming response body", error))?;
 
     handle.stream.push_end();
@@ -206,6 +171,9 @@ fn respond(
 
 struct EnvBuild {
     env: RHash,
+    input: Value,
+    /// The protocols the client offered to upgrade to, when it offered any.
+    protocols: Option<Vec<String>>,
     /// The input over a body still arriving, which the runtime closes once the
     /// request is done.
     streaming_input: Option<Value>,
@@ -281,6 +249,16 @@ fn build_env(
         )?;
     }
 
+    let protocols = upgrade_protocols(&headers).filter(|_| extensions);
+    if let Some(protocols) = &protocols {
+        set(
+            ruby,
+            env,
+            "rack.protocol",
+            ruby.ary_from_vec(protocols.clone()),
+        )?;
+    }
+
     let mut header_key = String::new();
     for (name, value) in headers {
         if let Some(key) = env_header_key(&name, &mut header_key) {
@@ -300,6 +278,8 @@ fn build_env(
 
     Ok(EnvBuild {
         env,
+        input: rack_input,
+        protocols,
         streaming_input: closed_after,
         diagnostics,
         runtime_queue_time,
@@ -333,7 +313,7 @@ fn streaming_input(
             "this runtime cannot serve a streaming request body".to_owned(),
         ));
     };
-    let chunks = ruby.obj_wrap(RequestChunks { handle });
+    let chunks = ruby.obj_wrap(ChunkSource::new(handle));
     class
         .funcall::<_, _, Value>("new", (chunks,))
         .map_err(|error| ruby_error("creating rack.input", error))
@@ -454,6 +434,50 @@ fn response_parts(rack_response: &RArray) -> Result<ResponseParts, BridgeError> 
     })
 }
 
+/// The protocols a client asks to upgrade to. Envoy presents an HTTP/2
+/// extended CONNECT the same way, as an `upgrade` header.
+fn upgrade_protocols(headers: &[(String, Vec<u8>)]) -> Option<Vec<String>> {
+    let tokens = |wanted: &'static str| {
+        headers
+            .iter()
+            .filter(move |(name, _)| name.eq_ignore_ascii_case(wanted))
+            .flat_map(|(_, value)| {
+                String::from_utf8_lossy(value)
+                    .split(',')
+                    .map(|token| token.trim().to_owned())
+                    .filter(|token| !token.is_empty())
+                    .collect::<Vec<_>>()
+            })
+    };
+    if !tokens("connection").any(|token| token.eq_ignore_ascii_case("upgrade")) {
+        return None;
+    }
+    let protocols = tokens("upgrade").collect::<Vec<_>>();
+    (!protocols.is_empty()).then_some(protocols)
+}
+
+/// Takes the `rack.protocol` response header: the protocol the application
+/// accepted, which must be one the client offered. Upgrade headers the
+/// application set itself are dropped in favour of the ones that go with it.
+fn accepted_protocol(
+    headers: &mut Vec<(String, String)>,
+    offered: Option<&[String]>,
+) -> Result<Option<String>, BridgeError> {
+    let Some(index) = headers.iter().position(|(name, _)| name == "rack.protocol") else {
+        return Ok(None);
+    };
+    let (_, protocol) = headers.remove(index);
+    if !offered.is_some_and(|offered| offered.iter().any(|candidate| candidate == &protocol)) {
+        return Err(BridgeError::InvalidResponse(format!(
+            "rack.protocol {protocol:?} is not one the client offered"
+        )));
+    }
+    headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("upgrade") && !name.eq_ignore_ascii_case("connection")
+    });
+    Ok(Some(protocol))
+}
+
 fn copy_headers(headers: RHash) -> Result<Vec<(String, String)>, BridgeError> {
     let mut result = Vec::with_capacity(headers.len());
     headers
@@ -540,7 +564,59 @@ fn stage_timing_headers(
 
 #[cfg(test)]
 mod tests {
-    use super::{INTERNED_KEYS, env_header_key};
+    use super::{INTERNED_KEYS, accepted_protocol, env_header_key, upgrade_protocols};
+
+    fn request_headers(pairs: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.as_bytes().to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn an_upgrade_offers_its_protocols_only_with_connection_upgrade() {
+        let offered = request_headers(&[
+            ("connection", "keep-alive, Upgrade"),
+            ("upgrade", "websocket"),
+        ]);
+        assert_eq!(
+            upgrade_protocols(&offered),
+            Some(vec!["websocket".to_owned()])
+        );
+
+        let without_connection = request_headers(&[("upgrade", "websocket")]);
+        assert_eq!(upgrade_protocols(&without_connection), None);
+        assert_eq!(
+            upgrade_protocols(&request_headers(&[("connection", "upgrade")])),
+            None
+        );
+    }
+
+    #[test]
+    fn an_accepted_protocol_must_be_one_the_client_offered() {
+        let offered = vec!["websocket".to_owned()];
+        let mut headers = vec![
+            ("rack.protocol".to_owned(), "websocket".to_owned()),
+            ("Upgrade".to_owned(), "h2c".to_owned()),
+            ("sec-websocket-accept".to_owned(), "x".to_owned()),
+        ];
+        assert_eq!(
+            accepted_protocol(&mut headers, Some(&offered)).unwrap(),
+            Some("websocket".to_owned())
+        );
+        assert_eq!(
+            headers,
+            vec![("sec-websocket-accept".to_owned(), "x".to_owned())]
+        );
+
+        let mut unoffered = vec![("rack.protocol".to_owned(), "h2c".to_owned())];
+        assert!(accepted_protocol(&mut unoffered, Some(&offered)).is_err());
+        let mut no_upgrade = vec![("rack.protocol".to_owned(), "websocket".to_owned())];
+        assert!(accepted_protocol(&mut no_upgrade, None).is_err());
+
+        let mut plain = vec![("content-type".to_owned(), "text/plain".to_owned())];
+        assert_eq!(accepted_protocol(&mut plain, Some(&offered)).unwrap(), None);
+    }
 
     #[test]
     fn header_names_map_onto_rack_keys() {

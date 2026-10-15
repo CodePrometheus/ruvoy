@@ -2,6 +2,7 @@
 
 require "digest"
 require "json"
+require "protocol/websocket"
 require "socket"
 
 # The upstream an application reaches through Envoy: a small HTTP/1.1 server in
@@ -18,7 +19,13 @@ require "socket"
 #   /flood/N        N bytes, chunked, as fast as the connection takes them
 #   /trailers       a chunked body that ends with a trailer
 #   /hang/KEY       one chunk, then nothing until the client hangs up on KEY
+#   /ws/echo        a WebSocket that sends every message back
+#   /ws/hello       a WebSocket that sends one message and closes
+#   /ws/silent/KEY  a WebSocket that sends nothing until the client hangs up on KEY
+#   /ws/flood/KEY   a WebSocket that sends 64 KiB frames until the client hangs up on KEY
 class UpstreamServer
+  WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
   attr_reader :port
 
   def initialize
@@ -34,6 +41,8 @@ class UpstreamServer
     @acceptor = Thread.new do
       loop do
         socket = @server.accept
+        # As a real server would: a frame's header and payload go out together.
+        socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
         @lock.synchronize { @connections << socket }
         Thread.new(socket) { |connection| serve(connection) }
       end
@@ -41,8 +50,6 @@ class UpstreamServer
       nil
     end
     self
-        # As a real server would: a frame's header and payload go out together.
-        socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
   end
 
   def stop
@@ -118,6 +125,8 @@ class UpstreamServer
       [ 200, {}, "u" * Integer($1, 10) ]
     when %r{\A/flaky/}
       hits(request[:path]) == 1 ? [ 503, {}, "not yet" ] : [ 200, {}, "recovered" ]
+    when "/ws/echo"
+      [ 400, {}, "a WebSocket handshake needs a key" ]
     when "/digest"
       framing = request[:headers]["transfer-encoding"].include?("chunked") ? "chunked" : "length"
       digest = { bytes: request[:body].bytesize, sha256: Digest::SHA256.hexdigest(request[:body]), framing: framing }
@@ -150,6 +159,29 @@ class UpstreamServer
       end
     when "/trailers"
       chunked(connection, trailer: "x-checksum: 5d41402a\r\n") { |send| send.call("hello") }
+    when "/ws/echo"
+      return false unless accept_websocket(connection, request)
+
+      echo_frames(Protocol::WebSocket::Framer.new(connection))
+    when "/ws/hello"
+      accept_websocket(connection, request)
+      framer = Protocol::WebSocket::Framer.new(connection)
+      framer.write_frame(Protocol::WebSocket::TextFrame.new(true, "hello"))
+      framer.write_frame(Protocol::WebSocket::CloseFrame.new(true, [ 1000 ].pack("n")))
+    when %r{\A/ws/flood/(.+)\z}
+      key = $1
+      accept_websocket(connection, request)
+      framer = Protocol::WebSocket::Framer.new(connection)
+      begin
+        loop { framer.write_frame(Protocol::WebSocket::BinaryFrame.new(true, "f" * 65_536)) }
+      rescue IOError, SystemCallError
+        @lock.synchronize { @hung_up << key }
+      end
+    when %r{\A/ws/silent/(.+)\z}
+      key = $1
+      accept_websocket(connection, request)
+      connection.read rescue nil
+      @lock.synchronize { @hung_up << key }
     when %r{\A/hang/(.+)\z}
       key = $1
       chunked(connection, finish: false) { |send| send.call("first\n") }
@@ -160,6 +192,33 @@ class UpstreamServer
       return false
     end
     true
+  end
+
+  # Answers the handshake, or refuses one without a key with a 400 the
+  # caller sees as an ordinary response.
+  def accept_websocket(connection, request)
+    key = request[:headers]["sec-websocket-key"].first
+    return false if key.nil?
+
+    accept = Digest::SHA1.base64digest(key + WEBSOCKET_GUID)
+    connection.write("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n" \
+                     "sec-websocket-accept: #{accept}\r\n\r\n")
+  end
+
+  def echo_frames(framer)
+    loop do
+      frame = framer.read_frame
+      case frame
+      when Protocol::WebSocket::PingFrame
+        framer.write_frame(Protocol::WebSocket::PongFrame.new(true, frame.unpack))
+      when Protocol::WebSocket::CloseFrame
+        break framer.write_frame(Protocol::WebSocket::CloseFrame.new.pack(*frame.unpack))
+      else
+        framer.write_frame(frame.class.new(frame.finished?, frame.unpack))
+      end
+    end
+  rescue EOFError, Protocol::WebSocket::ProtocolError
+    nil
   end
 
   def chunked(connection, finish: true, trailer: nil)
