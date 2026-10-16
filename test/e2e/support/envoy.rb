@@ -83,12 +83,22 @@ class Envoy < Server
     nil
   end
 
+  # A child of this process lingers as a zombie, which signal 0 still finds,
+  # until it is reaped.
   def running?(pid)
+    return false if reap(pid)
+
     Process.kill(0, pid)
     true
   rescue Errno::ESRCH
     false
   rescue Errno::EPERM
     true
+  end
+
+  def reap(pid)
+    Process.waitpid(pid, Process::WNOHANG)
+  rescue Errno::ECHILD
+    nil
   end
 end
