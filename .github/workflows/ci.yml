@@ -35,6 +35,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: bundle exec rake check:worker_boundary
+      - run: bundle exec rake check:changelog
 
   # Model checking explores thread interleavings, so it runs on its own with the
   # loom cfg rather than as part of the normal test job.

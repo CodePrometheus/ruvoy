@@ -3,6 +3,7 @@
 require "rake/testtask"
 require_relative "tasks/build"
 require_relative "tasks/oha"
+require_relative "tasks/release"
 
 namespace :build do
   desc "Build an Envoy module into build/modules: fiber, sync or baseline"
@@ -20,6 +21,18 @@ namespace :check do
   desc "Check that Envoy worker sources never touch the Ruby VM"
   task :worker_boundary do
     Build.check_worker_boundary
+  end
+
+  desc "Check that CHANGELOG.md has a section for the version being built"
+  task :changelog do
+    Release.check_changelog
+  end
+end
+
+namespace :release do
+  desc "Print the GitHub release notes for a tag: vX.Y.Z or envoy/vX.Y.Z"
+  task :notes, [ :tag ] do |_task, args|
+    print Release.notes(args.fetch(:tag))
   end
 end
 

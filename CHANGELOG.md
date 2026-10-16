@@ -1,0 +1,91 @@
+# Changelog
+
+Notable changes to the `ruvoy` gem, newest first. Changes not yet released are
+listed under Unreleased. The `ruvoy-envoy` gem carries an Envoy release as it
+is, and its version is that Envoy version.
+
+## Unreleased
+
+## 0.3.0 - 2026-10-15
+
+### Added
+
+- Protocol upgrades such as WebSocket, through Rack 3's `rack.protocol`: an
+  application accepts one by naming the protocol in its response headers and
+  answering with a streaming body, which gets a duplex stream to the client.
+  Works over HTTP/1.1 and HTTP/2 once Envoy allows the upgrade
+  (`upgrade_configs`, plus `allow_connect` for HTTP/2).
+- A streaming body, one that responds to `call`, can answer any request. The
+  stream it is given reads the request body and writes the response.
+- `Upstream#stream` takes `protocol:`, such as `"websocket"`. When the upstream
+  answers `101`, returning the response upgrades the client as well and relays
+  bytes both ways until either side closes.
+
+### Fixed
+
+- A fiber still reading a request body is woken when Envoy destroys the stream,
+  for example at shutdown, instead of waiting out the runtime's shutdown
+  timeout.
+
+## 0.2.1 - 2026-10-15
+
+### Added
+
+- `Upstream#stream` takes the same arguments as `call` but returns once the
+  response head arrives, with a body that streams and can be returned as the
+  Rack response. A request body may be any IO, such as `rack.input`. A reader
+  that falls more than `upstream.stream_buffer_bytes` (1 MiB by default) behind
+  has the stream reset and gets `Ruvoy::UpstreamOverflow`.
+
+### Changed
+
+- A streaming response body waiting for the client to catch up is woken when
+  there is room, instead of polling for it.
+
+### Fixed
+
+- A response body that fails after its headers are sent resets the stream, so
+  the client sees an error instead of a short response that looks complete.
+
+## 0.2.0 - 2026-10-14
+
+### Added
+
+- `env["ruvoy.context"]`: Envoy's view of the request, including the route
+  name, the connection, TLS, and dynamic and route metadata. Enabled by
+  `context` in the filter configuration.
+- `env["ruvoy.upstream"]`: `call` sends a request through an Envoy cluster
+  listed in `upstream.clusters` and returns a Rack-style triple, while the
+  calling fiber waits without holding the runtime thread. A call that cannot be
+  sent raises `Ruvoy::UpstreamError`, and a response over `max_response_bytes`
+  raises `Ruvoy::UpstreamResponseTooLarge`.
+- `Ruvoy.offload` runs a blocking call on its own thread while the calling
+  fiber waits; `Ruvoy::Offload.new(limit:)` bounds how many run at once.
+
+### Changed
+
+- The Rack environment reuses interned strings for its keys.
+
+### Fixed
+
+- `rack.input` can be rewound and read again, as Rails applications expect.
+  What has been read is kept in memory up to 128 KiB and in a temporary file
+  beyond that.
+- A chunk larger than the room left in a streaming response's buffer is split
+  to fit, instead of exceeding the buffer.
+- A request stopped while waiting for its body, for example because the client
+  went away, no longer leaves its waiter behind.
+
+## 0.1.0 - 2026-09-08
+
+First release.
+
+- Runs a Rack application from `config.ru` inside Envoy, as a dynamic module
+  with a dedicated Ruby thread where requests run as fibers. HTTP/1.1, HTTP/2
+  and connections stay under Envoy's control.
+- Streams response and request bodies, with backpressure in both directions.
+- Rejects work beyond a request-count budget before it reaches Ruby.
+- Stops the fiber of a request whose client has gone away, and closes its
+  response body.
+- Ships as the `ruvoy` gem, which carries the module and a command line, and
+  the `ruvoy-envoy` gem, which carries Envoy.
