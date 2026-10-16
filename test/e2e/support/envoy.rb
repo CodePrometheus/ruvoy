@@ -11,10 +11,12 @@ class Envoy < Server
   KILL_TIMEOUT = 5
 
   def self.start(config:, modules:, log:, concurrency: 1, log_level: "warning", admin_port: nil,
-                 hot_restart: nil, env: {})
+                 hot_restart: nil, drain_time: nil, env: {})
     command = [ "uvx", "--from", PACKAGE, "envoy",
                 "--config-path", config, "--concurrency", concurrency.to_s, "--log-level", log_level ]
     command += hot_restart ? hot_restart_arguments(hot_restart) : [ "--disable-hot-restart" ]
+    # How long a listener that was updated or removed keeps its connections.
+    command += [ "--drain-time-s", drain_time.to_s ] if drain_time
     if admin_port
       command += [ "--config-yaml",
                    "admin: {address: {socket_address: {address: 127.0.0.1, port_value: #{admin_port}}}}" ]
