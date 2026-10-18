@@ -216,7 +216,7 @@ class SoakTest < E2ETestCase
   def idle_state(label)
     sleep 7
     state = JSON.parse(http_get(url(:steady, "/state")).body)
-    heap = http_get(url(:steady, "/heap")).body.to_i
+    heap = JSON.parse(http_get(url(:steady, "/heap")).body).fetch("live_slots")
     stats = admin_stats
     { "label" => label, "fds" => fd_count, "threads" => thread_count, "rss_kib" => rss_kib, "heap" => heap,
       "fibers" => state.fetch("fibers"), "sessions" => state.fetch("sessions"), **stats }.tap do |snapshot|
@@ -227,6 +227,16 @@ class SoakTest < E2ETestCase
   def admin_stats
     text = http_get("http://127.0.0.1:#{ADMIN_PORT}/stats").body
     STATS.transform_values { |pattern| text[pattern, 1].to_i }
+  end
+
+  # Where the process's memory sits: Envoy's allocator by its own account, all
+  # anonymous pages, and the brk heap the C library allocates from first.
+  def memory_layout
+    allocator = JSON.parse(http_get("http://127.0.0.1:#{ADMIN_PORT}/memory").body)
+    rollup = File.read("/proc/#{@proxy_pid}/smaps_rollup")
+    brk = File.read("/proc/#{@proxy_pid}/smaps")[/\[heap\]\n(?:.*\n)*?Rss:\s+(\d+)/, 1]
+    [ allocator["allocated"].to_i / 1024, allocator["heap_size"].to_i / 1024, rollup[/^Anonymous:\s+(\d+)/, 1].to_i,
+      brk.to_i ]
   end
 
   def fd_count = Dir.children("/proc/#{@proxy_pid}/fd").size
@@ -258,14 +268,16 @@ class SoakTest < E2ETestCase
   end
 
   def sample_heap
-    record("heap.tsv", "seconds", "heap_live_slots", "fibers", "sessions", "inflight")
+    record("heap.tsv", "seconds", "heap_live_slots", "heap_pages", "ruby_memsize", "fibers", "sessions", "inflight",
+           "allocator_kib", "allocator_heap_kib", "anonymous_kib", "brk_kib")
     Thread.new do
       while @sampling && clock < @deadline
         sleep @settings[:heap_every]
         begin
           state = JSON.parse(http_get(url(:steady, "/state")).body)
-          record("heap.tsv", elapsed_in_run, http_get(url(:steady, "/heap")).body.to_i, state["fibers"],
-                 state["sessions"], admin_stats["inflight"])
+          heap = JSON.parse(http_get(url(:steady, "/heap")).body)
+          record("heap.tsv", elapsed_in_run, *heap.values_at("live_slots", "pages", "memsize"), state["fibers"],
+                 state["sessions"], admin_stats["inflight"], *memory_layout)
         rescue StandardError => error
           count("sampler:#{error.class}")
         end
@@ -425,7 +437,7 @@ class SoakTest < E2ETestCase
     if @mode == "full" && @final
       growth = trends
       verdict["trends"] = growth
-      growth.each do |name, trend|
+      growth.slice("rss", "heap_live_slots").each do |name, trend|
         failures << "#{name} grew #{trend["percent_per_hour"]}% an hour" if trend["percent_per_hour"] > 1.0
       end
       verdict["latency"] = drift
@@ -465,19 +477,21 @@ class SoakTest < E2ETestCase
   end
 
   # Least-squares slope over the steady part of the run, as a percentage of the
-  # mean per hour.
+  # mean per hour. RSS and live objects are judged; the rest says where growth
+  # sits when there is some.
   def trends
     from = 3600
+    heap = %w[heap_live_slots heap_pages ruby_memsize allocator_kib allocator_heap_kib anonymous_kib brk_kib]
     {
       "rss" => [ column("resources.tsv", "seconds"), column("resources.tsv", "rss_kib") ],
-      "heap_live_slots" => [ column("heap.tsv", "seconds"), column("heap.tsv", "heap_live_slots") ]
+      **heap.to_h { |name| [ name, [ column("heap.tsv", "seconds"), column("heap.tsv", name) ] ] }
     }.transform_values do |(seconds, values)|
       points = seconds.zip(values).select { |second, _| second >= from }
       mean_x = points.sum(&:first) / points.size
       mean_y = points.sum(&:last) / points.size
       slope = points.sum { |x, y| (x - mean_x) * (y - mean_y) } / points.sum { |x, _| (x - mean_x)**2 }
       { "points" => points.size, "mean" => mean_y.round, "per_hour" => (slope * 3600).round,
-        "percent_per_hour" => (slope * 3600 / mean_y * 100).round(3) }
+        "percent_per_hour" => mean_y.zero? ? nil : (slope * 3600 / mean_y * 100).round(3) }
     end
   end
 

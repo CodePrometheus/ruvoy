@@ -3,6 +3,7 @@
 require "async/websocket/adapters/rack"
 require "fiddle"
 require "json"
+require "objspace"
 
 # Every kind of work the runtime carries, behind one rackup that keeps nothing
 # between requests, so whatever a soak sees grow belongs to the runtime.
@@ -105,9 +106,12 @@ module Soak
       [ status, headers, session ]
     end
 
+    # What Ruby holds after a full collection: live objects, the pages they
+    # sit on, and their size counting the memory they allocated outside them.
     def heap
       GC.start
-      text(GC.stat(:heap_live_slots).to_s)
+      json("live_slots" => GC.stat(:heap_live_slots), "pages" => GC.stat(:heap_allocated_pages),
+           "memsize" => ObjectSpace.memsize_of_all)
     end
 
     def live_fibers
