@@ -1,24 +1,76 @@
 //! Sends the application's upstream calls and streams through Envoy and hands
 //! the answers back to the fibers waiting on them.
 
+use crate::metrics::CallOutcome;
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use ruvoy::{
     BridgeError, ResponseHead, ResponseStream, StreamChannel, StreamItem, UpstreamRequest,
     UpstreamStreamRequest,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+/// The trace context a call carries on from the request that made it, unless
+/// the application set the header itself.
+pub(crate) const TRACE_HEADERS: [&str; 9] = [
+    "traceparent",
+    "tracestate",
+    "x-request-id",
+    "b3",
+    "x-b3-traceid",
+    "x-b3-spanid",
+    "x-b3-parentspanid",
+    "x-b3-sampled",
+    "x-b3-flags",
+];
+
+/// A call a filter has sent and is waiting on.
+pub(crate) struct PendingCall {
+    pub(crate) response: Arc<ResponseStream>,
+    pub(crate) cluster: String,
+    sent_at: Instant,
+}
+
+impl PendingCall {
+    /// How long the call has been out.
+    pub(crate) fn waited(&self) -> Duration {
+        self.sent_at.elapsed()
+    }
+}
 
 /// Calls a filter has sent and is waiting on, by the id Envoy gave them.
-pub(crate) type InFlight = HashMap<u64, Arc<ResponseStream>>;
+pub(crate) type InFlight = HashMap<u64, PendingCall>;
 
-/// Sends one call. A call Envoy refuses fails on the spot, and its stream comes
-/// back for the caller to wake the fiber waiting on it.
+/// The headers a call goes out with: the application's, then whatever of the
+/// request's trace context it did not set.
+fn with_trace<'a>(
+    headers: &'a [(String, Vec<u8>)],
+    trace: &'a [(&'static str, Vec<u8>)],
+) -> Vec<(&'a str, &'a [u8])> {
+    let mut fields = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_slice()))
+        .collect::<Vec<_>>();
+    for (name, value) in trace {
+        if !headers.iter().any(|(own, _)| own == name) {
+            fields.push((name, value.as_slice()));
+        }
+    }
+    fields
+}
+
+/// Sends one call. A call Envoy refuses fails on the spot, and its stream and
+/// cluster come back for the caller to wake the fiber waiting on it.
 pub(crate) fn send<EHF: EnvoyHttpFilter>(
     envoy_filter: &mut EHF,
     request: UpstreamRequest,
+    trace: &[(&'static str, Vec<u8>)],
     in_flight: &mut InFlight,
-) -> Option<Arc<ResponseStream>> {
+) -> Option<(Arc<ResponseStream>, String)> {
     let UpstreamRequest {
         cluster,
         headers,
@@ -26,23 +78,28 @@ pub(crate) fn send<EHF: EnvoyHttpFilter>(
         timeout,
         response,
     } = request;
-    let headers = headers
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_slice()))
-        .collect::<Vec<_>>();
+    let headers = with_trace(&headers, trace);
     let body = (!body.is_empty()).then_some(body.as_slice());
     // Envoy reads zero as no deadline at all.
     let timeout_ms = u64::try_from(timeout.as_millis())
         .unwrap_or(u64::MAX)
         .max(1);
 
+    let sent_at = Instant::now();
     let (result, callout_id) = envoy_filter.send_http_callout(&cluster, &headers, body, timeout_ms);
     let Some(refusal) = refusal(result, &cluster) else {
-        in_flight.insert(callout_id, response);
+        in_flight.insert(
+            callout_id,
+            PendingCall {
+                response,
+                cluster,
+                sent_at,
+            },
+        );
         return None;
     };
     response.push_failure(BridgeError::Upstream(refusal));
-    Some(response)
+    Some((response, cluster))
 }
 
 /// Why Envoy turned a call or stream away, or nothing when it took it.
@@ -68,7 +125,8 @@ fn refusal(
     }
 }
 
-/// Hands a finished call's outcome to the stream its fiber waits on.
+/// Hands a finished call's outcome to the stream its fiber waits on, and says
+/// what that outcome was.
 ///
 /// Envoy owns the headers and body only for the duration of the callback, so
 /// both are copied here.
@@ -78,7 +136,7 @@ pub(crate) fn deliver(
     headers: Option<&[(EnvoyBuffer<'_>, EnvoyBuffer<'_>)]>,
     body: Option<&[EnvoyBuffer<'_>]>,
     max_response_bytes: usize,
-) {
+) -> CallOutcome {
     let outcome = match result {
         envoy_dynamic_module_type_http_callout_result::Success => answer(
             headers.unwrap_or_default(),
@@ -99,10 +157,22 @@ pub(crate) fn deliver(
                 response.push_chunk(body);
             }
             response.push_end();
+            CallOutcome::Completed
         }
         Err(error) => {
+            let outcome = failed(&error);
             response.push_failure(error);
+            outcome
         }
+    }
+}
+
+/// The outcome a failure the worker found stands for.
+fn failed(error: &BridgeError) -> CallOutcome {
+    match error {
+        BridgeError::UpstreamOverflow(_) => CallOutcome::Overflow,
+        BridgeError::UpstreamTooLarge(_) => CallOutcome::TooLarge,
+        _ => CallOutcome::Reset,
     }
 }
 
@@ -159,6 +229,10 @@ pub(crate) type OpenStreams = HashMap<u64, OpenStream>;
 /// A stream a filter has started that Envoy has not yet reported finished.
 pub(crate) struct OpenStream {
     pub(crate) channel: Arc<StreamChannel>,
+    pub(crate) cluster: String,
+    started_at: Instant,
+    /// How the stream ended, once it has.
+    outcome: Option<CallOutcome>,
     /// The request body has gone out to its end.
     request_ended: bool,
     /// The response has ended or failed; whatever else Envoy reports is dropped.
@@ -181,15 +255,18 @@ pub(crate) enum StreamAction {
 pub(crate) enum Started {
     Open(u64, OpenStream),
     /// Envoy turned it away; the fiber reading it must be woken.
-    Refused(Arc<StreamChannel>),
+    Refused(Arc<StreamChannel>, String),
     /// The fiber closed it before it started.
-    Skipped,
+    Skipped(String),
 }
 
 impl OpenStream {
-    fn new(channel: Arc<StreamChannel>, request_ended: bool) -> Self {
+    fn new(channel: Arc<StreamChannel>, cluster: String, request_ended: bool) -> Self {
         Self {
             channel,
+            cluster,
+            started_at: Instant::now(),
+            outcome: None,
             request_ended,
             response_ended: false,
             reset_sent: false,
@@ -221,25 +298,43 @@ impl OpenStream {
         }
     }
 
-    /// The response head has arrived.
+    /// The response head has arrived; how long it took when it is usable.
     pub(crate) fn headers_arrived(
         &mut self,
         headers: &[(EnvoyBuffer<'_>, EnvoyBuffer<'_>)],
         end_stream: bool,
-    ) {
+    ) -> Option<Duration> {
         if self.response_ended {
-            return;
+            return None;
         }
         let Some(head) = head_of(headers) else {
             self.fail(BridgeError::Upstream(
                 "the response carried no valid :status".to_owned(),
             ));
-            return;
+            return None;
         };
         self.upgraded = head.status == 101;
         self.channel.response.push_head(head);
         if end_stream {
             self.end();
+        }
+        Some(self.started_at.elapsed())
+    }
+
+    /// How the stream ended.
+    pub(crate) fn outcome(&self) -> CallOutcome {
+        self.outcome.unwrap_or(CallOutcome::Abandoned)
+    }
+
+    /// The fiber stopped the stream: it gave up, or the upstream went quiet
+    /// for too long. Ending an upgraded session is how it completes.
+    fn stopped_by_fiber(&self) -> CallOutcome {
+        if self.channel.timed_out() {
+            CallOutcome::TimedOut
+        } else if self.upgraded {
+            CallOutcome::Completed
+        } else {
+            CallOutcome::Abandoned
         }
     }
 
@@ -264,6 +359,7 @@ impl OpenStream {
                 // The fiber closed the stream, and its reset is already wanted.
                 None => {
                     self.response_ended = true;
+                    self.outcome.get_or_insert(self.stopped_by_fiber());
                     return false;
                 }
             }
@@ -312,6 +408,12 @@ impl OpenStream {
             self.completed();
             return;
         }
+        if self.reset_sent && self.outcome.is_none() {
+            self.outcome = Some(self.stopped_by_fiber());
+        }
+        if reason == envoy_dynamic_module_type_http_stream_reset_reason::Overflow {
+            self.outcome.get_or_insert(CallOutcome::Refused);
+        }
         if !self.response_ended {
             self.fail(BridgeError::Upstream(reset_reason(reason).to_owned()));
         }
@@ -320,6 +422,12 @@ impl OpenStream {
 
     /// The request is over before the stream; whoever reads it hears so.
     pub(crate) fn abandon(&mut self) {
+        // An upgraded session whose client went away has simply ended.
+        self.outcome.get_or_insert(if self.upgraded {
+            CallOutcome::Completed
+        } else {
+            CallOutcome::Abandoned
+        });
         if !self.response_ended {
             self.fail(BridgeError::Upstream(
                 "the request finished before the stream did".to_owned(),
@@ -335,11 +443,13 @@ impl OpenStream {
 
     fn end(&mut self) {
         self.response_ended = true;
+        self.outcome.get_or_insert(CallOutcome::Completed);
         self.channel.response.push_end();
     }
 
     fn fail(&mut self, error: BridgeError) {
         self.response_ended = true;
+        self.outcome.get_or_insert(failed(&error));
         self.channel.fail(error);
     }
 }
@@ -349,6 +459,7 @@ impl OpenStream {
 pub(crate) fn start<EHF: EnvoyHttpFilter>(
     envoy_filter: &mut EHF,
     request: UpstreamStreamRequest,
+    trace: &[(&'static str, Vec<u8>)],
 ) -> Started {
     let UpstreamStreamRequest {
         cluster,
@@ -357,7 +468,7 @@ pub(crate) fn start<EHF: EnvoyHttpFilter>(
         channel,
     } = request;
     if channel.wants_reset() {
-        return Started::Skipped;
+        return Started::Skipped(cluster);
     }
     // A body the fiber finished before the stream started goes out with the
     // headers, so a stream without one is never sent as chunked.
@@ -367,10 +478,7 @@ pub(crate) fn start<EHF: EnvoyHttpFilter>(
         Some(StreamItem::Chunk(chunk)) => (Some(chunk.as_slice()), false),
         _ => (None, false),
     };
-    let headers = headers
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_slice()))
-        .collect::<Vec<_>>();
+    let headers = with_trace(&headers, trace);
     // Envoy reads zero as no deadline at all, which a sub-millisecond one must
     // not become.
     let timeout_ms = if timeout.is_zero() {
@@ -384,9 +492,9 @@ pub(crate) fn start<EHF: EnvoyHttpFilter>(
         envoy_filter.start_http_stream(&cluster, &headers, body, request_ended, timeout_ms);
     if let Some(refusal) = refusal(result, &cluster) {
         channel.fail(BridgeError::Upstream(refusal));
-        return Started::Refused(channel);
+        return Started::Refused(channel, cluster);
     }
-    Started::Open(handle, OpenStream::new(channel, request_ended))
+    Started::Open(handle, OpenStream::new(channel, cluster, request_ended))
 }
 
 fn reset_reason(reason: envoy_dynamic_module_type_http_stream_reset_reason) -> &'static str {
@@ -466,6 +574,7 @@ mod tests {
         let refused = send(
             &mut envoy_filter,
             request(b"", Duration::from_micros(10)),
+            &[],
             &mut in_flight,
         );
 
@@ -487,13 +596,15 @@ mod tests {
             });
         let mut in_flight = InFlight::default();
 
-        let refused = send(
+        let (refused, cluster) = send(
             &mut envoy_filter,
             request(b"payload", Duration::from_secs(1)),
+            &[],
             &mut in_flight,
         )
         .expect("a refused call comes back to be woken");
 
+        assert_eq!(cluster, "users");
         assert!(in_flight.is_empty());
         match items(&refused).as_slice() {
             [StreamItem::Failed(BridgeError::Upstream(reason))] => {
@@ -501,6 +612,31 @@ mod tests {
             }
             other => panic!("expected one failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_request_trace_goes_along_unless_the_application_set_it() {
+        let mut envoy_filter = MockEnvoyHttpFilter::default();
+        envoy_filter
+            .expect_send_http_callout()
+            .returning(|_, headers, _, _| {
+                assert!(headers.contains(&("traceparent", b"00-mine-01".as_slice())));
+                assert!(!headers.contains(&("traceparent", b"00-request-01".as_slice())));
+                assert!(headers.contains(&("x-request-id", b"r-1".as_slice())));
+                (
+                    envoy_dynamic_module_type_http_callout_init_result::Success,
+                    7,
+                )
+            });
+        let mut own = request(b"", Duration::from_secs(1));
+        own.headers
+            .push(("traceparent".to_owned(), b"00-mine-01".to_vec()));
+        let trace = [
+            ("traceparent", b"00-request-01".to_vec()),
+            ("x-request-id", b"r-1".to_vec()),
+        ];
+
+        assert!(send(&mut envoy_filter, own, &trace, &mut InFlight::default()).is_none());
     }
 
     #[test]
@@ -513,7 +649,7 @@ mod tests {
         ];
         let body = [EnvoyBuffer::new(b"hel"), EnvoyBuffer::new(b"lo")];
 
-        deliver(
+        let outcome = deliver(
             &stream,
             envoy_dynamic_module_type_http_callout_result::Success,
             Some(&headers),
@@ -521,6 +657,7 @@ mod tests {
             64,
         );
 
+        assert_eq!(outcome, CallOutcome::Completed);
         match items(&stream).as_slice() {
             [
                 StreamItem::Head(head),
@@ -541,19 +678,22 @@ mod tests {
         }
     }
 
-    /// Why delivering a five byte body under `limit` failed, and whether it
-    /// failed for being too large.
+    /// Why delivering a five byte body under `limit` failed, and the outcome
+    /// it was counted as.
     fn failure(
         result: Outcome,
         headers: &[(EnvoyBuffer<'_>, EnvoyBuffer<'_>)],
         limit: usize,
-    ) -> (String, bool) {
+    ) -> (String, CallOutcome) {
         let stream = ResponseStream::new(64);
         let body = [EnvoyBuffer::new(b"12345")];
-        deliver(&stream, result, Some(headers), Some(&body), limit);
+        let outcome = deliver(&stream, result, Some(headers), Some(&body), limit);
         match items(&stream).as_slice() {
-            [StreamItem::Failed(BridgeError::Upstream(reason))] => (reason.clone(), false),
-            [StreamItem::Failed(BridgeError::UpstreamTooLarge(reason))] => (reason.clone(), true),
+            [
+                StreamItem::Failed(
+                    BridgeError::Upstream(reason) | BridgeError::UpstreamTooLarge(reason),
+                ),
+            ] => (reason.clone(), outcome),
             other => panic!("expected one failure, got {other:?}"),
         }
     }
@@ -564,18 +704,30 @@ mod tests {
         let no_status = [(EnvoyBuffer::new(b"x-a"), EnvoyBuffer::new(b"1"))];
 
         let cases = [
-            (failure(Outcome::Success, &status, 4), "limit", true),
-            (failure(Outcome::Success, &no_status, 64), ":status", false),
-            (failure(Outcome::Reset, &[], 64), "reset", false),
+            (
+                failure(Outcome::Success, &status, 4),
+                "limit",
+                CallOutcome::TooLarge,
+            ),
+            (
+                failure(Outcome::Success, &no_status, 64),
+                ":status",
+                CallOutcome::Reset,
+            ),
+            (
+                failure(Outcome::Reset, &[], 64),
+                "reset",
+                CallOutcome::Reset,
+            ),
             (
                 failure(Outcome::ExceedResponseBufferLimit, &[], 64),
                 "buffer limit",
-                true,
+                CallOutcome::TooLarge,
             ),
         ];
-        for ((reason, too_large), expected, expected_too_large) in cases {
+        for ((reason, outcome), expected, expected_outcome) in cases {
             assert!(reason.contains(expected), "{reason}");
-            assert_eq!(too_large, expected_too_large, "{reason}");
+            assert_eq!(outcome, expected_outcome, "{reason}");
         }
     }
 
@@ -617,7 +769,8 @@ mod tests {
             },
         );
 
-        let Started::Open(handle, mut stream) = start(&mut envoy_filter, stream_request(&channel))
+        let Started::Open(handle, mut stream) =
+            start(&mut envoy_filter, stream_request(&channel), &[])
         else {
             panic!("the stream should open");
         };
@@ -647,7 +800,7 @@ mod tests {
         };
 
         assert!(matches!(
-            start(&mut envoy_filter, request),
+            start(&mut envoy_filter, request, &[]),
             Started::Open(9, _)
         ));
     }
@@ -666,8 +819,8 @@ mod tests {
             });
 
         assert!(matches!(
-            start(&mut envoy_filter, stream_request(&channel)),
-            Started::Refused(_)
+            start(&mut envoy_filter, stream_request(&channel), &[]),
+            Started::Refused(_, _)
         ));
         match items(&channel.response).as_slice() {
             [StreamItem::Failed(BridgeError::Upstream(reason))] => {
@@ -685,15 +838,15 @@ mod tests {
         let mut envoy_filter = MockEnvoyHttpFilter::default();
 
         assert!(matches!(
-            start(&mut envoy_filter, stream_request(&channel)),
-            Started::Skipped
+            start(&mut envoy_filter, stream_request(&channel), &[]),
+            Started::Skipped(_)
         ));
     }
 
     #[test]
     fn the_body_goes_out_a_piece_at_a_time_and_then_ends() {
         let channel = Arc::new(StreamChannel::new(64));
-        let mut stream = OpenStream::new(Arc::clone(&channel), false);
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), false);
 
         assert_eq!(channel.request.push_chunk_within_budget(b"ab"), Some(2));
         assert_eq!(
@@ -716,7 +869,7 @@ mod tests {
     #[test]
     fn a_wanted_reset_is_asked_for_once() {
         let channel = Arc::new(StreamChannel::new(64));
-        let mut stream = OpenStream::new(Arc::clone(&channel), false);
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), false);
         channel.close();
 
         assert_eq!(stream.next_action(), Some(StreamAction::Reset));
@@ -726,7 +879,7 @@ mod tests {
     #[test]
     fn the_response_arrives_as_its_head_its_chunks_and_its_end() {
         let channel = Arc::new(StreamChannel::new(64));
-        let mut stream = OpenStream::new(Arc::clone(&channel), true);
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), true);
         let headers = [
             (EnvoyBuffer::new(b":status"), EnvoyBuffer::new(b"200")),
             (
@@ -735,10 +888,11 @@ mod tests {
             ),
         ];
 
-        stream.headers_arrived(&headers, false);
+        assert!(stream.headers_arrived(&headers, false).is_some());
         assert!(!stream.data_arrived(&[EnvoyBuffer::new(b"data: 1\n\n")], false));
         assert!(!stream.data_arrived(&[EnvoyBuffer::new(b"data: 2\n\n")], true));
         stream.completed();
+        assert_eq!(stream.outcome(), CallOutcome::Completed);
 
         match items(&channel.response).as_slice() {
             [
@@ -762,7 +916,7 @@ mod tests {
     #[test]
     fn a_body_still_going_up_when_the_stream_ends_is_stopped() {
         let channel = Arc::new(StreamChannel::new(64));
-        let mut stream = OpenStream::new(Arc::clone(&channel), false);
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), false);
         assert_eq!(channel.request.push_chunk_within_budget(b"part"), Some(4));
 
         stream.headers_arrived(&status(b"200"), true);
@@ -779,7 +933,7 @@ mod tests {
     #[test]
     fn a_delivery_past_the_buffer_fails_the_stream_and_wants_a_reset() {
         let channel = Arc::new(StreamChannel::new(4));
-        let mut stream = OpenStream::new(Arc::clone(&channel), true);
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), true);
         stream.headers_arrived(&status(b"200"), false);
 
         assert!(!stream.data_arrived(&[EnvoyBuffer::new(b"abc")], false));
@@ -801,14 +955,17 @@ mod tests {
             "{items:?}"
         );
         assert_eq!(stream.next_action(), Some(StreamAction::Reset));
+        stream.reset_by_envoy(envoy_dynamic_module_type_http_stream_reset_reason::LocalReset);
+        assert_eq!(stream.outcome(), CallOutcome::Overflow);
     }
 
     #[test]
     fn a_reset_from_envoy_arrives_as_a_failure_naming_its_reason() {
         let channel = Arc::new(StreamChannel::new(64));
-        let mut stream = OpenStream::new(Arc::clone(&channel), true);
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), true);
         stream
             .reset_by_envoy(envoy_dynamic_module_type_http_stream_reset_reason::ConnectionFailure);
+        assert_eq!(stream.outcome(), CallOutcome::Reset);
 
         match items(&channel.response).as_slice() {
             [StreamItem::Failed(BridgeError::Upstream(reason))] => {
@@ -821,7 +978,7 @@ mod tests {
     #[test]
     fn an_upgraded_stream_the_upstream_closes_ends_after_what_it_sent() {
         let channel = Arc::new(StreamChannel::new(64));
-        let mut stream = OpenStream::new(Arc::clone(&channel), false);
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), false);
         stream.headers_arrived(&status(b"101"), false);
         assert!(!stream.data_arrived(&[EnvoyBuffer::new(b"bye")], false));
         stream.reset_by_envoy(envoy_dynamic_module_type_http_stream_reset_reason::LocalReset);
@@ -831,24 +988,30 @@ mod tests {
             [StreamItem::Head(_), StreamItem::Chunk(bytes), StreamItem::End] if bytes == b"bye"
         ));
         assert!(channel.request.is_cancelled(), "nothing more can go up");
+        assert_eq!(stream.outcome(), CallOutcome::Completed);
     }
 
     #[test]
     fn an_upgraded_stream_the_worker_reset_still_fails() {
         let channel = Arc::new(StreamChannel::new(64));
-        let mut stream = OpenStream::new(Arc::clone(&channel), false);
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), false);
         stream.headers_arrived(&status(b"101"), false);
         channel.close();
         assert_eq!(stream.next_action(), Some(StreamAction::Reset));
         stream.reset_by_envoy(envoy_dynamic_module_type_http_stream_reset_reason::LocalReset);
 
         assert!(channel.response.is_cancelled());
+        assert_eq!(
+            stream.outcome(),
+            CallOutcome::Completed,
+            "ending a session is how it completes"
+        );
     }
 
     #[test]
     fn trailers_end_the_response_and_are_kept() {
         let channel = Arc::new(StreamChannel::new(64));
-        let mut stream = OpenStream::new(Arc::clone(&channel), true);
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), true);
         stream.headers_arrived(&status(b"200"), false);
         stream.trailers_arrived(&[(EnvoyBuffer::new(b"grpc-status"), EnvoyBuffer::new(b"0"))]);
 
@@ -865,7 +1028,7 @@ mod tests {
     #[test]
     fn a_request_that_finishes_first_fails_its_streams() {
         let channel = Arc::new(StreamChannel::new(64));
-        let mut stream = OpenStream::new(Arc::clone(&channel), true);
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), true);
         stream.abandon();
 
         match items(&channel.response).as_slice() {
@@ -874,5 +1037,53 @@ mod tests {
             }
             other => panic!("expected one failure, got {other:?}"),
         }
+        assert_eq!(stream.outcome(), CallOutcome::Abandoned);
+    }
+
+    /// The outcome of a stream that got its head, after the fiber `stops` it
+    /// and Envoy reports the reset that follows.
+    fn stopped(stops: impl FnOnce(&StreamChannel), status_code: &'static [u8]) -> CallOutcome {
+        let channel = Arc::new(StreamChannel::new(64));
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), true);
+        stream.headers_arrived(&status(status_code), false);
+        stops(&channel);
+        assert_eq!(stream.next_action(), Some(StreamAction::Reset));
+        stream.reset_by_envoy(envoy_dynamic_module_type_http_stream_reset_reason::LocalReset);
+        stream.outcome()
+    }
+
+    #[test]
+    fn a_stream_the_fiber_stops_is_abandoned_or_timed_out() {
+        assert_eq!(
+            stopped(StreamChannel::close, b"200"),
+            CallOutcome::Abandoned
+        );
+        assert_eq!(
+            stopped(StreamChannel::time_out, b"200"),
+            CallOutcome::TimedOut
+        );
+        assert_eq!(
+            stopped(StreamChannel::time_out, b"101"),
+            CallOutcome::TimedOut
+        );
+    }
+
+    #[test]
+    fn a_stream_envoy_turns_away_after_starting_it_is_refused() {
+        let channel = Arc::new(StreamChannel::new(64));
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), true);
+        stream.reset_by_envoy(envoy_dynamic_module_type_http_stream_reset_reason::Overflow);
+
+        assert_eq!(stream.outcome(), CallOutcome::Refused);
+    }
+
+    #[test]
+    fn an_upgraded_session_whose_request_finished_has_completed() {
+        let channel = Arc::new(StreamChannel::new(64));
+        let mut stream = OpenStream::new(Arc::clone(&channel), "users".to_owned(), false);
+        stream.headers_arrived(&status(b"101"), false);
+        stream.abandon();
+
+        assert_eq!(stream.outcome(), CallOutcome::Completed);
     }
 }

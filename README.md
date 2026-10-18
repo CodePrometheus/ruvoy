@@ -250,7 +250,8 @@ What Envoy's module interface can report sets some limits:
 
 ### `ruvoy.upstream`
 
-Calls a cluster Envoy was configured with and returns a Rack-style triple:
+Calls a cluster Envoy was configured with and returns the status, the headers
+and the whole body as a String:
 
 ```ruby
 status, headers, body = env["ruvoy.upstream"].call(
@@ -293,8 +294,28 @@ Envoy applies no flow control to it, so a reader that falls more than
 With `protocol: "websocket"`, the response upgrades the client too and relays
 both ways.
 
+Calls and streams carry the request's trace context on: `traceparent`,
+`tracestate`, `x-request-id` and the B3 headers, unless the call sets them.
+
 [`examples/extensions`](examples/extensions) runs both against a stand-in
 service, including two calls from one request overlapping.
+
+## Statistics
+
+Ruvoy reports through Envoy's statistics, so the numbers reach whatever sink
+Envoy has, the admin interface's `/stats/prometheus` among them.
+
+- `requests_total`, `rejected_total{reason}`, `responses_total{outcome}` and
+  `duration_ms`: requests, and how those that reached the application ended.
+- `inflight_requests`, `reactor_idle_ms` and `resident_bytes`: sampled as
+  requests start and end, so an idle proxy shows the last sample. After a
+  client leaves mid-request, `inflight_requests` can stay above zero until the
+  next request.
+- `upstream_calls_total{cluster, outcome}`: calls by how the application saw
+  them end, `completed`, `refused`, `timed_out`, `overflow`, `too_large`,
+  `reset` or `abandoned`. `upstream_duration_ms{cluster}` times a `call` to its
+  whole response and a `stream` to its head. Status codes and Envoy's own
+  timeouts are in the cluster's statistics.
 
 ## Scaling
 

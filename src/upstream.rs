@@ -74,6 +74,7 @@ pub struct StreamChannel {
     /// forward.
     pub request: Arc<ResponseStream>,
     reset_wanted: AtomicBool,
+    timed_out: AtomicBool,
     trailers: Mutex<Option<Vec<(String, String)>>>,
 }
 
@@ -85,6 +86,7 @@ impl StreamChannel {
             response: Arc::new(ResponseStream::new(budget)),
             request: Arc::new(ResponseStream::new(budget)),
             reset_wanted: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
             trailers: Mutex::new(None),
         }
     }
@@ -95,6 +97,19 @@ impl StreamChannel {
         self.response.cancel();
         self.request.cancel();
         self.reset_wanted.store(true, Ordering::Release);
+    }
+
+    /// The application stops the stream because the upstream went quiet past
+    /// its idle timeout.
+    pub fn time_out(&self) {
+        self.timed_out.store(true, Ordering::Release);
+        self.close();
+    }
+
+    /// True when the application stopped the stream for going quiet.
+    #[must_use]
+    pub fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
     }
 
     /// The stream fails with `error`, which the fiber reads in place of the
@@ -364,6 +379,17 @@ mod tests {
         assert!(channel.wants_reset());
         assert!(channel.response.is_cancelled());
         assert!(channel.response.take_next().is_none());
+        assert!(!channel.timed_out());
+    }
+
+    #[test]
+    fn a_channel_timed_out_is_closed_and_says_so() {
+        let channel = StreamChannel::new(8);
+        channel.time_out();
+
+        assert!(channel.wants_reset());
+        assert!(channel.response.is_cancelled());
+        assert!(channel.timed_out());
     }
 }
 

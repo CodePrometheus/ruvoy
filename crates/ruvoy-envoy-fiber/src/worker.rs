@@ -1,11 +1,11 @@
 use crate::{
     context,
     metrics::{
-        Metrics, OUTCOME_CANCELLED, OUTCOME_COMPLETED, OUTCOME_FAILED, REJECTED_ADMISSION,
-        REJECTED_INTERNAL, REJECTED_INVALID_REQUEST,
+        CallOutcome, Metrics, OUTCOME_CANCELLED, OUTCOME_COMPLETED, OUTCOME_FAILED,
+        REJECTED_ADMISSION, REJECTED_INTERNAL, REJECTED_INVALID_REQUEST,
     },
     runtime::{ContextConfig, FiberRackConfig},
-    upstream::{self, InFlight, OpenStream, OpenStreams, Started, StreamAction},
+    upstream::{self, InFlight, OpenStream, OpenStreams, Started, StreamAction, TRACE_HEADERS},
 };
 use abi::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
@@ -61,6 +61,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FiberRackConfig {
             upstreams: None,
             upstream_calls: InFlight::default(),
             upstream_streams: OpenStreams::default(),
+            trace: None,
         }))
     }
 }
@@ -99,6 +100,8 @@ struct FiberRackFilter {
     upstream_calls: InFlight,
     /// Streams started and not yet reported finished.
     upstream_streams: OpenStreams,
+    /// The request's trace context, read when its first call goes out.
+    trace: Option<Vec<(&'static str, Vec<u8>)>>,
 }
 
 impl Drop for FiberRackFilter {
@@ -116,29 +119,47 @@ impl Drop for FiberRackFilter {
             request.stream.cancel();
             self.client.wake_body(request.stream);
         }
-        // Envoy cancels what it sent without reporting back, so every fiber
-        // still waiting on a call hears it from here.
+        // Normally done when the stream completed, where it could be counted.
+        self.abandon_upstreams();
+    }
+}
+
+impl FiberRackFilter {
+    /// Fails every call and stream the request leaves behind and wakes the
+    /// fibers waiting on them, saying how each ended and on which cluster.
+    ///
+    /// Envoy cancels what it sent without reporting back, so this is the only
+    /// place those fibers hear of it.
+    fn abandon_upstreams(&mut self) -> Vec<(String, CallOutcome)> {
         let unsent = self
             .upstreams
             .take()
             .map(|upstreams| upstreams.close())
             .unwrap_or_default();
+        let mut ended = Vec::new();
         let waiting = unsent
             .calls
             .into_iter()
-            .map(|request| request.response)
-            .chain(self.upstream_calls.drain().map(|(_, response)| response));
-        for response in waiting {
+            .map(|request| (request.response, request.cluster))
+            .chain(
+                self.upstream_calls
+                    .drain()
+                    .map(|(_, call)| (call.response, call.cluster)),
+            )
+            .collect::<Vec<_>>();
+        for (response, cluster) in waiting {
             response.push_failure(BridgeError::Upstream(
                 "the request finished before the call did".to_owned(),
             ));
             self.client.wake_body(response);
+            ended.push((cluster, CallOutcome::Abandoned));
         }
         for request in unsent.streams {
             request.channel.fail(BridgeError::Upstream(
                 "the request finished before the stream did".to_owned(),
             ));
             self.wake_stream(&request.channel);
+            ended.push((request.cluster, CallOutcome::Abandoned));
         }
         let open = self
             .upstream_streams
@@ -148,11 +169,22 @@ impl Drop for FiberRackFilter {
         for mut stream in open {
             stream.abandon();
             self.wake_stream(&stream.channel);
+            ended.push((stream.cluster.clone(), stream.outcome()));
+        }
+        ended
+    }
+
+    fn count_call<EHF: EnvoyHttpFilter>(
+        &self,
+        envoy_filter: &EHF,
+        cluster: &str,
+        outcome: CallOutcome,
+    ) {
+        if let Some(metrics) = self.metrics {
+            metrics.upstream_call(envoy_filter, cluster, outcome);
         }
     }
-}
 
-impl FiberRackFilter {
     fn copy_headers<EHF: EnvoyHttpFilter>(
         &self,
         envoy_filter: &EHF,
@@ -493,18 +525,43 @@ impl FiberRackFilter {
             return;
         };
         let (calls, streams) = (upstreams.take_queued(), upstreams.take_queued_streams());
+        if calls.is_empty() && streams.is_empty() {
+            self.pump_streams(envoy_filter);
+            return;
+        }
+        let trace = self
+            .trace
+            .get_or_insert_with(|| {
+                TRACE_HEADERS
+                    .iter()
+                    .filter_map(|&name| {
+                        envoy_filter
+                            .get_request_header_value(name)
+                            .map(|value| (name, value.as_slice().to_vec()))
+                    })
+                    .collect()
+            })
+            .clone();
         for request in calls {
-            if let Some(refused) = upstream::send(envoy_filter, request, &mut self.upstream_calls) {
+            if let Some((refused, cluster)) =
+                upstream::send(envoy_filter, request, &trace, &mut self.upstream_calls)
+            {
                 self.client.wake_body(refused);
+                self.count_call(envoy_filter, &cluster, CallOutcome::Refused);
             }
         }
         for request in streams {
-            match upstream::start(envoy_filter, request) {
+            match upstream::start(envoy_filter, request, &trace) {
                 Started::Open(handle, stream) => {
                     self.upstream_streams.insert(handle, stream);
                 }
-                Started::Refused(channel) => self.wake_stream(&channel),
-                Started::Skipped => {}
+                Started::Refused(channel, cluster) => {
+                    self.wake_stream(&channel);
+                    self.count_call(envoy_filter, &cluster, CallOutcome::Refused);
+                }
+                Started::Skipped(cluster) => {
+                    self.count_call(envoy_filter, &cluster, CallOutcome::Abandoned);
+                }
             }
         }
         self.pump_streams(envoy_filter);
@@ -614,21 +671,33 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
 
     fn on_http_callout_done(
         &mut self,
-        _envoy_filter: &mut EHF,
+        envoy_filter: &mut EHF,
         callout_id: u64,
         result: envoy_dynamic_module_type_http_callout_result,
         response_headers: Option<&[(EnvoyBuffer<'_>, EnvoyBuffer<'_>)]>,
         response_body: Option<&[EnvoyBuffer<'_>]>,
     ) {
-        let Some(response) = self.upstream_calls.remove(&callout_id) else {
+        let Some(call) = self.upstream_calls.remove(&callout_id) else {
             return;
         };
         let limit = self
             .upstream_settings
             .as_ref()
             .map_or(0, |settings| settings.max_response_bytes);
-        upstream::deliver(&response, result, response_headers, response_body, limit);
-        self.client.wake_body(response);
+        let outcome = upstream::deliver(
+            &call.response,
+            result,
+            response_headers,
+            response_body,
+            limit,
+        );
+        self.count_call(envoy_filter, &call.cluster, outcome);
+        if outcome == CallOutcome::Completed
+            && let Some(metrics) = self.metrics
+        {
+            metrics.upstream_answered(envoy_filter, &call.cluster, call.waited());
+        }
+        self.client.wake_body(call.response);
     }
 
     /// Envoy is done with this stream, however it ended.
@@ -638,11 +707,14 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
     /// disconnect drives `requests_total` and `responses_total` further apart.
     fn on_stream_complete(&mut self, envoy_filter: &mut EHF) {
         self.report_outcome(envoy_filter, OUTCOME_CANCELLED);
+        for (cluster, outcome) in self.abandon_upstreams() {
+            self.count_call(envoy_filter, &cluster, outcome);
+        }
     }
 
     fn on_http_stream_headers(
         &mut self,
-        _envoy_filter: &mut EHF,
+        envoy_filter: &mut EHF,
         stream_handle: u64,
         response_headers: &[(EnvoyBuffer<'_>, EnvoyBuffer<'_>)],
         end_stream: bool,
@@ -650,8 +722,11 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
         let Some(stream) = self.upstream_streams.get_mut(&stream_handle) else {
             return;
         };
-        stream.headers_arrived(response_headers, end_stream);
-        let channel = Arc::clone(&stream.channel);
+        let waited = stream.headers_arrived(response_headers, end_stream);
+        let (channel, cluster) = (Arc::clone(&stream.channel), stream.cluster.clone());
+        if let (Some(waited), Some(metrics)) = (waited, self.metrics) {
+            metrics.upstream_answered(envoy_filter, &cluster, waited);
+        }
         self.wake_stream(&channel);
     }
 
@@ -689,17 +764,18 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
         self.wake_stream(&channel);
     }
 
-    fn on_http_stream_complete(&mut self, _envoy_filter: &mut EHF, stream_handle: u64) {
+    fn on_http_stream_complete(&mut self, envoy_filter: &mut EHF, stream_handle: u64) {
         let Some(mut stream) = self.upstream_streams.remove(&stream_handle) else {
             return;
         };
         stream.completed();
         self.wake_stream(&stream.channel);
+        self.count_call(envoy_filter, &stream.cluster, stream.outcome());
     }
 
     fn on_http_stream_reset(
         &mut self,
-        _envoy_filter: &mut EHF,
+        envoy_filter: &mut EHF,
         stream_handle: u64,
         reset_reason: envoy_dynamic_module_type_http_stream_reset_reason,
     ) {
@@ -708,6 +784,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for FiberRackFilter {
         };
         stream.reset_by_envoy(reset_reason);
         self.wake_stream(&stream.channel);
+        self.count_call(envoy_filter, &stream.cluster, stream.outcome());
     }
 
     fn on_downstream_above_write_buffer_high_watermark(&mut self, _envoy_filter: &mut EHF) {

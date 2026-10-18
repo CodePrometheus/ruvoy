@@ -110,6 +110,8 @@ class EnvoyExtensionsTest < E2ETestCase
                 "thresholds" => [ { "max_connections" => 1, "max_pending_requests" => 1, "max_requests" => 1 } ]
               }
             ),
+            # Only the test that counts calls uses this one.
+            cluster("counted", upstream.port),
             cluster("unreachable", UNREACHABLE_PORT),
             cluster("mtls_upstream", TERMINATOR_PORT).merge("transport_socket" => upstream_tls)
           ]
@@ -185,7 +187,7 @@ class EnvoyExtensionsTest < E2ETestCase
       if extensions
         filter_config["context"] = { "metadata_namespaces" => %w[acme.tenant acme.route absent] }
         filter_config["upstream"] = {
-          "clusters" => %w[test_upstream breaker unreachable mtls_upstream missing_cluster],
+          "clusters" => %w[test_upstream counted breaker unreachable mtls_upstream missing_cluster],
           "timeout_ms" => 2_000,
           "max_response_bytes" => MAX_RESPONSE_BYTES,
           "stream_buffer_bytes" => STREAM_BUFFER_BYTES
@@ -346,6 +348,52 @@ class EnvoyExtensionsTest < E2ETestCase
       assert_equal error, result["error"], "#{arguments} => #{result}"
       assert_includes result["message"], message
     end
+  end
+
+  def test_each_call_is_counted_by_how_it_ended
+    before = upstream_calls
+    call("cluster" => "counted", "path" => "/echo")
+    call("cluster" => "missing_cluster", "path" => "/echo")
+    call("cluster" => "counted", "path" => "/bytes/#{MAX_RESPONSE_BYTES + 1}")
+    stream("cluster" => "counted", "path" => "/flood/#{8 * 1024 * 1024}", "pause" => 0.5)
+    stream("cluster" => "counted", "path" => "/delay/1500", "idle_timeout" => 0.3)
+    stream("cluster" => "counted", "path" => "/chunks/8/50", "take" => 1)
+    stream("cluster" => "counted", "path" => "/cut")
+    post_json(PORT, "/abandon", "cluster" => "counted", "path" => "/hang/counted")
+
+    expected = { %w[counted completed] => 1, %w[missing_cluster refused] => 1, %w[counted too_large] => 1,
+                 %w[counted overflow] => 1, %w[counted timed_out] => 1, %w[counted abandoned] => 2,
+                 %w[counted reset] => 1 }
+    deadline = clock + 5
+    counted = nil
+    loop do
+      counted = upstream_calls.to_h { |key, value| [ key, value - before.fetch(key, 0) ] }.reject { |_, value| value.zero? }
+      break if counted == expected || clock > deadline
+
+      sleep 0.05
+    end
+    assert_equal expected, counted
+    # The whole response for a call, the head for each stream that got one.
+    wait_for(timeout: 12) { prometheus[/upstream_duration_ms_count\{[^}]*cluster="counted"[^}]*\} (\d+)/, 1].to_i == 5 }
+  end
+
+  def test_a_call_carries_the_requests_trace_unless_it_sets_its_own
+    trace = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    incoming = { "content-type" => "application/json", "traceparent" => trace, "x-b3-traceid" => "80f198ee56343ba8" }
+    forwarded = lambda do |path, arguments|
+      response = http_post("http://127.0.0.1:#{PORT}#{path}", JSON.generate(arguments), incoming)
+      result = JSON.parse(response.body)
+      JSON.parse(path == "/call" ? result.fetch("body") : result.fetch("chunks").join).fetch("headers")
+    end
+
+    [ [ "/call", { "cluster" => "test_upstream", "path" => "/echo" } ], [ "/stream", { "path" => "/echo" } ] ].each do |path, arguments|
+      headers = forwarded.call(path, arguments)
+      assert_equal [ trace ], headers["traceparent"], path
+      assert_equal [ "80f198ee56343ba8" ], headers["x-b3-traceid"], path
+      assert_match(/\A\S+\z/, headers.fetch("x-request-id").first, path)
+    end
+    own = forwarded.call("/call", "cluster" => "test_upstream", "path" => "/echo", "headers" => { "traceparent" => "00-own" })
+    assert_equal [ "00-own" ], own["traceparent"], "the application's own trace context wins"
   end
 
   def test_envoy_answers_for_an_upstream_that_is_too_slow_unreachable_or_hangs_up
@@ -834,6 +882,17 @@ class EnvoyExtensionsTest < E2ETestCase
 
   def call(arguments)
     post_json(PORT, "/call", arguments)
+  end
+
+  def prometheus
+    http_get("http://127.0.0.1:#{ADMIN_PORT}/stats/prometheus").body
+  end
+
+  # Calls counted so far, by cluster and outcome.
+  def upstream_calls
+    prometheus.scan(/upstream_calls_total\{([^}]*)\} (\d+)/).to_h do |labels, value|
+      [ labels.scan(/(\w+)="([^"]*)"/).to_h.values_at("cluster", "outcome"), value.to_i ]
+    end
   end
 
   def stream(spec)

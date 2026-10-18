@@ -6,6 +6,15 @@ is, and its version is that Envoy version.
 
 ## Unreleased
 
+### Added
+
+- Statistics for calls to clusters: `upstream_calls_total{cluster, outcome}`
+  counts how each call ended as the application saw it, and
+  `upstream_duration_ms{cluster}` times a call to its whole response and a
+  stream to its head.
+- Calls and streams carry the request's trace context on: `traceparent`,
+  `tracestate`, `x-request-id` and the B3 headers, unless the call sets them.
+
 ## 0.3.0 - 2026-10-15
 
 ### Added

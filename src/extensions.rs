@@ -67,6 +67,9 @@ pub(crate) fn define(ruby: &Ruby, module: RModule) -> Result<(), BridgeError> {
         .and_then(|()| channel.define_method("writer", method!(UpstreamChannelObject::writer, 0)))
         .and_then(|()| channel.define_method("close", method!(UpstreamChannelObject::close, 0)))
         .and_then(|()| {
+            channel.define_method("time_out", method!(UpstreamChannelObject::time_out, 0))
+        })
+        .and_then(|()| {
             channel.define_method("trailers", method!(UpstreamChannelObject::trailers, 0))
         })
         .map_err(|error| ruby_error("defining UpstreamChannel methods", error))?;
@@ -431,6 +434,12 @@ impl UpstreamChannelObject {
     /// Stops the stream: nothing more is read or sent, and the worker resets it.
     fn close(&self) {
         self.channel.close();
+        self.upstreams.wake();
+    }
+
+    /// Stops the stream because the upstream went quiet for too long.
+    fn time_out(&self) {
+        self.channel.time_out();
         self.upstreams.wake();
     }
 

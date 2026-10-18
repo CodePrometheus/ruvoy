@@ -121,7 +121,7 @@ module Ruvoy
     def await(queue)
       Park.on(queue, @idle_timeout)
     rescue Async::TimeoutError
-      @channel.close
+      @channel.time_out
       raise UpstreamTimeout, "the upstream sent nothing for #{@idle_timeout} seconds"
     end
   end

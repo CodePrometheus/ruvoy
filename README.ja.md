@@ -248,7 +248,7 @@ Envoy のモジュールインターフェースが報告できる範囲から�
 
 ### `ruvoy.upstream`
 
-Envoy に設定された cluster を呼び出し、Rack 形式の 3 要素配列を返します。
+Envoy に設定された cluster を呼び出し、ステータス、ヘッダー、ボディ全体（String）を返します。
 
 ```ruby
 status, headers, body = env["ruvoy.upstream"].call(
@@ -289,8 +289,29 @@ Envoy はこれにフロー制御をかけないため、読み手が `upstream.
 （既定 1 MiB）以上遅れるとストリームはリセットされます。`protocol: "websocket"` を
 付けると、レスポンスはクライアントも切り替えて双方向に中継します。
 
+呼び出しとストリームはリクエストのトレースコンテキストを引き継ぎます。
+`traceparent`、`tracestate`、`x-request-id` と B3 ヘッダーで、呼び出し側が
+自分で設定したものはそのままです。
+
 [`examples/extensions`](examples/extensions) では、代わりのサービスを相手に両方
 の機能を動かし、1 つのリクエストからの 2 つの呼び出しが並行する様子も確認できます。
+
+## 統計
+
+Ruvoy は Envoy の統計を通して報告するため、数値は Envoy に設定されたシンク、
+admin インターフェースの `/stats/prometheus` などに届きます。
+
+- `requests_total`、`rejected_total{reason}`、`responses_total{outcome}`、
+  `duration_ms`：リクエスト数と、アプリケーションに届いたリクエストの終わり方。
+- `inflight_requests`、`reactor_idle_ms`、`resident_bytes`：リクエストの開始と
+  終了時にサンプリングするため、アイドル中は最後の値が表示されます。クライ
+  アントが途中で離れた後は、次のリクエストまで `inflight_requests` が 0 より
+  大きいままのことがあります。
+- `upstream_calls_total{cluster, outcome}`：アプリケーションから見た呼び出しの
+  終わり方ごとの件数で、`completed`、`refused`、`timed_out`、`overflow`、
+  `too_large`、`reset`、`abandoned` のいずれかです。`upstream_duration_ms{cluster}`
+  は `call` ではレスポンス全体まで、`stream` ではヘッダーまでの時間です。ステー
+  タスコードと Envoy 自身のタイムアウトは cluster の統計にあります。
 
 ## スケーリング
 

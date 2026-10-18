@@ -217,7 +217,7 @@ Envoy 模块接口能报告的内容决定了几条限制：
 
 ### `ruvoy.upstream`
 
-调用 Envoy 配置里的某个 cluster，返回 Rack 风格的三元组：
+调用 Envoy 配置里的某个 cluster，返回状态码、响应头，以及完整响应体（String）：
 
 ```ruby
 status, headers, body = env["ruvoy.upstream"].call(
@@ -251,8 +251,26 @@ run ->(env) { env["ruvoy.upstream"].stream("api", env["REQUEST_METHOD"], env["PA
 Envoy 对它不做流控，读者落后超过 `upstream.stream_buffer_bytes`（默认 1 MiB）
 即重置流。带上 `protocol: "websocket"` 时，响应会把客户端也升级，并双向转发。
 
+调用和流会带上请求的 trace 上下文：`traceparent`、`tracestate`、`x-request-id`
+和 B3 系列头，调用自己设置了的除外。
+
 [`examples/extensions`](examples/extensions) 用一个替身服务把两项能力都跑一遍，
 包括同一请求里两次调用的重叠。
+
+## 统计
+
+Ruvoy 通过 Envoy 的统计上报，数字会进入 Envoy 配置的任何 sink，包括 admin 接口的
+`/stats/prometheus`。
+
+- `requests_total`、`rejected_total{reason}`、`responses_total{outcome}` 与
+  `duration_ms`：请求数，以及进入应用的请求如何结束。
+- `inflight_requests`、`reactor_idle_ms` 与 `resident_bytes`：在请求开始和结束时
+  采样，空闲时显示最后一次的值。客户端中途离开后，`inflight_requests` 可能停在
+  大于 0 的值，直到下一个请求。
+- `upstream_calls_total{cluster, outcome}`：按应用看到的结局给调用计数，
+  `completed`、`refused`、`timed_out`、`overflow`、`too_large`、`reset` 或
+  `abandoned`。`upstream_duration_ms{cluster}` 对 `call` 计到完整响应，对 `stream`
+  计到响应头。状态码和 Envoy 自己的超时在 cluster 的统计里。
 
 ## 扩展
 

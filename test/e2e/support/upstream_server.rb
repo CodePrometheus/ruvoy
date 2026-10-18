@@ -182,6 +182,9 @@ class UpstreamServer
       accept_websocket(connection, request)
       connection.read rescue nil
       @lock.synchronize { @hung_up << key }
+    # Hangs up partway through the body, as an upstream that crashes would.
+    when "/cut"
+      chunked(connection, finish: false) { |send| send.call("first\n") }
     when %r{\A/hang/(.+)\z}
       key = $1
       chunked(connection, finish: false) { |send| send.call("first\n") }
