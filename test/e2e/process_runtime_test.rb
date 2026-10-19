@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "yaml"
 require_relative "test_helper"
 
 # The process-wide Ruby runtime: one CRuby VM per Envoy process, shared by
@@ -62,7 +63,7 @@ class ProcessRuntimeTest < E2ETestCase
     other = File.join(scratch_dir, "other.ru")
     FileUtils.cp(fixture_rackup, other)
     FileUtils.cp(File.join(root, "test", "fixtures", "rack", "app.rb"), scratch_dir)
-    log = start(config([ [ "ruvoy_first", 19192 ], [ "ruvoy_second", 19193, other ] ]), "mismatch")
+    log = start(config([ [ "ruvoy_first", 19192 ], [ "ruvoy_second", 19193 ] ], bootstraps: [ fixture_rackup, other ]), "mismatch")
     refute_nil @envoy.wait_exit(timeout: 60), "Envoy stayed up with two different rackup paths"
     # What the operator needs from the message, not its wording: both rackups
     # named, and that a restart is what resolves it.
@@ -75,7 +76,7 @@ class ProcessRuntimeTest < E2ETestCase
   end
 
   def test_a_missing_rackup_fails_closed
-    log = start(config([ [ "ruvoy_first", 19194, File.join(scratch_dir, "does-not-exist.ru") ] ]), "missing")
+    log = start(config([ [ "ruvoy_first", 19194 ] ], bootstraps: [ File.join(scratch_dir, "does-not-exist.ru") ]), "missing")
     refute_nil @envoy.wait_exit(timeout: 60), "Envoy stayed up with a missing rackup"
     text = File.read(log)
     assert_includes text, "failed to resolve rackup", "the startup error does not name the unresolved rackup"
@@ -85,7 +86,7 @@ class ProcessRuntimeTest < E2ETestCase
   def test_a_raising_rackup_fails_closed
     raising = File.join(scratch_dir, "raising.ru")
     File.write(raising, "raise \"intentional startup failure\"\n")
-    log = start(config([ [ "ruvoy_first", 19195, raising ] ]), "raising")
+    log = start(config([ [ "ruvoy_first", 19195 ] ], bootstraps: [ raising ]), "raising")
     refute_nil @envoy.wait_exit(timeout: 60), "Envoy stayed up after a Ruby startup exception"
     text = File.read(log)
     assert_includes text, "intentional startup failure", "the Ruby startup exception was swallowed"
@@ -182,8 +183,7 @@ class ProcessRuntimeTest < E2ETestCase
 
   def start(config, name)
     File.join(self.class.results, "#{name}.log").tap do |log|
-      @envoy = Envoy.start(config: config, modules: module_dir, log: log, log_level: "info",
-                           env: bundle_env.merge("RUVOY_DIAGNOSTICS" => "1"))
+      @envoy = Envoy.start(config: config, modules: module_dir, log: log, log_level: "info", env: bundle_env)
     end
   end
 
@@ -191,20 +191,24 @@ class ProcessRuntimeTest < E2ETestCase
     log = File.join(self.class.results, "hot-epoch#{epoch}.log")
     envoy = Envoy.start(config: config, modules: module_dir, log: log, log_level: "info",
                         hot_restart: { epoch: epoch, base_id: 7, drain_time: 5, parent_shutdown_time: 10 },
-                        env: bundle_env.merge("RUVOY_DIAGNOSTICS" => "1"))
+                        env: bundle_env)
     [ envoy, log ]
   end
 
-  def config(listeners, admin_port: nil)
+  # One bootstrap extension per rackup in `bootstraps`: a second one is how a
+  # process is asked for two applications.
+  def config(listeners, admin_port: nil, bootstraps: [ fixture_rackup ])
     @configs = (@configs || 0) + 1
     File.join(scratch_dir, "config-#{@configs}.yaml").tap do |path|
       admin = admin_port ? [ "admin:", "  address:", "    socket_address:", "      address: 127.0.0.1", "      port_value: #{admin_port}" ] : []
-      File.write(path, (admin + [ "static_resources:", "  listeners:" ]).map { |line| "#{line}\n" }.join +
-                       listeners.map { |name, port, rackup| listener(name, port, rackup || fixture_rackup) }.join)
+      extensions = bootstraps.map { |rackup| bootstrap_extension(rackup: rackup, diagnostics: true) }
+      File.write(path, YAML.dump("bootstrap_extensions" => extensions).delete_prefix("---\n") +
+                       (admin + [ "static_resources:", "  listeners:" ]).map { |line| "#{line}\n" }.join +
+                       listeners.map { |name, port| listener(name, port) }.join)
     end
   end
 
-  def listener(name, port, rackup)
+  def listener(name, port)
     <<~YAML.gsub(/^/, "    ")
       - name: #{name}
         address:
@@ -236,7 +240,7 @@ class ProcessRuntimeTest < E2ETestCase
                         terminal_filter: true
                         filter_config:
                           "@type": type.googleapis.com/google.protobuf.StringValue
-                          value: #{rackup}
+                          value: "{}"
     YAML
   end
 end

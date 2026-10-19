@@ -14,7 +14,7 @@ use crate::{
     wake,
 };
 use magnus::{
-    RArray, RClass, RModule, Ruby, Value, kwargs, method,
+    RArray, RClass, RModule, RString, Ruby, Value, kwargs, method,
     prelude::*,
     value::{BoxValue, Opaque},
 };
@@ -48,6 +48,7 @@ const STREAM_SOURCE: &str = include_str!("../ruby/stream.rb");
 
 /// Moves blocking calls off the runtime thread.
 const OFFLOAD_SOURCE: &str = include_str!("../ruby/offload.rb");
+const LIFECYCLE_SOURCE: &str = include_str!("../ruby/lifecycle.rb");
 
 enum FiberApp {
     Source(String),
@@ -56,7 +57,58 @@ enum FiberApp {
 
 enum FiberCommand {
     Call(Box<FiberCall>),
-    Shutdown { reply: SyncSender<()> },
+    /// A request on Envoy's admin interface, answered by Ruby.
+    Admin(Box<AdminCall>),
+    /// Envoy has begun draining: the application's drain hooks run.
+    Drain,
+    Shutdown {
+        reply: SyncSender<()>,
+    },
+}
+
+struct AdminCall {
+    request: AdminRequest,
+    reply: SyncSender<(u32, String)>,
+}
+
+struct AdminRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+    inflight: usize,
+}
+
+/// An admin request handed to Ruby, which answers it with `reply`.
+#[magnus::wrap(class = "Ruvoy::AdminEnvelope", free_immediately)]
+struct AdminEnvelope {
+    request: AdminRequest,
+    reply: RefCell<Option<SyncSender<(u32, String)>>>,
+}
+
+impl AdminEnvelope {
+    fn http_method(&self) -> String {
+        self.request.method.clone()
+    }
+
+    fn path(&self) -> String {
+        self.request.path.clone()
+    }
+
+    fn body(ruby: &Ruby, rb_self: &Self) -> RString {
+        ruby.str_from_slice(&rb_self.request.body)
+    }
+
+    fn inflight(&self) -> usize {
+        self.request.inflight
+    }
+
+    /// Answers the request; a second answer, or one after the asker gave up,
+    /// goes nowhere.
+    fn reply(&self, status: u32, body: String) {
+        if let Some(reply) = self.reply.borrow_mut().take() {
+            let _ = reply.send((status, body));
+        }
+    }
 }
 
 struct FiberCall {
@@ -142,6 +194,9 @@ impl FiberBridge {
             .map_err(|error| fiber_bridge_error(ruby, error))?;
 
         let envelopes = ruby.ary_new();
+        // Rare, so an ordinary pass allocates nothing for them.
+        let mut admin: Option<RArray> = None;
+        let mut draining = false;
         let mut shutting_down = false;
         loop {
             match bridge.command_rx.borrow().try_recv() {
@@ -152,6 +207,16 @@ impl FiberBridge {
                     });
                     envelopes.push(envelope)?;
                 }
+                Ok(FiberCommand::Admin(call)) => {
+                    let AdminCall { request, reply } = *call;
+                    admin
+                        .get_or_insert_with(|| ruby.ary_new())
+                        .push(ruby.obj_wrap(AdminEnvelope {
+                            request,
+                            reply: RefCell::new(Some(reply)),
+                        }))?;
+                }
+                Ok(FiberCommand::Drain) => draining = true,
                 Ok(FiberCommand::Shutdown { reply }) => {
                     *bridge.shutdown_reply.borrow_mut() = Some(reply);
                     shutting_down = true;
@@ -167,6 +232,8 @@ impl FiberBridge {
 
         let batch = ruby.ary_new();
         batch.push(envelopes)?;
+        batch.push(admin)?;
+        batch.push(draining)?;
         batch.push(shutting_down)?;
         Ok(batch)
     }
@@ -383,6 +450,34 @@ impl FiberRuntimeClient {
         })))
     }
 
+    /// Hands an admin request to Ruby and waits for its answer.
+    pub fn admin(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<(u32, String), BridgeError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.send_and_wake(FiberCommand::Admin(Box::new(AdminCall {
+            request: AdminRequest {
+                method: method.to_owned(),
+                path: path.to_owned(),
+                body: body.to_vec(),
+                inflight: self.admission.used(),
+            },
+            reply: reply_tx,
+        })))?;
+        reply_rx
+            .recv_timeout(timeout)
+            .map_err(wake::map_recv_timeout)
+    }
+
+    /// Tells the application that Envoy has begun draining.
+    pub fn drain(&self) -> Result<(), BridgeError> {
+        self.send_and_wake(FiberCommand::Drain)
+    }
+
     fn request_shutdown(&self, timeout: Duration) -> Result<(), BridgeError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.send_and_wake(FiberCommand::Shutdown { reply: reply_tx })?;
@@ -455,8 +550,12 @@ impl FiberRuntime {
         app_source: impl Into<String>,
         max_inflight_requests: usize,
     ) -> Result<Self, BridgeError> {
-        Self::start_app_retained(FiberApp::Source(app_source.into()), max_inflight_requests)?
-            .into_result()
+        Self::start_app_retained(
+            FiberApp::Source(app_source.into()),
+            max_inflight_requests,
+            None,
+        )?
+        .into_result()
     }
 
     /// Starts a Fiber runtime with the application built from a rackup file.
@@ -469,13 +568,14 @@ impl FiberRuntime {
         path: impl AsRef<Path>,
         max_inflight_requests: usize,
     ) -> Result<Self, BridgeError> {
-        Self::start_rackup_with_limit_retained(path, max_inflight_requests)?.into_result()
+        Self::start_rackup_with_limit_retained(path, max_inflight_requests, None)?.into_result()
     }
 
     /// Starts a rackup application, keeping the VM alive even if loading fails.
     pub fn start_rackup_with_limit_retained(
         path: impl AsRef<Path>,
         max_inflight_requests: usize,
+        settings_json: Option<String>,
     ) -> Result<FiberRuntimeStartup, BridgeError> {
         let path = path.as_ref();
         let rackup = path.canonicalize().map_err(|error| {
@@ -490,12 +590,19 @@ impl FiberRuntime {
                 rackup.display()
             )));
         }
-        Self::start_app_retained(FiberApp::Rackup(rackup), max_inflight_requests)
+        Self::start_app_retained(
+            FiberApp::Rackup(rackup),
+            max_inflight_requests,
+            settings_json,
+        )
     }
 
+    /// `settings_json`, when given, is what the application sees as
+    /// `Ruvoy::Lifecycle.settings`.
     fn start_app_retained(
         app: FiberApp,
         max_inflight_requests: usize,
+        settings_json: Option<String>,
     ) -> Result<FiberRuntimeStartup, BridgeError> {
         if max_inflight_requests == 0 {
             return Err(BridgeError::Startup(
@@ -522,6 +629,7 @@ impl FiberRuntime {
             .spawn(move || {
                 fiber_runtime_main(
                     app,
+                    settings_json,
                     command_rx,
                     wake_reader,
                     ready_tx,
@@ -586,8 +694,9 @@ impl FiberRuntime {
     ///
     /// # Safety
     ///
-    /// This must only run at the end of the process, after all possible Ruby
-    /// execution and all clones of the runtime client have stopped.
+    /// The VM cannot start again in this process, so this must run only once
+    /// nothing will ask Ruby for more. Clones of the runtime client may outlive
+    /// it; what they send from then on is refused.
     pub unsafe fn shutdown(mut self) -> Result<(), BridgeError> {
         self.shutdown_inner(DEFAULT_RESPONSE_TIMEOUT)
     }
@@ -632,6 +741,7 @@ impl Drop for FiberRuntime {
 
 fn fiber_runtime_main(
     app: FiberApp,
+    settings_json: Option<String>,
     command_rx: Receiver<FiberCommand>,
     wake_reader: UnixStream,
     ready_tx: SyncSender<Result<RuntimeInfo, BridgeError>>,
@@ -643,7 +753,9 @@ fn fiber_runtime_main(
     let cleanup = unsafe { magnus::embed::init() };
     let ruby = &*cleanup;
 
-    let prepared = panic::catch_unwind(AssertUnwindSafe(|| prepare_fiber_runtime(ruby, app)));
+    let prepared = panic::catch_unwind(AssertUnwindSafe(|| {
+        prepare_fiber_runtime(ruby, app, settings_json)
+    }));
     let (app, rack_errors, body_reader, runner, request_body_class, info) = match prepared {
         Ok(Ok(prepared)) => prepared,
         Ok(Err(error)) => {
@@ -711,7 +823,11 @@ fn set_source_encoding(ruby: &Ruby) -> Result<(), BridgeError> {
         .map_err(|error| ruby_error("setting the default encoding", error))
 }
 
-fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRuntime, BridgeError> {
+fn prepare_fiber_runtime(
+    ruby: &Ruby,
+    app: FiberApp,
+    settings_json: Option<String>,
+) -> Result<PreparedFiberRuntime, BridgeError> {
     set_source_encoding(ruby)?;
 
     // RubyGems activates a gem from inside its own `Kernel#require`, which the
@@ -751,14 +867,37 @@ fn prepare_fiber_runtime(ruby: &Ruby, app: FiberApp) -> Result<PreparedFiberRunt
     envelope_class
         .define_method("cancelled?", method!(FiberEnvelope::cancelled, 0))
         .map_err(|error| ruby_error("defining FiberEnvelope methods", error))?;
+    let admin_class = ruvoy_module
+        .define_class("AdminEnvelope", ruby.class_object())
+        .map_err(|error| ruby_error("defining AdminEnvelope", error))?;
+    admin_class
+        .define_method("http_method", method!(AdminEnvelope::http_method, 0))
+        .and_then(|_| admin_class.define_method("path", method!(AdminEnvelope::path, 0)))
+        .and_then(|_| admin_class.define_method("body", method!(AdminEnvelope::body, 0)))
+        .and_then(|_| admin_class.define_method("inflight", method!(AdminEnvelope::inflight, 0)))
+        .and_then(|_| admin_class.define_method("reply", method!(AdminEnvelope::reply, 2)))
+        .map_err(|error| ruby_error("defining AdminEnvelope methods", error))?;
     crate::chunks::define(ruby, ruvoy_module)?;
     ruby.eval::<Value>(STREAM_SOURCE)
         .map_err(|error| ruby_error("loading Ruvoy::Stream", error))?;
     crate::extensions::define(ruby, ruvoy_module)?;
     ruby.eval::<Value>(OFFLOAD_SOURCE)
         .map_err(|error| ruby_error("loading Ruvoy.offload", error))?;
+    ruby.eval::<Value>(LIFECYCLE_SOURCE)
+        .map_err(|error| ruby_error("loading Ruvoy::Lifecycle", error))?;
+    if let Some(json) = settings_json {
+        let lifecycle = ruvoy_module
+            .const_get::<_, RModule>("Lifecycle")
+            .map_err(|error| ruby_error("loading Ruvoy::Lifecycle", error))?;
+        lifecycle
+            .funcall::<_, _, Value>("load_settings", (ruby.str_new(&json),))
+            .map_err(|error| ruby_error("loading the runtime settings", error))?;
+    }
 
     let app = BoxValue::new(load_fiber_app(ruby, app)?);
+    // Registered while the application loaded; it is not ready until they ran.
+    ruby.eval::<Value>("Ruvoy::Lifecycle.run_before_ready")
+        .map_err(|error| ruby_error("running before_ready hooks", error))?;
     let rack_errors = BoxValue::new(
         ruby.eval::<Value>("STDERR")
             .map_err(|error| ruby_error("loading rack.errors", error))?,
@@ -794,6 +933,10 @@ fn retain_failed_runtime(command_rx: Receiver<FiberCommand>, startup_error: Brid
                 call.handle.stream.push_failure(startup_error.clone());
                 call.handle.wake();
             }
+            Ok(FiberCommand::Admin(call)) => {
+                let _ = call.reply.send((503, format!("{startup_error}\n")));
+            }
+            Ok(FiberCommand::Drain) => {}
             Ok(FiberCommand::Shutdown { reply }) => {
                 let _ = reply.send(());
                 return;

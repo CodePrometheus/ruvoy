@@ -126,6 +126,11 @@ class SoakTest < E2ETestCase
   def bootstrap_config
     {
       "node" => { "id" => "ruvoy-soak", "cluster" => "ruvoy" },
+      "bootstrap_extensions" => [
+        bootstrap_extension(rackup: File.join(root, "test", "fixtures", "soak", "config.ru"))
+      ],
+      # What the generated configuration runs with.
+      "memory_allocator_manager" => Ruvoy::EnvoyConfig.memory_allocator_manager,
       "dynamic_resources" => {
         "lds_config" => { "resource_api_version" => "V3", "path_config_source" => { "path" => @lds } }
       },
@@ -167,8 +172,7 @@ class SoakTest < E2ETestCase
   end
 
   def listener(name, port, timeout_ms)
-    settings = { "rackup" => File.join(root, "test", "fixtures", "soak", "config.ru"),
-                 "upstream" => { "clusters" => [ "upstream" ], "timeout_ms" => timeout_ms } }
+    settings = { "upstream" => { "clusters" => [ "upstream" ], "timeout_ms" => timeout_ms } }
     {
       "@type" => "type.googleapis.com/envoy.config.listener.v3.Listener",
       "name" => name,
@@ -211,13 +215,13 @@ class SoakTest < E2ETestCase
   end
 
   # Waits for the pooled upstream connections to close, then reads what
-  # should be back to rest. The gauges are republished only as requests end,
-  # so they are read after the requests that ask for the rest.
+  # should be back to rest. The gauges are sampled once a second, so they are
+  # read before the requests that ask for the rest can show up in them.
   def idle_state(label)
     sleep 7
+    stats = admin_stats
     state = JSON.parse(http_get(url(:steady, "/state")).body)
     heap = JSON.parse(http_get(url(:steady, "/heap")).body).fetch("live_slots")
-    stats = admin_stats
     { "label" => label, "fds" => fd_count, "threads" => thread_count, "rss_kib" => rss_kib, "heap" => heap,
       "fibers" => state.fetch("fibers"), "sessions" => state.fetch("sessions"), **stats }.tap do |snapshot|
       File.write(File.join(@results, "#{label}.json"), JSON.pretty_generate(snapshot))

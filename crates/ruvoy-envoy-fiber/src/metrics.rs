@@ -3,25 +3,15 @@
 //! Reporting into Envoy's stats rather than a channel of our own means the
 //! numbers reach whatever sink the proxy is already configured with.
 //!
-//! Counters record events as they happen; the saturation gauges are republished
-//! from the runtime itself so a missed update cannot leave them drifting.
+//! Counters and histograms record events as they happen, on the worker that saw
+//! them. How loaded the runtime is lives on the bootstrap extension, which
+//! publishes it from the main thread.
 
 use envoy_proxy_dynamic_modules_rust_sdk::{
-    EnvoyCounterId, EnvoyCounterVecId, EnvoyGaugeId, EnvoyHistogramId, EnvoyHistogramVecId,
-    EnvoyHttpFilter, EnvoyHttpFilterConfig, envoy_log_warn,
+    EnvoyCounterId, EnvoyCounterVecId, EnvoyHistogramId, EnvoyHistogramVecId, EnvoyHttpFilter,
+    EnvoyHttpFilterConfig, envoy_log_warn,
 };
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
-
-/// Requests between resident-memory samples.
-///
-/// Reading it costs a file read, which is too much per request at the rates
-/// this runtime reaches, and memory does not move fast enough to need it.
-const RESIDENT_SAMPLE_INTERVAL: u64 = 512;
-
-static SAMPLES: AtomicU64 = AtomicU64::new(0);
+use std::time::Duration;
 
 /// Why a request never reached the application.
 pub(crate) const REJECTED_ADMISSION: &str = "admission";
@@ -73,9 +63,6 @@ pub(crate) struct Metrics {
     requests: EnvoyCounterId,
     rejected: EnvoyCounterVecId,
     responses: EnvoyCounterVecId,
-    inflight_requests: EnvoyGaugeId,
-    resident_bytes: EnvoyGaugeId,
-    reactor_idle_ms: EnvoyGaugeId,
     duration_ms: EnvoyHistogramId,
     upstream_calls: EnvoyCounterVecId,
     upstream_duration_ms: EnvoyHistogramVecId,
@@ -96,9 +83,6 @@ impl Metrics {
                 responses: config
                     .define_counter_vec("responses_total", &["outcome"])
                     .ok()?,
-                inflight_requests: config.define_gauge("inflight_requests").ok()?,
-                resident_bytes: config.define_gauge("resident_bytes").ok()?,
-                reactor_idle_ms: config.define_gauge("reactor_idle_ms").ok()?,
                 duration_ms: config.define_histogram("duration_ms").ok()?,
                 upstream_calls: config
                     .define_counter_vec("upstream_calls_total", &["cluster", "outcome"])
@@ -160,46 +144,4 @@ impl Metrics {
             waited.as_millis() as u64,
         );
     }
-
-    /// Republishes how loaded and how responsive the runtime currently is.
-    ///
-    /// Only a worker thread may write statistics, so these are sampled as
-    /// requests begin and end. An idle proxy therefore reports what it last saw
-    /// rather than what is true right now.
-    pub(crate) fn saturation<EHF: EnvoyHttpFilter>(
-        self,
-        envoy_filter: &EHF,
-        requests: usize,
-        reactor_idle: Duration,
-    ) {
-        let _ = envoy_filter.set_gauge(self.inflight_requests, requests as u64);
-        let _ = envoy_filter.set_gauge(self.reactor_idle_ms, reactor_idle.as_millis() as u64);
-
-        if SAMPLES
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(RESIDENT_SAMPLE_INTERVAL)
-            && let Some(bytes) = resident_bytes()
-        {
-            let _ = envoy_filter.set_gauge(self.resident_bytes, bytes);
-        }
-    }
-}
-
-/// Resident memory of this process.
-///
-/// An embedded VM grows in ways the proxy cannot see, so the orchestrator gets
-/// the number and decides what to do with it. Platforms without a cheap way to
-/// read it simply report nothing rather than a number that is not comparable.
-#[cfg(target_os = "linux")]
-fn resident_bytes() -> Option<u64> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-    // SAFETY: `sysconf` reads a static system parameter and takes no pointers.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u64::try_from(page_size).ok().map(|size| pages * size)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn resident_bytes() -> Option<u64> {
-    None
 }

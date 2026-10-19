@@ -7,6 +7,7 @@
 # co-located upstream. A textual substitution cannot tell those apart, so the
 # rewrite walks the parsed document instead.
 
+require "json"
 require "yaml"
 
 source, destination, listen_address, repo_root, certificate_path, private_key_path = ARGV
@@ -40,13 +41,16 @@ def downstream_tls_context(certificate_path, private_key_path)
   }
 end
 
+# The rackup sits inside the bootstrap extension's JSON settings.
 def absolutize_rackup(node, repo_root)
   case node
   when Hash
     node.each do |key, value|
-      if key == "value" && value.is_a?(String) && value.end_with?(".ru") &&
-         !value.start_with?("/")
-        node[key] = File.join(repo_root, value)
+      if key == "value" && value.is_a?(String) && value.start_with?("{") && value.include?("rackup")
+        settings = JSON.parse(value)
+        rackup = settings["rackup"]
+        settings["rackup"] = File.join(repo_root, rackup) if rackup && !rackup.start_with?("/")
+        node[key] = JSON.generate(settings)
       else
         absolutize_rackup(value, repo_root)
       end

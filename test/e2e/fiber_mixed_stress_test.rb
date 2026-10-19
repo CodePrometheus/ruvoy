@@ -10,6 +10,7 @@ require_relative "test_helper"
 class FiberMixedStressTest < E2ETestCase
   FIBER_PORT = 19183
   CONTROL_PORT = 19184
+  ADMIN_PORT = 19185
   MAX_INFLIGHT_REQUESTS = 256
   OHA_VERSION = "oha 1.15.0"
   CONTROL_LIMIT_SECONDS = 0.5
@@ -22,7 +23,7 @@ class FiberMixedStressTest < E2ETestCase
     @settings = mixed_settings
     assert File.executable?(oha), "missing project-local oha"
     assert_equal OHA_VERSION, IO.popen([ oha, "--version" ], &:read).strip, "expected #{OHA_VERSION}"
-    [ FIBER_PORT, CONTROL_PORT ].each { |port| assert_port_free(port) }
+    [ FIBER_PORT, CONTROL_PORT, ADMIN_PORT ].each { |port| assert_port_free(port) }
     @results = File.join(result_dir, "poc6-fiber-mixed-stress-#{run_id}")
     FileUtils.mkdir_p(@results)
     write_headers
@@ -49,8 +50,12 @@ class FiberMixedStressTest < E2ETestCase
     last = @heap.fetch("cycle-#{@settings[:cycles]}-recovered")
     assert_operator last[:slots], :<=, first[:slots] * 1.10 + 5000,
                     "Ruby live slots grew beyond the mixed-stress threshold: #{first[:slots]} -> #{last[:slots]}"
-    assert_operator last[:rss], :<=, [ first[:rss] * 1.25, first[:rss] + 65_536 ].max,
-                    "Envoy RSS grew beyond the mixed-stress threshold: #{first[:rss]} -> #{last[:rss]} KiB"
+    # The allocator keeps what it frees, so the resident set remembers the
+    # busiest cycle; a leak shows as live allocations or memory outside it.
+    assert_operator last[:allocated], :<=, first[:allocated] * 1.10 + 8192,
+                    "allocations still live grew: #{first[:allocated]} -> #{last[:allocated]} KiB"
+    assert_operator last[:outside], :<=, first[:outside] * 1.10 + 16_384,
+                    "memory outside the allocator grew: #{first[:outside]} -> #{last[:outside]} KiB"
     assert_operator last[:fds], :<=, first[:fds] + 32,
                     "Envoy FD count grew beyond the mixed-stress threshold: #{first[:fds]} -> #{last[:fds]}"
 
@@ -60,7 +65,9 @@ class FiberMixedStressTest < E2ETestCase
     assert status&.success?, "Envoy did not stop after the bounded shutdown sequence"
     assert_includes File.read(@envoy_log), "[ruvoy] Fiber runtime stopped", "Fiber runtime did not report clean shutdown"
     puts "result=PASS", "cycles=#{@settings[:cycles]}", "heap_live_slots=#{first[:slots]}->#{last[:slots]}",
-         "rss_kib=#{first[:rss]}->#{last[:rss]}", "fd_count=#{first[:fds]}->#{last[:fds]}", "raw_results=#{@results}"
+         "rss_kib=#{first[:rss]}->#{last[:rss]}", "allocated_kib=#{first[:allocated]}->#{last[:allocated]}",
+         "outside_allocator_kib=#{first[:outside]}->#{last[:outside]}", "fd_count=#{first[:fds]}->#{last[:fds]}",
+         "raw_results=#{@results}"
   ensure
     @load&.each { |pid| terminate(pid) }
     @sampling = false
@@ -117,8 +124,8 @@ class FiberMixedStressTest < E2ETestCase
 
   def write_headers
     @files = {
-      resources: [ "resources.tsv", %w[epoch phase cpu_percent rss_kib fd_count] ],
-      heap: [ "heap.tsv", %w[label heap_live_slots rss_kib fd_count] ],
+      resources: [ "resources.tsv", %w[epoch phase cpu_percent rss_kib fd_count allocated_kib allocator_resident_kib] ],
+      heap: [ "heap.tsv", %w[label heap_live_slots rss_kib fd_count allocated_kib outside_allocator_kib] ],
       status: [ "status.tsv", %w[label total status_200 status_503 transport_errors] ],
       control: [ "control.tsv", %w[label elapsed_seconds] ]
     }.transform_values do |(name, columns)|
@@ -150,13 +157,11 @@ class FiberMixedStressTest < E2ETestCase
 
   def start_envoy
     config = File.join(scratch_dir, "envoy.yaml")
-    template = File.read(File.join(root, "config", "envoy-fiber-rack.yaml"))
-    File.write(config, template.sub("value: bench/config.ru", "value: #{fixture_rackup}"))
-    assert_includes File.read(config), "value: #{fixture_rackup}", "failed to configure the Rack fixture"
+    File.write(config, fiber_rack_config(max_inflight_requests: MAX_INFLIGHT_REQUESTS))
     @envoy_log = File.join(@results, "envoy.log")
-    @envoy = Envoy.start(config: config, modules: module_dir, log: @envoy_log,
-                         concurrency: @settings[:envoy_concurrency],
-                         env: bundle_env.merge("RUVOY_MAX_INFLIGHT_REQUESTS" => MAX_INFLIGHT_REQUESTS.to_s))
+    # Info, so the log carries the runtime's own report of its shutdown.
+    @envoy = Envoy.start(config: config, modules: module_dir, log: @envoy_log, log_level: "info",
+                         admin_port: ADMIN_PORT, concurrency: @settings[:envoy_concurrency], env: bundle_env)
     assert @envoy.serving?(url("/gc-stats"), timeout: 10), "Fiber listener did not become ready:\n#{tail(@envoy_log)}"
     @proxy_pid = @envoy.proxy_pid
     refute_nil @proxy_pid, "could not resolve the Envoy runtime PID"
@@ -183,7 +188,7 @@ class FiberMixedStressTest < E2ETestCase
         cpu, rss = IO.popen([ "ps", "-o", "%cpu=,rss=", "-p", @proxy_pid.to_s ], &:read).split
         break unless rss
 
-        append(:resources, Time.now.to_i, @phase, cpu, rss, fd_count)
+        append(:resources, Time.now.to_i, @phase, cpu, rss, fd_count, *allocator_kib)
         sleep 1
       end
     end
@@ -196,8 +201,17 @@ class FiberMixedStressTest < E2ETestCase
     rss = IO.popen([ "ps", "-o", "rss=", "-p", @proxy_pid.to_s ], &:read).strip
     assert_match(/\A\d+\z/, slots, "#{label} did not report Ruby heap live slots")
     assert_match(/\A\d+\z/, rss, "#{label} did not report Envoy RSS")
-    @heap[label] = { slots: slots.to_i, rss: rss.to_i, fds: fd_count }
+    allocated, allocator_resident = allocator_kib
+    @heap[label] = { slots: slots.to_i, rss: rss.to_i, fds: fd_count, allocated: allocated,
+                     outside: rss.to_i - allocator_resident }
     append(:heap, label, *@heap[label].values)
+  end
+
+  # What Envoy's allocator holds for live objects, and what it keeps resident
+  # including memory it has freed.
+  def allocator_kib
+    memory = JSON.parse(http_get("http://127.0.0.1:#{ADMIN_PORT}/memory").body)
+    [ memory["allocated"].to_i / 1024, memory["total_physical_bytes"].to_i / 1024 ]
   end
 
   def start_oha(label, *args)

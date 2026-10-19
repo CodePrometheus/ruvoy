@@ -96,11 +96,9 @@ class EnvoyFiberRackTest < E2ETestCase
 
   def start_envoy
     config = File.join(scratch_dir, "envoy.yaml")
-    template = File.read(File.join(root, "config", "envoy-fiber-rack.yaml"))
-    File.write(config, template.sub("value: bench/config.ru", "value: #{fixture_rackup}"))
-    assert_includes File.read(config), "value: #{fixture_rackup}", "failed to configure the Rack fixture"
+    File.write(config, fiber_rack_config(diagnostics: true))
     @envoy = Envoy.start(config: config, modules: module_dir, log: @envoy_log, concurrency: @concurrency,
-                         log_level: "info", env: bundle_env.merge("RUVOY_DIAGNOSTICS" => "1"))
+                         log_level: "info", env: bundle_env)
     ready = @envoy.serving?("http://127.0.0.1:#{CONTROL_PORT}/", timeout: 15) && @envoy.serving?(url("/info"), timeout: 15)
     assert ready, "Fiber listener did not become ready:\n#{tail(@envoy_log)}"
   end

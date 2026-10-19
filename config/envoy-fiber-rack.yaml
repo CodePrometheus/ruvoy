@@ -1,3 +1,18 @@
+# The extension that starts the Ruby runtime and names the application; the
+# rack filter below joins it.
+bootstrap_extensions:
+  - name: ruvoy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.bootstrap.dynamic_modules.v3.DynamicModuleBootstrapExtension
+      dynamic_module_config:
+        name: ruvoy_fiber
+        do_not_close: true
+      extension_name: ruvoy
+      extension_config:
+        "@type": type.googleapis.com/google.protobuf.StringValue
+        value: '{"rackup": "bench/config.ru"}'
+# Envoy's allocator keeps freed memory unless told to hand some back.
+memory_allocator_manager: { bytes_to_release: 1048576, memory_release_interval: 1s }
 static_resources:
   listeners:
     - name: ruvoy_fiber_rack
@@ -34,7 +49,7 @@ static_resources:
                       terminal_filter: true
                       filter_config:
                         "@type": type.googleapis.com/google.protobuf.StringValue
-                        value: bench/config.ru
+                        value: "{}"
     - name: ruvoy_fiber_control
       address:
         socket_address:

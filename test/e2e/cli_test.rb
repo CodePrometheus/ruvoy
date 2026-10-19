@@ -58,12 +58,23 @@ class CLITest < E2ETestCase
     assert_includes config, "stream_idle_timeout: 15s"
   end
 
-  # Envoy resolves the rackup from its own working directory.
-  def test_the_rackup_path_is_absolute
-    filter = YAML.safe_load(self.class.printed_config)
-      .dig("static_resources", "listeners", 0, "filter_chains", 0, "filters", 0,
-           "typed_config", "http_filters", 0, "typed_config", "filter_config", "value")
-    assert_equal File.expand_path(self.class.rackup), filter
+  def test_the_allocator_returns_freed_memory
+    manager = YAML.safe_load(self.class.printed_config)["memory_allocator_manager"]
+    assert_operator manager["bytes_to_release"], :>, 0, "without it the resident set only grows"
+    assert_equal "1s", manager["memory_release_interval"]
+  end
+
+  # Envoy resolves the rackup from its own working directory. It is the
+  # bootstrap extension's; the filter has nothing of its own to configure.
+  def test_the_rackup_path_is_absolute_and_belongs_to_the_bootstrap_extension
+    config = YAML.safe_load(self.class.printed_config)
+    extension = config.dig("bootstrap_extensions", 0, "typed_config")
+    assert_equal "ruvoy", extension["extension_name"]
+    settings = JSON.parse(extension.dig("extension_config", "value"))
+    assert_equal File.expand_path(self.class.rackup), settings["rackup"]
+    filter = config.dig("static_resources", "listeners", 0, "filter_chains", 0, "filters", 0,
+                        "typed_config", "http_filters", 0, "typed_config", "filter_config", "value")
+    assert_equal "{}", filter
   end
 
   # An admin port bound by default would expose Envoy's control surface to

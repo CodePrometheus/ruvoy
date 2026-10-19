@@ -28,9 +28,7 @@ class RackCompatibilityTest < E2ETestCase
     def start_ruvoy
       [ FIBER_PORT, CONTROL_PORT ].each { |port| raise "TCP port #{port} is already in use" unless port_free?(port) }
       config = File.join(scratch_dir, "envoy.yaml")
-      template = File.read(File.join(root, "config", "envoy-fiber-rack.yaml"))
-      File.write(config, template.sub("value: bench/config.ru", "value: #{fixture_rackup}"))
-      raise "failed to configure the Rack fixture" unless File.read(config).include?("value: #{fixture_rackup}")
+      File.write(config, fiber_rack_config)
 
       build_module("fiber", log: File.join(scratch_dir, "build.log"))
       log = File.join(scratch_dir, "envoy.log")

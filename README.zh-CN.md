@@ -51,9 +51,10 @@ Usage: ruvoy [options] [config.ru]
         --print-config               Print the generated Envoy configuration and exit
 ```
 
-要在自己配置的 Envoy 里运行，`--print-config` 会打印 Ruvoy 本来会用的 listener；
-模块名是 `ruvoy_fiber`，它的 filter config 是 rackup 的路径，或一个包含它的
-JSON 对象（见 [Envoy context 与上游调用](#envoy-context-与上游调用)）。
+要在自己配置的 Envoy 里运行，`--print-config` 会打印 Ruvoy 本来会用的配置：命名
+rackup 的 `ruvoy` bootstrap 扩展（见 [生命周期](#生命周期)），以及一个 rack 过滤器
+加入它的 listener。过滤器自己的配置是一个可选的 JSON 对象（见
+[Envoy context 与上游调用](#envoy-context-与上游调用)）。
 
 ## 状态
 
@@ -182,7 +183,6 @@ filter config 要求时才开启，且只在 fiber 运行时提供。此时配�
 
 ```json
 {
-  "rackup": "/srv/app/config.ru",
   "context": { "metadata_namespaces": ["acme.tenant"] },
   "upstream": { "clusters": ["users"], "timeout_ms": 15000, "max_response_bytes": 1048576 }
 }
@@ -257,6 +257,42 @@ Envoy 对它不做流控，读者落后超过 `upstream.stream_buffer_bytes`（�
 [`examples/extensions`](examples/extensions) 用一个替身服务把两项能力都跑一遍，
 包括同一请求里两次调用的重叠。
 
+## 生命周期
+
+`ruvoy` bootstrap 扩展掌管 Ruby 运行时：它命名 rackup，并规定运行时按什么条件服务它；
+每个 listener 的 rack 过滤器都加入这个运行时。没有配置它时，rack 过滤器会被拒绝。
+
+```yaml
+bootstrap_extensions:
+  - name: ruvoy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.bootstrap.dynamic_modules.v3.DynamicModuleBootstrapExtension
+      dynamic_module_config: { name: ruvoy_fiber, do_not_close: true }
+      extension_name: ruvoy
+      extension_config:
+        "@type": type.googleapis.com/google.protobuf.StringValue
+        value: '{"rackup": "/srv/app/config.ru"}'
+```
+
+| 设置 | 默认值 | |
+|---|---|---|
+| `rackup` | | 应用。必填。 |
+| `max_inflight_requests` | 1024 | 同时在 Ruby 里的请求数；再多一个以 503 拒绝。 |
+| `shutdown_timeout_ms` | 10000 | 关停时等待仍在运行的 fiber 多久。 |
+| `diagnostics` | false | 给响应加上 `x-ruvoy-*` 诊断头。 |
+
+- 应用加载完成、`Ruvoy::Lifecycle.before_ready { }` 注册的钩子跑完之后，Envoy 才变为 ready。
+  应用加载失败会让 Envoy 退出。
+- `Ruvoy::Lifecycle.on_drain { }` 在 Envoy 开始 drain 时运行，此时请求照常服务：用来关闭长连接、
+  停止后台工作。
+- Envoy 的关停会停止运行时：仍在运行的 fiber 被取消，并有 `shutdown_timeout_ms` 的时间收尾。
+- admin 接口能到达 Ruby：`/ruvoy`（概览）、`/ruvoy/gc`（`GET` 返回 `GC.stat`，`POST` 触发回收，
+  `?compact=1` 同时整理）、`/ruvoy/fibers`（存活 fiber 及回溯）、`/ruvoy/config`。Ruby 在自己的
+  线程上作答，两秒内没答的返回 504。
+- `Ruvoy::Lifecycle.settings` 保存上面这些设置。
+- Envoy 的内存分配器默认不归还已释放的内存，除非 `memory_allocator_manager` 设置了
+  `bytes_to_release`；不设的话常驻内存只增不减。生成的配置每秒归还 1 MiB，手写配置也应设置。
+
 ## 统计
 
 Ruvoy 通过 Envoy 的统计上报，数字会进入 Envoy 配置的任何 sink，包括 admin 接口的
@@ -264,9 +300,8 @@ Ruvoy 通过 Envoy 的统计上报，数字会进入 Envoy 配置的任何 sink�
 
 - `requests_total`、`rejected_total{reason}`、`responses_total{outcome}` 与
   `duration_ms`：请求数，以及进入应用的请求如何结束。
-- `inflight_requests`、`reactor_idle_ms` 与 `resident_bytes`：在请求开始和结束时
-  采样，空闲时显示最后一次的值。客户端中途离开后，`inflight_requests` 可能停在
-  大于 0 的值，直到下一个请求。
+- `inflight_requests`、`reactor_idle_ms` 与 `resident_bytes`：由 bootstrap 扩展每秒在主线程
+  读取一次，请求路径上不做任何发布，空闲时显示的就是空闲的运行时。
 - `upstream_calls_total{cluster, outcome}`：按应用看到的结局给调用计数，
   `completed`、`refused`、`timed_out`、`overflow`、`too_large`、`reset` 或
   `abandoned`。`upstream_duration_ms{cluster}` 对 `call` 计到完整响应，对 `stream`

@@ -24,9 +24,7 @@ class FiberBackpressureTest < E2ETestCase
 
     def config
       @config ||= File.join(scratch_dir, "envoy.yaml").tap do |path|
-        template = File.read(File.join(root, "config", "envoy-fiber-rack.yaml"))
-        File.write(path, template.sub("value: bench/config.ru", "value: #{fixture_rackup}"))
-        raise "failed to configure the Rack fixture" unless File.read(path).include?("value: #{fixture_rackup}")
+        File.write(path, fiber_rack_config)
       end
     end
 
@@ -126,9 +124,10 @@ class FiberBackpressureTest < E2ETestCase
 
   def start_envoy(name, request_limit)
     @envoy_log = File.join(self.class.results, "#{name}-envoy.log")
-    @envoy = Envoy.start(config: self.class.config, modules: module_dir, log: @envoy_log, log_level: "info",
-                         admin_port: ADMIN_PORT,
-                         env: bundle_env.merge("RUVOY_MAX_INFLIGHT_REQUESTS" => request_limit.to_s))
+    config = File.join(scratch_dir, "#{name}.yaml")
+    File.write(config, fiber_rack_config(max_inflight_requests: request_limit))
+    @envoy = Envoy.start(config: config, modules: module_dir, log: @envoy_log, log_level: "info",
+                         admin_port: ADMIN_PORT, env: bundle_env)
     ready = @envoy.serving?("http://127.0.0.1:#{CONTROL_PORT}/", timeout: 10) && @envoy.serving?(url("/info"), timeout: 10)
     assert ready, "#{name} Envoy did not become ready:\n#{tail(@envoy_log)}"
   end

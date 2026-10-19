@@ -53,9 +53,10 @@ Usage: ruvoy [options] [config.ru]
         --print-config               Print the generated Envoy configuration and exit
 ```
 
-自分で構成した Envoy の下で動かす場合、`--print-config` が Ruvoy の使う listener を
-出力します。モジュール名は `ruvoy_fiber`、その filter config は rackup のパス、またはそれを
-含む JSON オブジェクトです（[Envoy コンテキストと上流呼び出し](#envoy-コンテキストと上流呼び出し) を参照）。
+自分で構成した Envoy の下で動かす場合、`--print-config` が Ruvoy の使う構成を出力します。
+rackup を指定する `ruvoy` bootstrap 拡張（[ライフサイクル](#ライフサイクル) を参照）と、
+その rack フィルタがそれに参加する listener です。フィルタ自身の設定は省略可能な JSON
+オブジェクトです（[Envoy コンテキストと上流呼び出し](#envoy-コンテキストと上流呼び出し) を参照）。
 
 ## ステータス
 
@@ -210,7 +211,6 @@ Rack リクエストが運ぶ以上の Envoy の情報をアプリケーショ�
 
 ```json
 {
-  "rackup": "/srv/app/config.ru",
   "context": { "metadata_namespaces": ["acme.tenant"] },
   "upstream": { "clusters": ["users"], "timeout_ms": 15000, "max_response_bytes": 1048576 }
 }
@@ -296,6 +296,46 @@ Envoy はこれにフロー制御をかけないため、読み手が `upstream.
 [`examples/extensions`](examples/extensions) では、代わりのサービスを相手に両方
 の機能を動かし、1 つのリクエストからの 2 つの呼び出しが並行する様子も確認できます。
 
+## ライフサイクル
+
+`ruvoy` bootstrap 拡張が Ruby ランタイムを所有します。rackup と、ランタイムがそれを
+配信する条件を指定し、各 listener の rack フィルタはこのランタイムに参加します。
+これなしに構成された rack フィルタは拒否されます。
+
+```yaml
+bootstrap_extensions:
+  - name: ruvoy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.bootstrap.dynamic_modules.v3.DynamicModuleBootstrapExtension
+      dynamic_module_config: { name: ruvoy_fiber, do_not_close: true }
+      extension_name: ruvoy
+      extension_config:
+        "@type": type.googleapis.com/google.protobuf.StringValue
+        value: '{"rackup": "/srv/app/config.ru"}'
+```
+
+| 設定 | 既定値 | |
+|---|---|---|
+| `rackup` | | アプリケーション。必須。 |
+| `max_inflight_requests` | 1024 | Ruby 内で同時に処理するリクエスト数。それを超えた 1 件は 503 で拒否されます。 |
+| `shutdown_timeout_ms` | 10000 | シャットダウン時に、まだ実行中の fiber を待つ時間。 |
+| `diagnostics` | false | レスポンスに `x-ruvoy-*` 診断ヘッダーを付けます。 |
+
+- Envoy が ready になるのは、アプリケーションのロードと `Ruvoy::Lifecycle.before_ready { }`
+  で登録したフックが終わってからです。ロードに失敗したアプリケーションは Envoy を停止させます。
+- `Ruvoy::Lifecycle.on_drain { }` は Envoy がドレインを始めたときに、リクエストを配信した
+  まま実行されます。持続接続を閉じる、バックグラウンド処理を止める、といった用途です。
+- Envoy のシャットダウンはランタイムを停止します。実行中の fiber はキャンセルされ、
+  `shutdown_timeout_ms` の間だけ終了を待ちます。
+- admin インターフェースは Ruby に届きます。`/ruvoy`（概要）、`/ruvoy/gc`（`GET` は
+  `GC.stat`、`POST` は回収、`?compact=1` で圧縮も）、`/ruvoy/fibers`（生存 fiber と
+  バックトレース）、`/ruvoy/config`。Ruby は自分のスレッドで答え、2 秒以内に答えない
+  ものは 504 になります。
+- `Ruvoy::Lifecycle.settings` に上記の設定が入っています。
+- Envoy のアロケータは、`memory_allocator_manager` で `bytes_to_release` を設定しない
+  かぎり解放されたメモリを OS に返さないため、常駐メモリは増える一方になります。生成される
+  構成は毎秒 1 MiB を返します。手書きの構成でも設定してください。
+
 ## 統計
 
 Ruvoy は Envoy の統計を通して報告するため、数値は Envoy に設定されたシンク、
@@ -303,10 +343,9 @@ admin インターフェースの `/stats/prometheus` などに届きます。
 
 - `requests_total`、`rejected_total{reason}`、`responses_total{outcome}`、
   `duration_ms`：リクエスト数と、アプリケーションに届いたリクエストの終わり方。
-- `inflight_requests`、`reactor_idle_ms`、`resident_bytes`：リクエストの開始と
-  終了時にサンプリングするため、アイドル中は最後の値が表示されます。クライ
-  アントが途中で離れた後は、次のリクエストまで `inflight_requests` が 0 より
-  大きいままのことがあります。
+- `inflight_requests`、`reactor_idle_ms`、`resident_bytes`：bootstrap 拡張がメイン
+  スレッドで毎秒読み取ります。リクエストの経路では何も公開せず、アイドル中は
+  アイドルのランタイムが表示されます。
 - `upstream_calls_total{cluster, outcome}`：アプリケーションから見た呼び出しの
   終わり方ごとの件数で、`completed`、`refused`、`timed_out`、`overflow`、
   `too_large`、`reset`、`abandoned` のいずれかです。`upstream_duration_ms{cluster}`

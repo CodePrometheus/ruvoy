@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const DEFAULT_SHUTDOWN_TIMEOUT_MS: usize = 10_000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
 
 /// Envoy's own default route timeout.
 const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 15_000;
@@ -37,23 +37,21 @@ pub(crate) struct FiberRackConfig {
 }
 
 impl FiberRackConfig {
+    /// Joins the runtime the bootstrap extension started; a filter cannot
+    /// start one.
     pub(crate) fn start(
         filter_config: &[u8],
         metrics: Option<Metrics>,
     ) -> Result<Self, BridgeError> {
         let FilterConfig {
-            rackup,
-            context,
-            upstream,
+            context, upstream, ..
         } = FilterConfig::parse(filter_config)?;
         let upstream = upstream.map(UpstreamConfig::into_settings).transpose()?;
-        let requested = ProcessRuntimeConfig::new(&rackup)?;
-        let runtime = process_runtime(requested)?;
-        let ready = runtime.ready()?;
+        let ready = ready()?;
 
         Ok(Self {
             client: ready.client.clone(),
-            diagnostics_enabled: runtime.config.diagnostics_enabled,
+            diagnostics_enabled: ready.diagnostics_enabled,
             runtime_thread_id: ready.runtime_thread_id.clone(),
             metrics,
             context: context.map(Arc::new),
@@ -86,6 +84,64 @@ impl FiberRackConfig {
     }
 }
 
+/// The bootstrap extension's configuration: the application and the terms the
+/// runtime serves it on.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeSettings {
+    rackup: String,
+    #[serde(default = "RuntimeSettings::default_max_inflight_requests")]
+    max_inflight_requests: usize,
+    #[serde(default = "RuntimeSettings::default_shutdown_timeout_ms")]
+    shutdown_timeout_ms: u64,
+    #[serde(default)]
+    diagnostics: bool,
+}
+
+impl RuntimeSettings {
+    pub(crate) fn parse(config: &[u8]) -> Result<Self, BridgeError> {
+        let text = std::str::from_utf8(config)
+            .map_err(|_| {
+                BridgeError::Startup(
+                    "bootstrap extension configuration must contain valid UTF-8".to_owned(),
+                )
+            })?
+            .trim();
+        if text.is_empty() {
+            return Err(BridgeError::Startup(
+                "bootstrap extension configuration must name a rackup file".to_owned(),
+            ));
+        }
+        let settings = serde_json::from_str::<Self>(text).map_err(|error| {
+            BridgeError::Startup(format!(
+                "invalid bootstrap extension configuration: {error}"
+            ))
+        })?;
+        if settings.rackup.is_empty() {
+            return Err(BridgeError::Startup("rackup must not be empty".to_owned()));
+        }
+        if settings.max_inflight_requests == 0 {
+            return Err(BridgeError::Startup(
+                "max_inflight_requests must be a positive integer".to_owned(),
+            ));
+        }
+        if settings.shutdown_timeout_ms == 0 {
+            return Err(BridgeError::Startup(
+                "shutdown_timeout_ms must be a positive integer".to_owned(),
+            ));
+        }
+        Ok(settings)
+    }
+
+    fn default_max_inflight_requests() -> usize {
+        DEFAULT_MAX_INFLIGHT_REQUESTS
+    }
+
+    fn default_shutdown_timeout_ms() -> u64 {
+        DEFAULT_SHUTDOWN_TIMEOUT_MS
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProcessRuntimeConfig {
     rackup: PathBuf,
@@ -95,10 +151,12 @@ struct ProcessRuntimeConfig {
 }
 
 /// The filter configuration as a control plane serializes it.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct FilterConfig {
-    rackup: String,
+    /// Accepted only to say where it belongs now.
+    #[serde(default)]
+    rackup: Option<serde::de::IgnoredAny>,
     /// Exposes `ruvoy.context` when present.
     #[serde(default)]
     context: Option<ContextConfig>,
@@ -130,11 +188,11 @@ struct UpstreamConfig {
 }
 
 impl FilterConfig {
-    /// Reads the filter configuration.
+    /// Reads the filter configuration: a JSON object, or nothing.
     ///
-    /// Control planes deliver it as JSON — either the rackup path on its own or
-    /// an object naming it — while a static Envoy configuration may pass the
-    /// path unquoted.
+    /// The rackup lives on the bootstrap extension, so a configuration that
+    /// still names one, as every configuration did before, is told where it
+    /// went.
     fn parse(filter_config: &[u8]) -> Result<Self, BridgeError> {
         let text = std::str::from_utf8(filter_config)
             .map_err(|_| {
@@ -142,23 +200,25 @@ impl FilterConfig {
             })?
             .trim();
         if text.is_empty() {
-            return Err(BridgeError::Startup(
-                "filter configuration must name a rackup file".to_owned(),
-            ));
+            return Ok(Self::default());
         }
-        let rackup_only = |rackup: String| Self {
-            rackup,
-            context: None,
-            upstream: None,
+        let moved = || {
+            BridgeError::Startup(
+                "the rackup is configured on the ruvoy bootstrap extension, not on the filter; \
+                 the filter configuration is a JSON object with optional context and upstream"
+                    .to_owned(),
+            )
         };
-        if !text.starts_with(['{', '"']) {
-            return Ok(rackup_only(text.to_owned()));
+        if !text.starts_with('{') {
+            return Err(moved());
         }
-        if let Ok(rackup) = serde_json::from_str::<String>(text) {
-            return Ok(rackup_only(rackup));
+        let config = serde_json::from_str::<Self>(text).map_err(|error| {
+            BridgeError::Startup(format!("invalid filter configuration: {error}"))
+        })?;
+        if config.rackup.is_some() {
+            return Err(moved());
         }
-        serde_json::from_str::<Self>(text)
-            .map_err(|error| BridgeError::Startup(format!("invalid filter configuration: {error}")))
+        Ok(config)
     }
 }
 
@@ -207,21 +267,25 @@ impl UpstreamConfig {
 }
 
 impl ProcessRuntimeConfig {
-    fn new(rackup: &str) -> Result<Self, BridgeError> {
-        let rackup = canonical_rackup(rackup)?;
-        let max_inflight_requests =
-            positive_env_usize("RUVOY_MAX_INFLIGHT_REQUESTS", DEFAULT_MAX_INFLIGHT_REQUESTS)?;
-        let shutdown_timeout_ms =
-            positive_env_usize("RUVOY_SHUTDOWN_TIMEOUT_MS", DEFAULT_SHUTDOWN_TIMEOUT_MS)?;
-
+    fn new(settings: &RuntimeSettings) -> Result<Self, BridgeError> {
         Ok(Self {
-            rackup,
-            max_inflight_requests,
-            shutdown_timeout: Duration::from_millis(shutdown_timeout_ms.try_into().map_err(
-                |_| BridgeError::Startup("RUVOY_SHUTDOWN_TIMEOUT_MS is too large".to_owned()),
-            )?),
-            diagnostics_enabled: flag_env("RUVOY_DIAGNOSTICS")?,
+            rackup: canonical_rackup(&settings.rackup)?,
+            max_inflight_requests: settings.max_inflight_requests,
+            shutdown_timeout: Duration::from_millis(settings.shutdown_timeout_ms),
+            diagnostics_enabled: settings.diagnostics,
         })
+    }
+
+    /// What the application sees as `Ruvoy::Lifecycle.settings`.
+    fn ruby_settings_json(&self) -> String {
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "rackup": self.rackup.display().to_string(),
+            "max_inflight_requests": self.max_inflight_requests,
+            "shutdown_timeout_ms": self.shutdown_timeout.as_millis() as u64,
+            "diagnostics": self.diagnostics_enabled,
+        })
+        .to_string()
     }
 }
 
@@ -234,9 +298,10 @@ struct ProcessRuntime {
 }
 
 /// What a runtime that loaded its application can hand to a filter.
-struct Ready {
-    client: FiberRuntimeClient,
-    runtime_thread_id: String,
+pub(crate) struct Ready {
+    pub(crate) client: FiberRuntimeClient,
+    pub(crate) runtime_thread_id: String,
+    pub(crate) diagnostics_enabled: bool,
 }
 
 impl ProcessRuntime {
@@ -244,6 +309,7 @@ impl ProcessRuntime {
         let startup = FiberRuntime::start_rackup_with_limit_retained(
             &config.rackup,
             config.max_inflight_requests,
+            Some(config.ruby_settings_json()),
         )?;
         let (runtime, startup_error) = startup.into_parts();
         let ready = match startup_error {
@@ -251,6 +317,7 @@ impl ProcessRuntime {
             None => Ok(Ready {
                 client: runtime.client(),
                 runtime_thread_id: runtime.info().rust_thread_id.clone(),
+                diagnostics_enabled: config.diagnostics_enabled,
             }),
         };
         if ready.is_ok() {
@@ -289,34 +356,64 @@ impl ProcessRuntime {
         )))
     }
 
+    /// Stops the runtime; false when it was stopped already.
+    ///
     /// # Safety
     ///
-    /// Must run only at process exit, after all Ruby execution has stopped.
-    unsafe fn shutdown(&self) -> Result<(), BridgeError> {
+    /// Must run only from Envoy's shutdown stage or at process exit. Workers
+    /// may still be serving then; they reach Ruby only through the runtime
+    /// client, which refuses them once the runtime has stopped.
+    unsafe fn shutdown(&self) -> Result<bool, BridgeError> {
         let runtime = match self.runtime.lock() {
             Ok(mut slot) => slot.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
         match runtime {
-            // SAFETY: the caller guarantees the process is exiting, which is
-            // when this function's own contract says it may run.
-            Some(runtime) => unsafe { runtime.shutdown_with_timeout(self.config.shutdown_timeout) },
-            None => Ok(()),
+            // SAFETY: Envoy is exiting, so nothing will ask Ruby for more; the
+            // workers' clients are refused from here on.
+            Some(runtime) => unsafe {
+                runtime
+                    .shutdown_with_timeout(self.config.shutdown_timeout)
+                    .map(|()| true)
+            },
+            None => Ok(false),
         }
     }
 }
 
-fn process_runtime(
-    requested: ProcessRuntimeConfig,
-) -> Result<&'static ProcessRuntime, BridgeError> {
+/// Starts the runtime for this process, or joins the one already started
+/// with the same settings. Only the bootstrap extension calls this.
+pub(crate) fn start(settings: RuntimeSettings) -> Result<&'static Ready, BridgeError> {
+    let requested = ProcessRuntimeConfig::new(&settings)?;
     register_process_shutdown_hook()?;
     let runtime = PROCESS_RUNTIME
         .get_or_init(|| ProcessRuntime::start(requested.clone()))
         .as_ref()
         .map_err(terminal_startup_failure)?;
     runtime.ensure_compatible(&requested)?;
-    runtime.ready()?;
-    Ok(runtime)
+    runtime.ready()
+}
+
+/// The runtime the bootstrap extension started, for a filter configuration.
+pub(crate) fn ready() -> Result<&'static Ready, BridgeError> {
+    match PROCESS_RUNTIME.get() {
+        None => Err(BridgeError::Startup(
+            "the Ruby runtime is not configured: add the ruvoy bootstrap extension under \
+             bootstrap_extensions, which names the rackup"
+                .to_owned(),
+        )),
+        Some(Err(error)) => Err(terminal_startup_failure(error)),
+        Some(Ok(runtime)) => runtime.ready(),
+    }
+}
+
+/// Stops the runtime if it is still running; true when this call stopped it.
+pub(crate) fn shutdown() -> Result<bool, BridgeError> {
+    let Some(Ok(runtime)) = PROCESS_RUNTIME.get() else {
+        return Ok(false);
+    };
+    // SAFETY: called only from Envoy's shutdown stage and at process exit.
+    unsafe { runtime.shutdown() }
 }
 
 fn register_process_shutdown_hook() -> Result<(), BridgeError> {
@@ -336,17 +433,14 @@ fn register_process_shutdown_hook() -> Result<(), BridgeError> {
         .clone()
 }
 
+/// The last resort for a process that exits without Envoy's shutdown stage.
 extern "C" fn shutdown_process_runtime() {
     let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-        let Some(Ok(runtime)) = PROCESS_RUNTIME.get() else {
-            return;
-        };
-        // SAFETY: `atexit` runs after Envoy has stopped serving, so no Ruby
-        // execution and no client clone can still be live.
         // Envoy may already have torn its logger down by the time `atexit`
         // handlers run, so this path stays on stderr.
-        match unsafe { runtime.shutdown() } {
-            Ok(()) => eprintln!("[ruvoy] Fiber runtime stopped"),
+        match shutdown() {
+            Ok(true) => eprintln!("[ruvoy] Fiber runtime stopped"),
+            Ok(false) => {}
             Err(error) => eprintln!("[ruvoy] Fiber runtime shutdown failed: {error}"),
         }
     }));
@@ -388,83 +482,72 @@ fn canonical_rackup(path: impl AsRef<Path>) -> Result<PathBuf, BridgeError> {
 
 /// Thread identity and stage-timing headers describe Ruvoy internals, so they
 /// stay off unless an operator turns them on for a test or an investigation.
-fn flag_env(name: &str) -> Result<bool, BridgeError> {
-    let Some(value) = std::env::var_os(name) else {
-        return Ok(false);
-    };
-    match value.to_str() {
-        Some("1") => Ok(true),
-        Some("0") => Ok(false),
-        _ => Err(BridgeError::Startup(format!("{name} must be 0 or 1"))),
-    }
-}
-
-fn positive_env_usize(name: &str, default: usize) -> Result<usize, BridgeError> {
-    let Some(value) = std::env::var_os(name) else {
-        return Ok(default);
-    };
-    let value = value
-        .into_string()
-        .map_err(|_| BridgeError::Startup(format!("{name} must contain valid UTF-8")))?;
-    let value = value
-        .parse::<usize>()
-        .map_err(|_| BridgeError::Startup(format!("{name} must be a positive integer")))?;
-    if value == 0 {
-        return Err(BridgeError::Startup(format!(
-            "{name} must be a positive integer"
-        )));
-    }
-    Ok(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn rackup(encoding: &str) -> Result<String, BridgeError> {
-        FilterConfig::parse(encoding.as_bytes()).map(|config| config.rackup)
+    fn settings(encoding: &str) -> Result<RuntimeSettings, BridgeError> {
+        RuntimeSettings::parse(encoding.as_bytes())
     }
 
     #[test]
-    fn filter_config_accepts_json_and_plain_paths() {
-        let expected = "/srv/app/config.ru";
+    fn runtime_settings_take_their_documented_defaults() {
+        let parsed =
+            settings(r#"{"rackup": "/srv/app/config.ru"}"#).expect("a valid configuration");
+        assert_eq!(parsed.rackup, "/srv/app/config.ru");
+        assert_eq!(parsed.max_inflight_requests, DEFAULT_MAX_INFLIGHT_REQUESTS);
+        assert_eq!(parsed.shutdown_timeout_ms, DEFAULT_SHUTDOWN_TIMEOUT_MS);
+        assert!(!parsed.diagnostics);
+    }
+
+    #[test]
+    fn runtime_settings_reject_what_could_not_serve() {
         for encoding in [
-            r#"/srv/app/config.ru"#,
-            r#""/srv/app/config.ru""#,
-            r#"{"rackup": "/srv/app/config.ru"}"#,
-            "  /srv/app/config.ru  ",
+            "",
+            "   ",
+            "/srv/app/config.ru",
+            r#"{"rackup": ""}"#,
+            r#"{"rackup": 7}"#,
+            r#"{"rack_up": "/a"}"#,
+            r#"{"rackup": "/a", "max_inflight_requests": 0}"#,
+            r#"{"rackup": "/a", "shutdown_timeout_ms": 0}"#,
+            r#"{"rackup": "/a", "diagnostics": "yes"}"#,
         ] {
-            assert_eq!(
-                rackup(encoding).as_deref(),
-                Ok(expected),
-                "failed to read {encoding}"
+            assert!(
+                settings(encoding).is_err(),
+                "{encoding:?} should be refused"
             );
         }
     }
 
     #[test]
-    fn filter_config_rejects_empty_and_malformed_json() {
-        assert!(rackup("").is_err());
-        assert!(rackup("   ").is_err());
-        assert!(rackup(r#"{"rackup": 7}"#).is_err());
-        assert!(rackup(r#"{"rack_up": "/a"}"#).is_err());
+    fn filter_config_is_optional() {
+        for encoding in ["", "   ", "{}"] {
+            let config = FilterConfig::parse(encoding.as_bytes()).expect("a valid configuration");
+            assert_eq!(config.context, None, "{encoding:?}");
+            assert_eq!(config.upstream, None, "{encoding:?}");
+        }
     }
 
     #[test]
-    fn extensions_stay_off_unless_configured() {
-        for encoding in [r#"/a"#, r#"{"rackup": "/a"}"#] {
-            let config = FilterConfig::parse(encoding.as_bytes()).expect("a valid configuration");
-            assert_eq!(config.context, None, "{encoding}");
-            assert_eq!(config.upstream, None, "{encoding}");
+    fn a_filter_config_that_still_names_the_rackup_is_told_where_it_went() {
+        for encoding in [
+            "/srv/app/config.ru",
+            r#""/srv/app/config.ru""#,
+            r#"{"rackup": "/srv/app/config.ru"}"#,
+        ] {
+            let error = FilterConfig::parse(encoding.as_bytes())
+                .expect_err("the rackup no longer belongs here")
+                .to_string();
+            assert!(error.contains("bootstrap extension"), "{encoding}: {error}");
         }
     }
 
     #[test]
     fn extension_settings_take_their_documented_defaults() {
-        let config = FilterConfig::parse(
-            br#"{"rackup": "/a", "context": {}, "upstream": {"clusters": ["users"]}}"#,
-        )
-        .expect("a valid configuration");
+        let config =
+            FilterConfig::parse(br#"{"context": {}, "upstream": {"clusters": ["users"]}}"#)
+                .expect("a valid configuration");
 
         assert_eq!(config.context, Some(ContextConfig::default()));
         assert_eq!(
@@ -481,10 +564,10 @@ mod tests {
     #[test]
     fn upstream_settings_no_call_could_use_are_refused() {
         for encoding in [
-            r#"{"rackup": "/a", "upstream": {"clusters": []}}"#,
-            r#"{"rackup": "/a", "upstream": {"clusters": [""]}}"#,
-            r#"{"rackup": "/a", "upstream": {"clusters": ["users"], "timeout_ms": 0}}"#,
-            r#"{"rackup": "/a", "upstream": {"clusters": ["users"], "max_response_bytes": 0}}"#,
+            r#"{"upstream": {"clusters": []}}"#,
+            r#"{"upstream": {"clusters": [""]}}"#,
+            r#"{"upstream": {"clusters": ["users"], "timeout_ms": 0}}"#,
+            r#"{"upstream": {"clusters": ["users"], "max_response_bytes": 0}}"#,
         ] {
             let config = FilterConfig::parse(encoding.as_bytes()).expect("well-formed JSON");
             assert!(
@@ -500,9 +583,9 @@ mod tests {
     #[test]
     fn misspelled_extension_fields_are_rejected() {
         for encoding in [
-            r#"{"rackup": "/a", "context": {"metadata_namespace": []}}"#,
-            r#"{"rackup": "/a", "upstream": {"cluster": ["users"]}}"#,
-            r#"{"rackup": "/a", "upstreams": {"clusters": ["users"]}}"#,
+            r#"{"context": {"metadata_namespace": []}}"#,
+            r#"{"upstream": {"cluster": ["users"]}}"#,
+            r#"{"upstreams": {"clusters": ["users"]}}"#,
         ] {
             assert!(
                 FilterConfig::parse(encoding.as_bytes()).is_err(),
@@ -532,5 +615,22 @@ mod tests {
         let mut different = active.clone();
         different.rackup = PathBuf::from("/srv/other/config.ru");
         assert_ne!(active, different);
+    }
+
+    #[test]
+    fn the_application_sees_the_settings_it_runs_under() {
+        let config = ProcessRuntimeConfig {
+            rackup: PathBuf::from("/srv/app/config.ru"),
+            max_inflight_requests: 128,
+            shutdown_timeout: Duration::from_secs(5),
+            diagnostics_enabled: true,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&config.ruby_settings_json()).expect("valid JSON");
+        assert_eq!(json["rackup"], "/srv/app/config.ru");
+        assert_eq!(json["max_inflight_requests"], 128);
+        assert_eq!(json["shutdown_timeout_ms"], 5000);
+        assert_eq!(json["diagnostics"], true);
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
     }
 }

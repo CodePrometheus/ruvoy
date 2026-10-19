@@ -87,6 +87,9 @@ class EnvoyExtensionsTest < E2ETestCase
 
     def envoy_config
       {
+        "bootstrap_extensions" => [
+          bootstrap_extension(rackup: File.join(root, "test", "fixtures", "extensions", "config.ru"))
+        ],
         "static_resources" => {
           "listeners" => [
             listener("extensions", PORT, ruvoy_filters(extensions: true)),
@@ -183,7 +186,7 @@ class EnvoyExtensionsTest < E2ETestCase
     end
 
     def ruvoy_filters(extensions:)
-      filter_config = { "rackup" => File.join(root, "test", "fixtures", "extensions", "config.ru") }
+      filter_config = {}
       if extensions
         filter_config["context"] = { "metadata_namespaces" => %w[acme.tenant acme.route absent] }
         filter_config["upstream"] = {
@@ -832,8 +835,8 @@ class EnvoyExtensionsTest < E2ETestCase
     socket&.close
   end
 
-  # Shutting Envoy down ends the open connections; the fibers parked in them
-  # hear the end and leave, so the runtime stops without waiting them out.
+  # Shutting Envoy down stops the fibers parked in open WebSockets, so the
+  # runtime stops without waiting them out and every client sees the end.
   def test_shutdown_ends_open_websockets_and_the_runtime_stops_cleanly
     offset = 10
     envoy, log = self.class.start_dedicated_envoy(offset, "shutdown")
@@ -850,7 +853,12 @@ class EnvoyExtensionsTest < E2ETestCase
     text = File.read(log)
     assert_includes text, "Fiber runtime stopped"
     refute_match(/shutdown failed|panicked|\[BUG\]/, text)
-    sockets.each { |socket| assert_includes [ nil, "" ], (socket.read rescue nil), "the client should see the end" }
+    sockets.each do |socket|
+      rest = (socket.read rescue nil)
+      # The end is the connection closing, after at most one unmasked close frame.
+      close_frame = rest.to_s.getbyte(0) == 0x88 && rest.bytesize == 2 + rest.getbyte(1)
+      assert rest.to_s.empty? || close_frame, "the client should see the end, got #{rest.inspect}"
+    end
   ensure
     sockets&.each(&:close)
     envoy&.stop

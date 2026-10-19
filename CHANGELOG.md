@@ -6,8 +6,32 @@ is, and its version is that Envoy version.
 
 ## Unreleased
 
+### Changed
+
+- The `ruvoy` bootstrap extension is required. It names the rackup and the
+  runtime's settings, `max_inflight_requests`, `shutdown_timeout_ms` and
+  `diagnostics`, which the filter configuration and the
+  `RUVOY_MAX_INFLIGHT_REQUESTS`, `RUVOY_SHUTDOWN_TIMEOUT_MS` and
+  `RUVOY_DIAGNOSTICS` variables carried before. A rack filter configured
+  without it, or still naming a rackup, is refused. `ruvoy` and
+  `--print-config` generate it.
+- The generated Envoy configuration sets `memory_allocator_manager` to return
+  1 MiB of freed memory a second. Envoy's allocator keeps freed memory by
+  default, which a three-hour soak showed as a resident set growing about 3%
+  an hour with no growth in what was allocated.
+- `inflight_requests`, `reactor_idle_ms` and `resident_bytes` are read once a
+  second on the main thread instead of being written on every request, so the
+  request path publishes nothing and an idle proxy no longer shows a stale
+  value.
+
 ### Added
 
+- Envoy becomes ready only once the application has loaded and its
+  `Ruvoy::Lifecycle.before_ready` hooks have run. `Ruvoy::Lifecycle.on_drain`
+  hooks run when Envoy begins draining, and Envoy's own shutdown stops the
+  runtime.
+- Admin endpoints answered by Ruby: `/ruvoy`, `/ruvoy/gc`, `/ruvoy/fibers`
+  and `/ruvoy/config`.
 - Statistics for calls to clusters: `upstream_calls_total{cluster, outcome}`
   counts how each call ended as the application saw it, and
   `upstream_duration_ms{cluster}` times a call to its whole response and a

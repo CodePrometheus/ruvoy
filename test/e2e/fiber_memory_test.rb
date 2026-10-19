@@ -134,11 +134,11 @@ class FiberMemoryTest < E2ETestCase
 
   def start_envoy
     config = File.join(@results, "envoy.yaml")
-    template = File.read(File.join(root, "config", "envoy-fiber-rack.yaml"))
-    File.write(config, template.sub("value: bench/config.ru", "value: #{fixture_rackup}"))
-    assert_includes File.read(config), "value: #{fixture_rackup}", "failed to configure the Rack fixture"
+    File.write(config, fiber_rack_config)
     @envoy_log = File.join(@results, "envoy.log")
-    @envoy = Envoy.start(config: config, modules: module_dir, log: @envoy_log, admin_port: ADMIN_PORT, env: bundle_env)
+    # Info, so the log carries the runtime's own report of its shutdown.
+    @envoy = Envoy.start(config: config, modules: module_dir, log: @envoy_log, log_level: "info", admin_port: ADMIN_PORT,
+                         env: bundle_env)
     assert @envoy.serving?(url("/gc-stats"), timeout: 10), "Fiber listener did not become ready:\n#{tail(@envoy_log)}"
     @proxy_pid = @envoy.proxy_pid
     refute_nil @proxy_pid, "could not resolve the Envoy runtime PID"
@@ -214,12 +214,11 @@ class FiberMemoryTest < E2ETestCase
 
   # A fiber whose client walked away is stopped by the reactor on its next
   # pass, so the load generator exiting does not mean the work is over. The
-  # gauges are written as requests begin and end, which is why each poll
-  # sends one.
+  # gauge is sampled once a second, so this waits through several samples.
   def wait_until_idle(label, moment)
+    assert_equal "200", http_get(url("/counted")).code, "#{label} could not reach the runtime #{moment} the run"
     inflight = nil
     100.times do
-      assert_equal "200", http_get(url("/counted")).code, "#{label} could not reach the runtime #{moment} the run"
       inflight = stat_value(module_stats, /inflight_requests: /)
       return if inflight == "0"
 

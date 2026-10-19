@@ -353,7 +353,7 @@ impl FiberRackFilter {
         }
     }
 
-    /// Records the admission outcome and republishes how loaded the runtime is.
+    /// Records the admission outcome.
     fn report_admission<EHF: EnvoyHttpFilter>(&self, envoy_filter: &EHF, rejected: Option<&str>) {
         let Some(metrics) = self.metrics else {
             return;
@@ -362,15 +362,6 @@ impl FiberRackFilter {
             Some(reason) => metrics.rejected(envoy_filter, reason),
             None => metrics.submitted(envoy_filter),
         }
-        self.publish_saturation(envoy_filter, metrics);
-    }
-
-    fn publish_saturation<EHF: EnvoyHttpFilter>(&self, envoy_filter: &EHF, metrics: Metrics) {
-        metrics.saturation(
-            envoy_filter,
-            self.client.inflight_requests(),
-            self.client.reactor_idle_for(),
-        );
     }
 
     /// Records how a request that reached the application ended.
@@ -382,7 +373,6 @@ impl FiberRackFilter {
             return;
         };
         metrics.responded(envoy_filter, outcome, submitted_at.elapsed());
-        self.publish_saturation(envoy_filter, metrics);
     }
 
     fn send_bridge_error<EHF: EnvoyHttpFilter>(

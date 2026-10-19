@@ -17,7 +17,7 @@ lambda do |bridge, app, rack_errors, body_reader|
       shutting_down = false
       until shutting_down
         io.wait_readable(heartbeat_seconds)
-        envelopes, shutting_down = bridge.drain
+        envelopes, admin, draining, shutting_down = bridge.drain
         # Registered from inside the task rather than from its return value:
         # a request that never blocks finishes before `async` returns, so an
         # assignment made out here would land after the task had already left.
@@ -29,10 +29,14 @@ lambda do |bridge, app, rack_errors, body_reader|
             running.delete(current_envelope)
           end
         end
+        admin&.each { |envelope| parent.async { Ruvoy::Admin.handle(envelope) } }
+        parent.async { Ruvoy::Lifecycle.drain } if draining
         # Stopping the fiber is what frees the admission slot and abandons the
         # work; discarding the response on its own would not.
         running.each { |envelope, task| task.stop if envelope.cancelled? }
       end
+      # Envoy closes every connection once shutdown returns: end what still runs.
+      running.each_value(&:stop)
       parent.wait_all
     end
   ensure

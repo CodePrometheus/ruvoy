@@ -41,6 +41,7 @@ class FiberOffloadTest < E2ETestCase
 
     def listener_config
       <<~YAML
+        #{bootstrap_yaml(rackup: File.join(root, "test", "fixtures", "offload", "config.ru"))}
         static_resources:
           listeners:
             - name: ruvoy_offload
@@ -72,7 +73,7 @@ class FiberOffloadTest < E2ETestCase
                               terminal_filter: true
                               filter_config:
                                 "@type": type.googleapis.com/google.protobuf.StringValue
-                                value: #{File.join(root, "test", "fixtures", "offload", "config.ru")}
+                                value: "{}"
       YAML
     end
   end

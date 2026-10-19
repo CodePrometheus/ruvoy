@@ -1,6 +1,17 @@
 # Serves config.ru with ruvoy.context and ruvoy.upstream turned on, next to a
 # stand-in `users` service the application calls through Envoy. Run it from the
 # repository root; see config.ru for the commands.
+bootstrap_extensions:
+  - name: ruvoy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.bootstrap.dynamic_modules.v3.DynamicModuleBootstrapExtension
+      dynamic_module_config: { name: ruvoy_fiber, do_not_close: true }
+      extension_name: ruvoy
+      extension_config:
+        "@type": type.googleapis.com/google.protobuf.StringValue
+        value: '{"rackup": "examples/extensions/config.ru"}'
+# Envoy's allocator keeps freed memory unless told to hand some back.
+memory_allocator_manager: { bytes_to_release: 1048576, memory_release_interval: 1s }
 static_resources:
   listeners:
     - name: app
@@ -42,7 +53,6 @@ static_resources:
                         "@type": type.googleapis.com/google.protobuf.StringValue
                         value: |
                           {
-                            "rackup": "examples/extensions/config.ru",
                             "context": { "metadata_namespaces": ["acme.tenant", "acme.route"] },
                             "upstream": { "clusters": ["users"], "timeout_ms": 2000 }
                           }

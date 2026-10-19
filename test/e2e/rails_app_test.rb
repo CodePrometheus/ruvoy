@@ -208,6 +208,7 @@ class RailsAppTest < E2ETestCase
 
     def listener_config(name, port)
       <<~YAML
+        #{bootstrap_yaml(rackup: File.join(APP, "config.ru"))}
         static_resources:
           listeners:
             - name: #{name}
@@ -239,7 +240,7 @@ class RailsAppTest < E2ETestCase
                               terminal_filter: true
                               filter_config:
                                 "@type": type.googleapis.com/google.protobuf.StringValue
-                                value: #{File.join(APP, "config.ru")}
+                                value: "{}"
       YAML
     end
   end

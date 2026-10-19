@@ -33,8 +33,7 @@ class ResponseStreamingTest < E2ETestCase
       config = File.join(scratch_dir, "streaming.yaml")
       File.write(config, listener_config)
       log = File.join(results, "envoy.log")
-      Envoy.start(config: config, modules: module_dir, log: log, log_level: "info",
-                  env: bundle_env.merge("RUVOY_DIAGNOSTICS" => "1")).tap do |envoy|
+      Envoy.start(config: config, modules: module_dir, log: log, log_level: "info", env: bundle_env).tap do |envoy|
         Minitest.after_run { envoy.stop }
         raise "streaming Envoy did not become ready:\n#{tail(log, lines: 5)}" unless envoy.serving?(
           "http://127.0.0.1:#{PORT}/rack-env"
@@ -44,6 +43,7 @@ class ResponseStreamingTest < E2ETestCase
 
     def listener_config
       <<~YAML
+        #{bootstrap_yaml(rackup: fixture_rackup, diagnostics: true)}
         static_resources:
           listeners:
             - name: ruvoy_streaming
@@ -76,7 +76,7 @@ class ResponseStreamingTest < E2ETestCase
                               terminal_filter: true
                               filter_config:
                                 "@type": type.googleapis.com/google.protobuf.StringValue
-                                value: #{fixture_rackup}
+                                value: "{}"
       YAML
     end
   end

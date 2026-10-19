@@ -4,6 +4,7 @@ $LOAD_PATH.unshift(File.expand_path("../../lib", __dir__))
 
 require "bundler"
 require "fileutils"
+require "json"
 require "minitest/autorun"
 require "net/http"
 require "rbconfig"
@@ -11,6 +12,7 @@ require "socket"
 require "tmpdir"
 require "uri"
 require_relative "../../tasks/build"
+require "ruvoy/envoy_config"
 require_relative "../../tasks/lockfile"
 require_relative "support/envoy"
 require_relative "support/throttled_upload"
@@ -33,6 +35,26 @@ class E2ETestCase < Minitest::Test
 
     def fixture_rackup
       File.join(ROOT, "test", "fixtures", "rack", "config.ru")
+    end
+
+    # The fiber template with its bootstrap extension pointed at `rackup`,
+    # under `settings` such as `max_inflight_requests:`.
+    def fiber_rack_config(rackup: fixture_rackup, **settings)
+      template = File.read(File.join(ROOT, "config", "envoy-fiber-rack.yaml"))
+      value = JSON.generate({ "rackup" => rackup }.merge(settings.transform_keys(&:to_s)))
+      configured = template.sub(%('{"rackup": "bench/config.ru"}'), "'#{value}'")
+      raise "the template no longer carries the bench rackup" if configured == template
+
+      configured
+    end
+
+    # The bootstrap section a hand-written configuration starts with.
+    def bootstrap_yaml(rackup: fixture_rackup, **settings)
+      Ruvoy::EnvoyConfig.bootstrap_yaml(rackup: rackup, **settings)
+    end
+
+    def bootstrap_extension(rackup: fixture_rackup, **settings)
+      Ruvoy::EnvoyConfig.bootstrap_extension(rackup: rackup, **settings)
     end
 
     def build_profile

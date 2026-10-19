@@ -53,9 +53,10 @@ Usage: ruvoy [options] [config.ru]
         --print-config               Print the generated Envoy configuration and exit
 ```
 
-To run it under an Envoy you configure yourself, `--print-config` prints the
-listener Ruvoy would have used; the module is `ruvoy_fiber` and its filter
-config is the path to the rackup, or a JSON object naming it (see
+To run it under an Envoy you configure yourself, `--print-config` prints what
+Ruvoy would have used: the `ruvoy` bootstrap extension, which names the rackup
+(see [Lifecycle](#lifecycle)), and a listener whose rack filter joins it. The
+filter's own config is an optional JSON object (see
 [Envoy context and upstream calls](#envoy-context-and-upstream-calls)).
 
 ## Status
@@ -213,7 +214,6 @@ JSON object:
 
 ```json
 {
-  "rackup": "/srv/app/config.ru",
   "context": { "metadata_namespaces": ["acme.tenant"] },
   "upstream": { "clusters": ["users"], "timeout_ms": 15000, "max_response_bytes": 1048576 }
 }
@@ -300,6 +300,50 @@ Calls and streams carry the request's trace context on: `traceparent`,
 [`examples/extensions`](examples/extensions) runs both against a stand-in
 service, including two calls from one request overlapping.
 
+## Lifecycle
+
+The `ruvoy` bootstrap extension owns the Ruby runtime: it names the rackup and
+the terms the runtime serves it on, and every listener's rack filter joins it.
+A rack filter configured without it is refused.
+
+```yaml
+bootstrap_extensions:
+  - name: ruvoy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.bootstrap.dynamic_modules.v3.DynamicModuleBootstrapExtension
+      dynamic_module_config: { name: ruvoy_fiber, do_not_close: true }
+      extension_name: ruvoy
+      extension_config:
+        "@type": type.googleapis.com/google.protobuf.StringValue
+        value: '{"rackup": "/srv/app/config.ru"}'
+```
+
+| Setting | Default | |
+|---|---|---|
+| `rackup` | | The application. Required. |
+| `max_inflight_requests` | 1024 | Requests in Ruby at once; one more is refused with 503. |
+| `shutdown_timeout_ms` | 10000 | How long shutdown waits for fibers still running. |
+| `diagnostics` | false | Adds the `x-ruvoy-*` diagnostic headers to responses. |
+
+- Envoy becomes ready only once the application has loaded and the hooks
+  registered with `Ruvoy::Lifecycle.before_ready { }` have run. An application
+  that fails to load stops Envoy.
+- `Ruvoy::Lifecycle.on_drain { }` runs when Envoy begins draining, while
+  requests are still served: close persistent connections, stop background
+  work.
+- Envoy's shutdown stops the runtime: fibers still running are cancelled and
+  given `shutdown_timeout_ms` to finish.
+- The admin interface reaches Ruby: `/ruvoy` (overview), `/ruvoy/gc` (`GET`
+  for `GC.stat`, `POST` to collect, `?compact=1` to compact too),
+  `/ruvoy/fibers` (live fibers with backtraces) and `/ruvoy/config`. Ruby
+  answers from its own thread; what it does not answer within two seconds gets
+  504.
+- `Ruvoy::Lifecycle.settings` holds the settings above.
+- Envoy's allocator keeps freed memory unless its `memory_allocator_manager`
+  sets `bytes_to_release`; without it the resident set only grows. The
+  generated configuration returns 1 MiB a second, and a hand-written one
+  should set it too.
+
 ## Statistics
 
 Ruvoy reports through Envoy's statistics, so the numbers reach whatever sink
@@ -307,10 +351,9 @@ Envoy has, the admin interface's `/stats/prometheus` among them.
 
 - `requests_total`, `rejected_total{reason}`, `responses_total{outcome}` and
   `duration_ms`: requests, and how those that reached the application ended.
-- `inflight_requests`, `reactor_idle_ms` and `resident_bytes`: sampled as
-  requests start and end, so an idle proxy shows the last sample. After a
-  client leaves mid-request, `inflight_requests` can stay above zero until the
-  next request.
+- `inflight_requests`, `reactor_idle_ms` and `resident_bytes`: the bootstrap
+  extension reads them once a second on the main thread, so the request path
+  never publishes anything and an idle proxy reports an idle runtime.
 - `upstream_calls_total{cluster, outcome}`: calls by how the application saw
   them end, `completed`, `refused`, `timed_out`, `overflow`, `too_large`,
   `reset` or `abandoned`. `upstream_duration_ms{cluster}` times a `call` to its

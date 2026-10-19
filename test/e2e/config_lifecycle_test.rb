@@ -27,9 +27,9 @@ class ConfigLifecycleTest < E2ETestCase
     @envoy_log = File.join(@results, "envoy.log")
     secondary_rackup = File.join(root, "bench", "config.ru")
 
-    apply_listeners(1, rack_listener("ruvoy_primary", RACK_PORT, fixture_rackup))
+    apply_listeners(1, rack_listener("ruvoy_primary", RACK_PORT))
     @envoy = Envoy.start(config: bootstrap, modules: module_dir, log: @envoy_log, log_level: "info",
-                         env: bundle_env.merge("RUVOY_DIAGNOSTICS" => "1"))
+                         env: bundle_env)
     assert wait_for_status(url(RACK_PORT), "200"), "the primary listener never became ready:\n#{tail(@envoy_log, lines: 20)}"
 
     # 1. The runtime starts once and identifies its Ruby thread.
@@ -39,31 +39,32 @@ class ConfigLifecycleTest < E2ETestCase
     refute_nil runtime_thread, "the primary listener did not report a Ruby thread"
 
     # 2. A second listener on the same rackup reuses the same VM.
-    apply_listeners(2, rack_listener("ruvoy_primary", RACK_PORT, fixture_rackup) +
-                       rack_listener("ruvoy_secondary", SECOND_PORT, fixture_rackup))
+    apply_listeners(2, rack_listener("ruvoy_primary", RACK_PORT) +
+                       rack_listener("ruvoy_secondary", SECOND_PORT))
     assert wait_for_status(url(SECOND_PORT), "200"), "the added listener never became ready"
     second = probe(SECOND_PORT, "second")
     assert_equal runtime_thread, second["x-ruby-thread-object-id"], "the added listener reported a different Ruby thread"
     assert_operator second["x-ruby-call-count"].to_i, :>, first_calls, "the call counter restarted, so the VM was replaced"
 
     # 3. An Envoy-side update leaves the runtime untouched.
-    apply_listeners(3, rack_listener("ruvoy_primary", RACK_PORT, fixture_rackup) +
+    apply_listeners(3, rack_listener("ruvoy_primary", RACK_PORT) +
                        static_listener("ruvoy_secondary", SECOND_PORT, "envoy-only"))
     assert wait_for_status("http://127.0.0.1:#{SECOND_PORT}/", "200"), "the reconfigured listener never became ready"
     assert_equal runtime_thread, probe(RACK_PORT, "third")["x-ruby-thread-object-id"], "the VM changed while a listener was reconfigured"
 
-    # 4. A second rackup is refused, and the running configuration keeps serving.
+    # 4. A listener that still names a rackup on its filter is refused, and the
+    # running configuration keeps serving.
     rejected_before = admin_stat(ADMIN_PORT, REJECTED).to_i
-    apply_listeners(4, rack_listener("ruvoy_primary", RACK_PORT, fixture_rackup) +
+    apply_listeners(4, rack_listener("ruvoy_primary", RACK_PORT) +
                        rack_listener("ruvoy_secondary", SECOND_PORT, secondary_rackup))
     100.times do
       break if admin_stat(ADMIN_PORT, REJECTED).to_i > rejected_before
 
       sleep 0.1
     end
-    assert_operator admin_stat(ADMIN_PORT, REJECTED).to_i, :>, rejected_before, "Envoy accepted a second rackup"
+    assert_operator admin_stat(ADMIN_PORT, REJECTED).to_i, :>, rejected_before, "Envoy accepted a rackup on the filter"
     assert_equal runtime_thread, probe(RACK_PORT, "fourth")["x-ruby-thread-object-id"], "the rejected update disturbed the running configuration"
-    assert_includes File.read(@envoy_log), secondary_rackup, "the rejection does not say which rackup was refused"
+    assert_includes File.read(@envoy_log), "bootstrap extension", "the rejection does not say where the rackup belongs"
 
     # 5. Removing every Ruby listener must not unload the module.
     puts "NOTE: #{unload_observable? ? "dlclose unloads here, so this is a real check" : "this platform keeps libraries resident, so this check is vacuous"}"
@@ -72,7 +73,7 @@ class ConfigLifecycleTest < E2ETestCase
     assert_predicate @envoy, :alive?, "Envoy died when the module lost its last reference"
 
     # 6. The VM is still the one from step 1.
-    apply_listeners(6, rack_listener("ruvoy_primary", RACK_PORT, fixture_rackup) +
+    apply_listeners(6, rack_listener("ruvoy_primary", RACK_PORT) +
                        static_listener("ruvoy_secondary", SECOND_PORT, "envoy-only"))
     assert wait_for_status(url(RACK_PORT), "200"), "the Ruby listener did not come back"
     assert_equal runtime_thread, probe(RACK_PORT, "sixth")["x-ruby-thread-object-id"], "a new VM was created after the module lost every reference"
@@ -118,6 +119,7 @@ class ConfigLifecycleTest < E2ETestCase
     File.join(scratch_dir, "bootstrap.yaml").tap do |path|
       File.write(path, <<~YAML)
         node: { id: ruvoy-config-lifecycle, cluster: ruvoy }
+        #{bootstrap_yaml(diagnostics: true).gsub("\n", "\n        ")}
         # Histograms only publish on flush; a short interval keeps the run quick.
         stats_flush_interval: 1s
         admin:
@@ -141,7 +143,8 @@ class ConfigLifecycleTest < E2ETestCase
     FileUtils.cp(@lds, File.join(@results, "lds-#{version}.yaml"))
   end
 
-  def rack_listener(name, port, rackup)
+  # A rackup names one on the filter, which the runtime refuses.
+  def rack_listener(name, port, rackup = nil)
     <<~YAML
         - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
           name: #{name}
@@ -169,7 +172,7 @@ class ConfigLifecycleTest < E2ETestCase
                           terminal_filter: true
                           filter_config:
                             "@type": type.googleapis.com/google.protobuf.StringValue
-                            value: '{"rackup": "#{rackup}"}'
+                            value: '#{rackup ? %({"rackup": "#{rackup}"}) : "{}"}'
     YAML
   end
 
