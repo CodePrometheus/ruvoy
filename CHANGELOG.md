@@ -4,7 +4,7 @@ Notable changes to the `ruvoy` gem, newest first. Changes not yet released are
 listed under Unreleased. The `ruvoy-envoy` gem carries an Envoy release as it
 is, and its version is that Envoy version.
 
-## Unreleased
+## 0.4.0 - 2026-10-20
 
 ### Changed
 
