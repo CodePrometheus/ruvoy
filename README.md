@@ -63,8 +63,10 @@ filter's own config is an optional JSON object (see
 
 The data path is implemented and covered by suites that run against a real
 Envoy in CI. Configuration reload has been driven through a running Envoy, and
-a one-hour soak of 1.8 million requests left the heap, file descriptors and
-threads flat. Interfaces may change.
+a three-hour soak of 5.7 million requests, 22,800 WebSocket sessions and 359
+listener updates left live memory, file descriptors, threads and p99 latency
+flat; the resident set still rose about 3% an hour, held by the allocator and
+Ruby's heap rather than by anything live. Interfaces may change.
 
 ## Features
 

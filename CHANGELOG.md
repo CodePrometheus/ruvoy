@@ -17,8 +17,9 @@ is, and its version is that Envoy version.
   `--print-config` generate it.
 - The generated Envoy configuration sets `memory_allocator_manager` to return
   1 MiB of freed memory a second. Envoy's allocator keeps freed memory by
-  default, which a three-hour soak showed as a resident set growing about 3%
-  an hour with no growth in what was allocated.
+  default, so the resident set stayed at its busiest moment; after bursts of
+  1 MiB uploads it now comes back down, from 460 to 308 MiB in the
+  mixed-stress suite.
 - `inflight_requests`, `reactor_idle_ms` and `resident_bytes` are read once a
   second on the main thread instead of being written on every request, so the
   request path publishes nothing and an idle proxy no longer shows a stale
