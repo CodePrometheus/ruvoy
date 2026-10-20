@@ -50,8 +50,7 @@ class FiberMixedStressTest < E2ETestCase
     last = @heap.fetch("cycle-#{@settings[:cycles]}-recovered")
     assert_operator last[:slots], :<=, first[:slots] * 1.10 + 5000,
                     "Ruby live slots grew beyond the mixed-stress threshold: #{first[:slots]} -> #{last[:slots]}"
-    # The allocator keeps what it frees, so the resident set remembers the
-    # busiest cycle; a leak shows as live allocations or memory outside it.
+    # A leak shows as live allocations or as memory outside the allocator.
     assert_operator last[:allocated], :<=, first[:allocated] * 1.10 + 8192,
                     "allocations still live grew: #{first[:allocated]} -> #{last[:allocated]} KiB"
     assert_operator last[:outside], :<=, first[:outside] * 1.10 + 16_384,
@@ -124,7 +123,8 @@ class FiberMixedStressTest < E2ETestCase
 
   def write_headers
     @files = {
-      resources: [ "resources.tsv", %w[epoch phase cpu_percent rss_kib fd_count allocated_kib allocator_resident_kib] ],
+      resources: [ "resources.tsv",
+                   %w[epoch phase cpu_percent rss_kib fd_count allocated_kib allocator_resident_kib outside_allocator_kib] ],
       heap: [ "heap.tsv", %w[label heap_live_slots rss_kib fd_count allocated_kib outside_allocator_kib] ],
       status: [ "status.tsv", %w[label total status_200 status_503 transport_errors] ],
       control: [ "control.tsv", %w[label elapsed_seconds] ]
@@ -188,7 +188,7 @@ class FiberMixedStressTest < E2ETestCase
         cpu, rss = IO.popen([ "ps", "-o", "%cpu=,rss=", "-p", @proxy_pid.to_s ], &:read).split
         break unless rss
 
-        append(:resources, Time.now.to_i, @phase, cpu, rss, fd_count, *allocator_kib)
+        append(:resources, Time.now.to_i, @phase, cpu, rss, fd_count, *memory_kib)
         sleep 1
       end
     end
@@ -201,17 +201,16 @@ class FiberMixedStressTest < E2ETestCase
     rss = IO.popen([ "ps", "-o", "rss=", "-p", @proxy_pid.to_s ], &:read).strip
     assert_match(/\A\d+\z/, slots, "#{label} did not report Ruby heap live slots")
     assert_match(/\A\d+\z/, rss, "#{label} did not report Envoy RSS")
-    allocated, allocator_resident = allocator_kib
-    @heap[label] = { slots: slots.to_i, rss: rss.to_i, fds: fd_count, allocated: allocated,
-                     outside: rss.to_i - allocator_resident }
+    allocated, _, outside = memory_kib
+    @heap[label] = { slots: slots.to_i, rss: rss.to_i, fds: fd_count, allocated: allocated, outside: outside }
     append(:heap, label, *@heap[label].values)
   end
 
-  # What Envoy's allocator holds for live objects, and what it keeps resident
-  # including memory it has freed.
-  def allocator_kib
-    memory = JSON.parse(http_get("http://127.0.0.1:#{ADMIN_PORT}/memory").body)
-    [ memory["allocated"].to_i / 1024, memory["total_physical_bytes"].to_i / 1024 ]
+  # What the allocator holds for live objects, what it keeps resident including
+  # memory it has freed, and the anonymous memory outside it.
+  def memory_kib
+    allocated = JSON.parse(http_get("http://127.0.0.1:#{ADMIN_PORT}/memory").body)["allocated"].to_i / 1024
+    [ allocated, *anonymous_kib_by_owner(@proxy_pid) ]
   end
 
   def start_oha(label, *args)

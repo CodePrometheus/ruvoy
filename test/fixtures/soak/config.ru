@@ -111,7 +111,7 @@ module Soak
     def heap
       GC.start
       json("live_slots" => GC.stat(:heap_live_slots), "pages" => GC.stat(:heap_allocated_pages),
-           "memsize" => ObjectSpace.memsize_of_all)
+           "page_size" => GC::INTERNAL_CONSTANTS[:HEAP_PAGE_SIZE], "memsize" => ObjectSpace.memsize_of_all)
     end
 
     def live_fibers

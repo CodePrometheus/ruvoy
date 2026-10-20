@@ -215,8 +215,7 @@ class SoakTest < E2ETestCase
   end
 
   # Waits for the pooled upstream connections to close, then reads what
-  # should be back to rest. The gauges are sampled once a second, so they are
-  # read before the requests that ask for the rest can show up in them.
+  # should be back to rest; the gauges first, before the probes below.
   def idle_state(label)
     sleep 7
     stats = admin_stats
@@ -233,14 +232,16 @@ class SoakTest < E2ETestCase
     STATS.transform_values { |pattern| text[pattern, 1].to_i }
   end
 
-  # Where the process's memory sits: Envoy's allocator by its own account, all
-  # anonymous pages, and the brk heap the C library allocates from first.
-  def memory_layout
-    allocator = JSON.parse(http_get("http://127.0.0.1:#{ADMIN_PORT}/memory").body)
-    rollup = File.read("/proc/#{@proxy_pid}/smaps_rollup")
+  # Where the process's memory sits: what the allocator holds for live objects
+  # by its own account, what it keeps resident, the anonymous memory outside
+  # it, the part of that Ruby keeps as heap pages, the rest (stacks, buffers,
+  # other mappings), and the brk heap the C library allocates from first.
+  def memory_layout(heap)
+    allocated = JSON.parse(http_get("http://127.0.0.1:#{ADMIN_PORT}/memory").body)["allocated"].to_i / 1024
+    resident, outside = anonymous_kib_by_owner(@proxy_pid)
+    ruby_heap = heap.fetch("pages") * heap.fetch("page_size") / 1024
     brk = File.read("/proc/#{@proxy_pid}/smaps")[/\[heap\]\n(?:.*\n)*?Rss:\s+(\d+)/, 1]
-    [ allocator["allocated"].to_i / 1024, allocator["heap_size"].to_i / 1024, rollup[/^Anonymous:\s+(\d+)/, 1].to_i,
-      brk.to_i ]
+    [ allocated, resident, outside, ruby_heap, outside - ruby_heap, brk.to_i ]
   end
 
   def fd_count = Dir.children("/proc/#{@proxy_pid}/fd").size
@@ -273,7 +274,8 @@ class SoakTest < E2ETestCase
 
   def sample_heap
     record("heap.tsv", "seconds", "heap_live_slots", "heap_pages", "ruby_memsize", "fibers", "sessions", "inflight",
-           "allocator_kib", "allocator_heap_kib", "anonymous_kib", "brk_kib")
+           "allocator_kib", "allocator_resident_kib", "outside_allocator_kib", "ruby_heap_kib", "other_anonymous_kib",
+           "brk_kib")
     Thread.new do
       while @sampling && clock < @deadline
         sleep @settings[:heap_every]
@@ -281,7 +283,7 @@ class SoakTest < E2ETestCase
           state = JSON.parse(http_get(url(:steady, "/state")).body)
           heap = JSON.parse(http_get(url(:steady, "/heap")).body)
           record("heap.tsv", elapsed_in_run, *heap.values_at("live_slots", "pages", "memsize"), state["fibers"],
-                 state["sessions"], admin_stats["inflight"], *memory_layout)
+                 state["sessions"], admin_stats["inflight"], *memory_layout(heap))
         rescue StandardError => error
           count("sampler:#{error.class}")
         end
@@ -441,7 +443,7 @@ class SoakTest < E2ETestCase
     if @mode == "full" && @final
       growth = trends
       verdict["trends"] = growth
-      growth.slice("rss", "heap_live_slots").each do |name, trend|
+      growth.slice("allocator_kib", "other_anonymous_kib", "heap_live_slots").each do |name, trend|
         failures << "#{name} grew #{trend["percent_per_hour"]}% an hour" if trend["percent_per_hour"] > 1.0
       end
       verdict["latency"] = drift
@@ -481,11 +483,13 @@ class SoakTest < E2ETestCase
   end
 
   # Least-squares slope over the steady part of the run, as a percentage of the
-  # mean per hour. RSS and live objects are judged; the rest says where growth
-  # sits when there is some.
+  # mean per hour. Live allocations, anonymous memory held by neither the
+  # allocator nor Ruby's heap, and Ruby's objects are judged; the rest is
+  # reported.
   def trends
     from = 3600
-    heap = %w[heap_live_slots heap_pages ruby_memsize allocator_kib allocator_heap_kib anonymous_kib brk_kib]
+    heap = %w[heap_live_slots heap_pages ruby_memsize allocator_kib allocator_resident_kib outside_allocator_kib
+              ruby_heap_kib other_anonymous_kib brk_kib]
     {
       "rss" => [ column("resources.tsv", "seconds"), column("resources.tsv", "rss_kib") ],
       **heap.to_h { |name| [ name, [ column("heap.tsv", "seconds"), column("heap.tsv", name) ] ] }

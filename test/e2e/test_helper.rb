@@ -22,6 +22,8 @@ require_relative "support/throttled_upload"
 class E2ETestCase < Minitest::Test
   ROOT = File.expand_path("../..", __dir__)
   BUILD_PROFILES = %w[debug release].freeze
+  # How Envoy's allocator names its anonymous mappings in /proc/<pid>/smaps.
+  ALLOCATOR_MAPPING = "[anon:tcmalloc_"
 
   # Available to the suites and to their class-level fixtures alike.
   module Helpers
@@ -91,6 +93,23 @@ class E2ETestCase < Minitest::Test
     def admin_stat(port, name)
       filter = URI.encode_www_form_component("^#{name}$")
       http_get("http://127.0.0.1:#{port}/stats?filter=#{filter}").body.lines.first&.split(": ", 2)&.last&.strip
+    end
+
+    # A process's anonymous memory in KiB, split into what Envoy's allocator
+    # holds, told apart by the names it gives its mappings, and everything
+    # else: Ruby's heap pages, stacks and any other mapping.
+    def anonymous_kib_by_owner(pid)
+      allocator = outside = 0
+      allocator_mapping = false
+      File.foreach("/proc/#{pid}/smaps") do |line|
+        if line.match?(/\A\h+-\h+ /)
+          allocator_mapping = line.include?(ALLOCATOR_MAPPING)
+        elsif line.start_with?("Anonymous:")
+          kib = line.split[1].to_i
+          allocator_mapping ? allocator += kib : outside += kib
+        end
+      end
+      [ allocator, outside ]
     end
 
     def clock
